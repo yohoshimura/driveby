@@ -67,8 +67,8 @@ mod tests {
 
     #[test]
     fn basename_match() {
-        assert!(matches("foo/bar.tmp", &vec!["*.tmp".into()]));
-        assert!(!matches("foo/bar.txt", &vec!["*.tmp".into()]));
+        assert!(matches("foo/bar.tmp", &["*.tmp".into()]));
+        assert!(!matches("foo/bar.txt", &["*.tmp".into()]));
     }
 
     #[test]

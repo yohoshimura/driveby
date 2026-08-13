@@ -16,7 +16,7 @@ build/
 Cargo.lock.bak
 
 # Tauri generated
-src-tauri/gen/
+**/src-tauri/gen/
 
 # Env / secrets
 .env
