@@ -271,14 +271,125 @@ async fn update_last_backup(app: &AppHandle, task_id: &str) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────
 // Main pipeline
 // ─────────────────────────────────────────────────────────────────────
+/// The immutable facts about a run, plus the progress channel back to the
+/// UI. Every phase gets one of these instead of the eight loose parameters
+/// each of them used to need.
+struct RunCtx<'a> {
+    app: &'a AppHandle,
+    backup_id: &'a str,
+    task_id: &'a str,
+    target: &'a Path,
+    settings: &'a Settings,
+    token: &'a CancellationToken,
+    started: Instant,
+    total_bytes: u64,
+    total_files: u64,
+}
 
-async fn execute(
-    app: &AppHandle,
-    backup_id: &str,
-    task: &Task,
-    settings: &Settings,
-    token: &CancellationToken,
-) -> Result<CompletePayload> {
+impl RunCtx<'_> {
+    /// Err(CANCELLED_MSG) if the user asked to stop. Phases call this at
+    /// every point where stopping is safe.
+    fn check_cancelled(&self) -> Result<()> {
+        if self.token.is_cancelled() {
+            return Err(anyhow!(CANCELLED_MSG));
+        }
+        Ok(())
+    }
+
+    /// Unconditional progress emit — used at phase boundaries, where there
+    /// is one event rather than a stream and the throttle would only risk
+    /// swallowing it.
+    fn emit_phase(
+        &self,
+        phase: &'static str,
+        copied_bytes: u64,
+        copied_files: u64,
+        eta_seconds: Option<u64>,
+    ) {
+        let _ = self.app.emit(
+            "backup-progress",
+            ProgressPayload {
+                backup_id: self.backup_id.to_string(),
+                task_id: self.task_id.to_string(),
+                progress: 100,
+                copied_bytes,
+                total_bytes: self.total_bytes,
+                copied_files,
+                total_files: self.total_files,
+                speed_bps: 0,
+                eta_seconds,
+                phase,
+            },
+        );
+    }
+
+    /// Throttled progress emit for the copy loop: at most one event per
+    /// 100ms, with speed and ETA derived from elapsed wall time.
+    fn maybe_emit(
+        &self,
+        last_emit: &mut Instant,
+        copied_bytes: u64,
+        copied_files: u64,
+        phase: &'static str,
+    ) {
+        if last_emit.elapsed().as_millis() < 100 {
+            return;
+        }
+        *last_emit = Instant::now();
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 {
+            (copied_bytes as f64 / elapsed) as u64
+        } else {
+            0
+        };
+        // `checked_div` returns None when speed is 0, sparing us the manual
+        // guard *and* the potential div-by-zero panic if speed underflowed.
+        let eta = self
+            .total_bytes
+            .saturating_sub(copied_bytes)
+            .checked_div(speed);
+        let progress = if self.total_bytes > 0 {
+            ((copied_bytes as f64 / self.total_bytes as f64) * 100.0).min(100.0) as u32
+        } else {
+            0
+        };
+        let _ = self.app.emit(
+            "backup-progress",
+            ProgressPayload {
+                backup_id: self.backup_id.to_string(),
+                task_id: self.task_id.to_string(),
+                progress,
+                copied_bytes,
+                total_bytes: self.total_bytes,
+                copied_files,
+                total_files: self.total_files,
+                speed_bps: speed,
+                eta_seconds: eta,
+                phase,
+            },
+        );
+    }
+}
+
+/// Running totals threaded through the phases and folded into the final
+/// payload. One accumulator rather than a dozen `let mut` bindings living
+/// for the whole length of `execute()`.
+#[derive(Default)]
+struct PhaseStats {
+    copied_bytes: u64,
+    copied_files: u64,
+    unchanged: u64,
+    failed: u64,
+    deleted: u64,
+    recased: u64,
+    icon_resyncs: u64,
+    attr_drift: u64,
+    errors: Vec<String>,
+}
+
+/// Validate the pair of paths before touching anything. Returns them as
+/// owned PathBufs so the caller doesn't re-parse the task strings.
+async fn preflight(task: &Task) -> Result<(PathBuf, PathBuf)> {
     let source = PathBuf::from(&task.source);
     let destination = PathBuf::from(&task.destination);
 
@@ -300,58 +411,28 @@ async fn execute(
     // Reject self-syncs and any nested overlap (#3). Shared with restore(),
     // which needs the same guard for an even sharper reason.
     reject_overlap(&source, &destination)?;
+    Ok((source, destination))
+}
 
-    let _ = app.emit(
-        "backup-started",
-        StartedPayload {
-            backup_id: backup_id.to_string(),
-            task_id: task.id.clone(),
-        },
-    );
-
-    info!(task = %task.name, "walking source");
-    let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    // Walk returns BOTH the files we'll actually copy AND the set of relative
-    // paths matched by exclude patterns, so prune can leave the latter alone.
-    let WalkResult {
-        files,
-        mut dirs,
-        total_bytes,
-        skipped: skipped_count,
-        excluded: excluded_rels,
-        unreadable: unreadable_rels,
-    } = walk(&source, &patterns).await?;
-    let total_files = files.len() as u64;
-    if !unreadable_rels.is_empty() {
-        warn!(
-            "{} source path(s) could not be read — their destination copies are left untouched",
-            unreadable_rels.len()
-        );
-    }
-
-    // Sync mode: mirror source into the destination directly. Files already
-    // present with matching size + mtime (within 2s tolerance) are skipped.
-    let target = destination.clone();
-    let started = Instant::now();
+/// Mirror the source files into the destination. Files already present with
+/// matching size + mtime (within the 2s tolerance) are skipped.
+async fn copy_phase(ctx: &RunCtx<'_>, files: &[FileEntry], stats: &mut PhaseStats) -> Result<()> {
     let mut copied_bytes: u64 = 0;
     let mut copied_files: u64 = 0;
-    let mut unchanged_files: u64 = 0;
-    let mut failed_files: u64 = 0;
     let mut last_emit = Instant::now();
-    let mut errors: Vec<String> = Vec::new();
 
-    for file in &files {
-        if token.is_cancelled() {
-            return Err(anyhow!(CANCELLED_MSG));
-        }
-        let dest_path = target.join(&file.rel);
+    for file in files {
+        ctx.check_cancelled()?;
+        let dest_path = ctx.target.join(&file.rel);
         if let Some(parent) = dest_path.parent() {
             // Don't kill the whole job because one parent can't be made (#8).
             if let Err(e) = fs::create_dir_all(long_path(parent)).await {
-                failed_files += 1;
+                stats.failed += 1;
                 warn!(target = %file.rel, "create parent failed: {}", e);
-                errors.push(format!("{}: create parent: {}", file.rel, e));
-                if !settings.continue_on_error() {
+                stats
+                    .errors
+                    .push(format!("{}: create parent: {}", file.rel, e));
+                if !ctx.settings.continue_on_error() {
                     return Err(anyhow!("create parent for {}: {}", file.rel, e));
                 }
                 continue;
@@ -377,21 +458,10 @@ async fn execute(
             };
 
         if skip {
-            unchanged_files += 1;
+            stats.unchanged += 1;
             copied_bytes += file.size;
             copied_files += 1;
-            maybe_emit(
-                app,
-                backup_id,
-                &task.id,
-                &mut last_emit,
-                &started,
-                copied_bytes,
-                total_bytes,
-                copied_files,
-                total_files,
-                "syncing",
-            );
+            ctx.maybe_emit(&mut last_emit, copied_bytes, copied_files, "syncing");
             continue;
         }
 
@@ -400,21 +470,16 @@ async fn execute(
         // while the loop kept copying. The callback receives this file's
         // cumulative bytes so far (resets to 0 on a retry).
         let base_bytes = copied_bytes;
-        let result = copy_with_retries(&file.path, &dest_path, token, settings, |file_so_far| {
-            copied_bytes = base_bytes + file_so_far;
-            maybe_emit(
-                app,
-                backup_id,
-                &task.id,
-                &mut last_emit,
-                &started,
-                copied_bytes,
-                total_bytes,
-                copied_files,
-                total_files,
-                "copying",
-            );
-        })
+        let result = copy_with_retries(
+            &file.path,
+            &dest_path,
+            ctx.token,
+            ctx.settings,
+            |file_so_far| {
+                copied_bytes = base_bytes + file_so_far;
+                ctx.maybe_emit(&mut last_emit, copied_bytes, copied_files, "copying");
+            },
+        )
         .await;
 
         match result {
@@ -423,254 +488,267 @@ async fn execute(
                 copied_bytes = base_bytes + file.size;
             }
             Err(e) => {
-                if token.is_cancelled() {
-                    return Err(anyhow!(CANCELLED_MSG));
-                }
-                failed_files += 1;
+                ctx.check_cancelled()?;
+                stats.failed += 1;
                 copied_bytes = base_bytes; // discard partial progress for failed file
                 warn!(target = %file.rel, "copy failed: {}", e);
-                errors.push(format!("{}: {}", file.rel, e));
-                if !settings.continue_on_error() {
+                stats.errors.push(format!("{}: {}", file.rel, e));
+                if !ctx.settings.continue_on_error() {
                     return Err(e);
                 }
             }
         }
     }
 
-    // Mirror-delete pass: remove anything in the destination that is no
-    // longer in the source. Excluded paths are *preserved* — exclude means
-    // "don't copy", not "delete from dest" (#2). We pass the full set of
-    // names the user said to leave alone (matched basenames + relative paths).
-    let _ = app.emit(
-        "backup-progress",
-        ProgressPayload {
-            backup_id: backup_id.to_string(),
-            task_id: task.id.clone(),
-            progress: 100,
-            copied_bytes,
-            total_bytes,
-            copied_files,
-            total_files,
-            speed_bps: 0,
-            eta_seconds: None,
-            phase: "pruning",
-        },
-    );
-    let source_paths = KeepSet::new(files.iter().map(|f| f.rel.clone()));
-    let mut prune_stats = PruneStats::default();
+    stats.copied_bytes = copied_bytes;
+    stats.copied_files = copied_files;
+    Ok(())
+}
+
+/// Mirror-delete pass: remove anything in the destination that is no longer
+/// in the source. Excluded paths are *preserved* — exclude means "don't
+/// copy", not "delete from dest" (#2) — as are paths the walk could not read.
+async fn prune_phase(
+    ctx: &RunCtx<'_>,
+    files: &[FileEntry],
+    walked: &WalkResult,
+    patterns: &glob::PatternSet,
+    stats: &mut PhaseStats,
+) -> Result<()> {
+    ctx.emit_phase("pruning", stats.copied_bytes, stats.copied_files, None);
+    let keep = KeepSet::new(files.iter().map(|f| f.rel.clone()));
     if let Err(e) = prune_destination(
-        &target,
-        &source_paths,
-        &excluded_rels,
-        &unreadable_rels,
-        &patterns,
-        token,
-        &mut prune_stats,
+        ctx.target,
+        &keep,
+        &walked.excluded,
+        &walked.unreadable,
+        patterns,
+        ctx.token,
+        stats,
     )
     .await
     {
-        if token.is_cancelled() {
-            return Err(anyhow!(CANCELLED_MSG));
-        }
+        ctx.check_cancelled()?;
         warn!("prune destination failed: {}", e);
     }
-    if prune_stats.recased > 0 {
+    if stats.recased > 0 {
         info!(
             "restored source casing on {} destination file(s)",
-            prune_stats.recased
+            stats.recased
         );
     }
+    Ok(())
+}
 
-    // ─── Folder-icon hash verification ────────────────────────────────
-    // Custom Windows folder icons live in two places: a `desktop.ini`
-    // *file* with a `[.ShellClassInfo]` block, and the *parent folder's*
-    // Readonly or System bit. Both halves must match the source byte-for-
-    // byte for Explorer to render the correct icon. The main copy loop
-    // already always re-copies every `desktop.ini`, but disk errors,
-    // power loss between flush and sync_all, and file-system quirks can
-    // still produce a "copy succeeded" file that doesn't actually equal
-    // the source. We close that gap by hashing both sides via xxh3 and
-    // force-re-copying any drift. This runs *before* the parent-folder
-    // attribute apply, so the very last action on each icon folder is
-    // setting the `+R`/`+S` bit on a folder whose `desktop.ini` is known
-    // to match the source bit-for-bit.
+/// Folder-icon hash verification.
+///
+/// Custom Windows folder icons live in two places: a `desktop.ini` *file*
+/// with a `[.ShellClassInfo]` block, and the *parent folder's* Readonly or
+/// System bit. Both halves must match the source byte-for-byte for Explorer
+/// to render the correct icon. The copy loop already always re-copies every
+/// `desktop.ini`, but disk errors, power loss between flush and sync_all,
+/// and filesystem quirks can still produce a "copy succeeded" file that
+/// doesn't actually equal the source. We close that gap by hashing both
+/// sides via xxh3 and force-re-copying any drift. This runs *before* the
+/// parent-folder attribute apply, so the very last action on each icon
+/// folder is setting the `+R`/`+S` bit on a folder whose `desktop.ini` is
+/// known to match the source bit-for-bit.
+async fn verify_icons_phase(
+    ctx: &RunCtx<'_>,
+    files: &[FileEntry],
+    stats: &mut PhaseStats,
+) -> Result<()> {
     let icon_files: Vec<&FileEntry> = files
         .iter()
         .filter(|f| is_icon_descriptor(&f.rel))
         .collect();
-
-    let mut icon_resyncs: u64 = 0;
-    if !icon_files.is_empty() {
-        let _ = app.emit(
-            "backup-progress",
-            ProgressPayload {
-                backup_id: backup_id.to_string(),
-                task_id: task.id.clone(),
-                progress: 100,
-                copied_bytes,
-                total_bytes,
-                copied_files,
-                total_files,
-                speed_bps: 0,
-                eta_seconds: None,
-                phase: "verifying-icons",
-            },
-        );
-        for f in &icon_files {
-            if token.is_cancelled() {
-                return Err(anyhow!(CANCELLED_MSG));
-            }
-            let dest_path = target.join(&f.rel);
-            let src_hash = match hash_file(&f.path).await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("could not hash source icon descriptor {}: {}", f.rel, e);
-                    continue;
-                }
-            };
-            let dst_hash = if fs::metadata(long_path(&dest_path)).await.is_ok() {
-                hash_file(&dest_path).await.ok()
-            } else {
-                None
-            };
-            if Some(src_hash) != dst_hash {
-                warn!(
-                    "folder-icon descriptor {} differs from source — forcing re-copy",
-                    f.rel
-                );
-                if let Some(parent) = dest_path.parent() {
-                    let _ = fs::create_dir_all(long_path(parent)).await;
-                }
-                match copy_with_retries(&f.path, &dest_path, token, settings, |_| {}).await {
-                    Ok(()) => {
-                        icon_resyncs += 1;
-                    }
-                    Err(e) => warn!("icon descriptor resync of {} failed: {}", f.rel, e),
-                }
-            }
-        }
-        if icon_resyncs > 0 {
-            info!(
-                "re-synced {} folder-icon descriptor(s) after hash mismatch",
-                icon_resyncs
-            );
-        } else {
-            info!(
-                "verified {} folder-icon descriptor(s) — all match source",
-                icon_files.len()
-            );
-        }
+    if icon_files.is_empty() {
+        return Ok(());
     }
 
-    // Mirror directory attributes — the second half of "custom folder
-    // icon" that lives on the parent folder. Sort deepest-first so a
-    // child's bits are applied before any ancestor inherits a Readonly
-    // flag that would block mutation, and ensure every source dir has a
-    // destination counterpart (empty source subfolders aren't created by
-    // the file-copy loop). After applying, read the destination attrs
-    // back and warn if the bits we wanted didn't actually stick — that's
-    // what surfaces filesystem-level limitations (e.g. exFAT silently
-    // dropping `+R` on directories) rather than letting the destination
-    // quietly render a default icon.
-    // Sort `dirs` in place — it's no longer needed in source order after
-    // this point, and re-cloning every PathBuf+String into a new Vec just
-    // to reverse-sort by depth is a `clippy::needless_clone` waste.
+    ctx.emit_phase(
+        "verifying-icons",
+        stats.copied_bytes,
+        stats.copied_files,
+        None,
+    );
+    for f in &icon_files {
+        ctx.check_cancelled()?;
+        let dest_path = ctx.target.join(&f.rel);
+        let src_hash = match hash_file(&f.path).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("could not hash source icon descriptor {}: {}", f.rel, e);
+                continue;
+            }
+        };
+        let dst_hash = if fs::metadata(long_path(&dest_path)).await.is_ok() {
+            hash_file(&dest_path).await.ok()
+        } else {
+            None
+        };
+        if Some(src_hash) != dst_hash {
+            warn!(
+                "folder-icon descriptor {} differs from source — forcing re-copy",
+                f.rel
+            );
+            if let Some(parent) = dest_path.parent() {
+                let _ = fs::create_dir_all(long_path(parent)).await;
+            }
+            match copy_with_retries(&f.path, &dest_path, ctx.token, ctx.settings, |_| {}).await {
+                Ok(()) => stats.icon_resyncs += 1,
+                Err(e) => warn!("icon descriptor resync of {} failed: {}", f.rel, e),
+            }
+        }
+    }
+    if stats.icon_resyncs > 0 {
+        info!(
+            "re-synced {} folder-icon descriptor(s) after hash mismatch",
+            stats.icon_resyncs
+        );
+    } else {
+        info!(
+            "verified {} folder-icon descriptor(s) — all match source",
+            icon_files.len()
+        );
+    }
+    Ok(())
+}
+
+/// Mirror directory attributes — the second half of "custom folder icon",
+/// the one that lives on the parent folder.
+///
+/// Sorted deepest-first so a child's bits are applied before any ancestor
+/// inherits a Readonly flag that would block mutation, and every source dir
+/// gets a destination counterpart (empty source subfolders aren't created by
+/// the copy loop). After applying, the destination attrs are read back and a
+/// mismatch is warned about — that's what surfaces filesystem-level
+/// limitations (e.g. exFAT silently dropping `+R` on directories) rather
+/// than letting the destination quietly render a default icon.
+async fn mirror_dir_attrs_phase(
+    ctx: &RunCtx<'_>,
+    dirs: &mut [(PathBuf, String)],
+    stats: &mut PhaseStats,
+) {
+    // Sort in place — `dirs` is not needed in source order after this point.
     dirs.sort_by_key(|(_, r)| std::cmp::Reverse(r.len()));
-    let mut attr_drift: u64 = 0;
-    for (src_dir, rel) in &dirs {
-        let dest_dir = target.join(rel);
+    for (src_dir, rel) in dirs.iter() {
+        let dest_dir = ctx.target.join(rel);
         if let Err(e) = fs::create_dir_all(long_path(&dest_dir)).await {
             warn!("could not ensure destination dir {}: {}", rel, e);
             continue;
         }
-        if let Some(src_attrs) = read_attrs(src_dir) {
-            let want = src_attrs & ATTR_KEEP;
-            apply_attrs(&dest_dir, src_attrs);
-            if want != 0 {
-                if let Some(got_full) = read_attrs(&dest_dir) {
-                    let got = got_full & ATTR_KEEP;
-                    if got != want {
-                        attr_drift += 1;
-                        warn!(
-                            "destination folder attrs at {} did not stick: want={:#x} got={:#x} (filesystem may not support these bits)",
-                            rel, want, got
-                        );
-                    }
-                }
+        let Some(src_attrs) = read_attrs(src_dir) else {
+            continue;
+        };
+        let want = src_attrs & ATTR_KEEP;
+        apply_attrs(&dest_dir, src_attrs);
+        if want == 0 {
+            continue;
+        }
+        if let Some(got_full) = read_attrs(&dest_dir) {
+            let got = got_full & ATTR_KEEP;
+            if got != want {
+                stats.attr_drift += 1;
+                warn!(
+                    "destination folder attrs at {} did not stick: want={:#x} got={:#x} (filesystem may not support these bits)",
+                    rel, want, got
+                );
             }
         }
     }
-    if attr_drift > 0 {
-        warn!("{} destination folder(s) could not mirror source attributes — custom icons there may not render", attr_drift);
+    if stats.attr_drift > 0 {
+        warn!("{} destination folder(s) could not mirror source attributes — custom icons there may not render", stats.attr_drift);
     }
+}
 
-    // Force a final 100% emit so the UI reflects completion even when the
-    // throttle would have skipped the last chunk.
+/// Optional whole-tree hash verification. Only runs on a clean copy pass:
+/// re-reading files we already know failed would just report the failure a
+/// second time, more slowly.
+async fn verify_phase(ctx: &RunCtx<'_>, files: &[FileEntry], stats: &PhaseStats) -> Result<bool> {
+    if !ctx.settings.verify() || stats.failed != 0 {
+        return Ok(false);
+    }
+    ctx.emit_phase("verifying", stats.copied_bytes, stats.copied_files, None);
+    verify_files(files, ctx.target, ctx.token).await?;
+    Ok(true)
+}
+
+async fn execute(
+    app: &AppHandle,
+    backup_id: &str,
+    task: &Task,
+    settings: &Settings,
+    token: &CancellationToken,
+) -> Result<CompletePayload> {
+    let (source, destination) = preflight(task).await?;
+
     let _ = app.emit(
-        "backup-progress",
-        ProgressPayload {
+        "backup-started",
+        StartedPayload {
             backup_id: backup_id.to_string(),
             task_id: task.id.clone(),
-            progress: 100,
-            copied_bytes: total_bytes,
-            total_bytes,
-            copied_files: total_files,
-            total_files,
-            speed_bps: 0,
-            eta_seconds: Some(0),
-            phase: "finishing",
         },
     );
 
-    let mut verified = false;
-    if settings.verify() && failed_files == 0 {
-        let _ = app.emit(
-            "backup-progress",
-            ProgressPayload {
-                backup_id: backup_id.to_string(),
-                task_id: task.id.clone(),
-                progress: 100,
-                copied_bytes,
-                total_bytes,
-                copied_files,
-                total_files,
-                speed_bps: 0,
-                eta_seconds: None,
-                phase: "verifying",
-            },
+    info!(task = %task.name, "walking source");
+    let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
+    let mut walked = walk(&source, &patterns).await?;
+    if !walked.unreadable.is_empty() {
+        warn!(
+            "{} source path(s) could not be read — their destination copies are left untouched",
+            walked.unreadable.len()
         );
-        verify_files(&files, &target, token).await?;
-        verified = true;
     }
 
-    if !errors.is_empty() {
-        for e in &errors {
-            warn!("file error: {}", e);
-        }
-    }
+    let ctx = RunCtx {
+        app,
+        backup_id,
+        task_id: &task.id,
+        target: &destination,
+        settings,
+        token,
+        started: Instant::now(),
+        total_bytes: walked.total_bytes,
+        total_files: walked.files.len() as u64,
+    };
+    let mut stats = PhaseStats::default();
 
-    let duration_ms = started.elapsed().as_millis() as u64;
+    copy_phase(&ctx, &walked.files, &mut stats).await?;
+    prune_phase(&ctx, &walked.files, &walked, &patterns, &mut stats).await?;
+    verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
+    mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
+
+    // Force a final 100% emit so the UI reflects completion even when the
+    // throttle would have skipped the last chunk.
+    ctx.emit_phase("finishing", ctx.total_bytes, ctx.total_files, Some(0));
+
+    let verified = verify_phase(&ctx, &walked.files, &stats).await?;
+
+    for e in &stats.errors {
+        warn!("file error: {}", e);
+    }
 
     Ok(CompletePayload {
         backup_id: backup_id.to_string(),
         task_id: task.id.clone(),
-        success: failed_files == 0,
+        success: stats.failed == 0,
         cancelled: false,
-        error: if failed_files > 0 {
-            Some(format!("{} file(s) failed", failed_files))
+        error: if stats.failed > 0 {
+            Some(format!("{} file(s) failed", stats.failed))
         } else {
             None
         },
-        path: Some(target.to_string_lossy().to_string()),
-        total_bytes: Some(total_bytes),
-        total_files: Some(total_files),
-        duration_ms: Some(duration_ms),
-        skipped: Some(skipped_count as u64),
-        cleaned: Some(prune_stats.deleted),
-        unchanged: Some(unchanged_files),
-        failed: Some(failed_files),
+        path: Some(destination.to_string_lossy().to_string()),
+        total_bytes: Some(ctx.total_bytes),
+        total_files: Some(ctx.total_files),
+        duration_ms: Some(ctx.started.elapsed().as_millis() as u64),
+        skipped: Some(walked.skipped as u64),
+        cleaned: Some(stats.deleted),
+        unchanged: Some(stats.unchanged),
+        failed: Some(stats.failed),
         verified: Some(verified),
-        unreadable: Some(unreadable_rels.len() as u64),
+        unreadable: Some(walked.unreadable.len() as u64),
     })
 }
 
@@ -694,7 +772,7 @@ async fn prune_destination(
     unreadable: &HashSet<String>,
     patterns: &glob::PatternSet,
     token: &CancellationToken,
-    stats: &mut PruneStats,
+    stats: &mut PhaseStats,
 ) -> Result<()> {
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
@@ -785,7 +863,7 @@ async fn prune_destination(
 /// we started from, and we leave it alone. Directory-level case drift is not
 /// corrected — but the file is no longer deleted for it either, which was
 /// the part that lost data.
-async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PruneStats) {
+async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PhaseStats) {
     let Some(name) = Path::new(source_rel).file_name() else {
         return;
     };
@@ -818,54 +896,6 @@ fn same_mtime(a: SystemTime, b: SystemTime) -> bool {
         }
         _ => false,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_emit(
-    app: &AppHandle,
-    backup_id: &str,
-    task_id: &str,
-    last_emit: &mut Instant,
-    started: &Instant,
-    copied_bytes: u64,
-    total_bytes: u64,
-    copied_files: u64,
-    total_files: u64,
-    phase: &'static str,
-) {
-    if last_emit.elapsed().as_millis() < 100 {
-        return;
-    }
-    *last_emit = Instant::now();
-    let elapsed = started.elapsed().as_secs_f64();
-    let speed = if elapsed > 0.0 {
-        (copied_bytes as f64 / elapsed) as u64
-    } else {
-        0
-    };
-    // `checked_div` returns None when speed is 0, sparing us the manual
-    // guard *and* the potential div-by-zero panic if speed underflowed.
-    let eta = total_bytes.saturating_sub(copied_bytes).checked_div(speed);
-    let progress = if total_bytes > 0 {
-        ((copied_bytes as f64 / total_bytes as f64) * 100.0).min(100.0) as u32
-    } else {
-        0
-    };
-    let _ = app.emit(
-        "backup-progress",
-        ProgressPayload {
-            backup_id: backup_id.to_string(),
-            task_id: task_id.to_string(),
-            progress,
-            copied_bytes,
-            total_bytes,
-            copied_files,
-            total_files,
-            speed_bps: speed,
-            eta_seconds: eta,
-            phase,
-        },
-    );
 }
 
 /// Files that, sitting directly under the destination root, would change the
@@ -940,14 +970,6 @@ impl KeepSet {
         }
         KeepStatus::Absent
     }
-}
-
-/// Running totals for the prune pass. Passed by `&mut` rather than returned
-/// so the counts survive an early cancellation.
-#[derive(Default)]
-struct PruneStats {
-    deleted: u64,
-    recased: u64,
 }
 
 /// Everything the source walk learned, in one place.
@@ -1277,7 +1299,7 @@ mod tests {
         let excluded: HashSet<String> = HashSet::new();
         let unreadable: HashSet<String> = ["locked".to_string()].into_iter().collect();
         let token = CancellationToken::new();
-        let mut stats = PruneStats::default();
+        let mut stats = PhaseStats::default();
 
         prune_destination(
             &root,
@@ -1323,7 +1345,7 @@ mod tests {
 
         let empty: HashSet<String> = HashSet::new();
         let token = CancellationToken::new();
-        let mut stats = PruneStats::default();
+        let mut stats = PhaseStats::default();
         prune_destination(
             &root,
             &KeepSet::new(std::iter::empty()),
@@ -1359,7 +1381,7 @@ mod tests {
         let keep = KeepSet::new(["README.md".to_string()].into_iter());
         let empty: HashSet<String> = HashSet::new();
         let token = CancellationToken::new();
-        let mut stats = PruneStats::default();
+        let mut stats = PhaseStats::default();
         prune_destination(
             &root,
             &keep,
