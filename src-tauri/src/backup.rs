@@ -858,9 +858,24 @@ async fn prune_destination(
     // Bottom-up: remove now-empty directories. Sort deepest-first by length.
     dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
     for d in dirs_to_check {
-        // Custom-icon folders carry `+R`, which blocks RemoveDirectoryW.
+        // succeeds only if empty
+        if fs::remove_dir(&d).await.is_ok() {
+            continue;
+        }
+        // Custom-icon folders carry `+R`, which blocks RemoveDirectoryW —
+        // but stripping it up front cleared the bit from every directory we
+        // merely walked past. Only `mirror_dir_attrs_phase` restores it, two
+        // phases later, and the icon-verification phase in between can bail
+        // out on cancellation: pressing Stop then left the whole destination
+        // rendering with default folder icons. Strip it only when a removal
+        // actually needs it, and put it back if the directory stays.
+        let attrs = read_attrs(&d);
         clear_readonly(&d);
-        let _ = fs::remove_dir(&d).await; // succeeds only if empty
+        if fs::remove_dir(&d).await.is_err() {
+            if let Some(a) = attrs {
+                apply_attrs(&d, a);
+            }
+        }
     }
     Ok(())
 }
@@ -1388,6 +1403,48 @@ mod tests {
             !dir.exists(),
             "emptied read-only directory was left behind by prune"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// prune stripped `+R` from every directory it walked, not just the ones
+    /// it was about to remove, and only `mirror_dir_attrs_phase` — two
+    /// phases later — put the bit back. `verify_icons_phase` sits in between
+    /// and can return early on cancellation, so hitting Stop at the wrong
+    /// moment left every custom-icon folder in the destination rendering
+    /// with the default icon until a later run completed all its phases.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prune_leaves_a_surviving_icon_folder_readonly() {
+        let root = scratch("prune-keeps-readonly");
+        let dir = root.join("iconfolder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"kept").unwrap();
+        apply_attrs(&dir, 0x1); // what a custom-icon folder looks like
+
+        let empty: HashSet<String> = HashSet::new();
+        let token = CancellationToken::new();
+        let mut stats = PhaseStats::default();
+        prune_destination(
+            &root,
+            &KeepSet::new(["iconfolder/keep.txt".to_string()].into_iter()),
+            &empty,
+            &empty,
+            &glob::PatternSet::new(&[]),
+            &token,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.deleted, 0);
+        assert!(dir.exists(), "a folder with a kept file must survive prune");
+        assert_eq!(
+            read_attrs(&dir).unwrap() & 0x1,
+            0x1,
+            "prune cleared +R from a directory it did not remove"
+        );
+
+        clear_readonly(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 
