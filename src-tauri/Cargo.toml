@@ -33,6 +33,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+[dev-dependencies]
+# `test` brings in tauri::test::mock_app(), which lets the restore pipeline
+# be driven end to end without a real webview.
+tauri = { version = "2", features = ["macos-private-api", "test"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 

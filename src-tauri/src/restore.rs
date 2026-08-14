@@ -4,7 +4,7 @@ use filetime::FileTime;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -32,8 +32,12 @@ struct RestoreProgress {
     progress: u32,
 }
 
-pub async fn restore(
-    app: &AppHandle,
+/// Generic over the Tauri runtime purely so tests can drive the real
+/// pipeline against `tauri::test::mock_app()`. Production passes an
+/// `AppHandle` (i.e. `AppHandle<Wry>`) and infers `R` from it, so no call
+/// site changes.
+pub async fn restore<R: Runtime>(
+    app: &AppHandle<R>,
     backup_path: PathBuf,
     destination: PathBuf,
 ) -> Result<RestorePayload> {
@@ -275,6 +279,51 @@ mod tests {
             b"the user's existing file",
             "restore deleted a destination file it never wrote to"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same guarantee, driven through the real entry point rather than a
+    /// single helper: `restore()` walks the backup, hits a file it cannot
+    /// open, and must leave the user's copy at the destination untouched.
+    ///
+    /// The unreadable backup file is simulated by holding an exclusive
+    /// handle on it (`share_mode(0)`), which is what a file open in another
+    /// program looks like — `File::open` then fails with a sharing
+    /// violation, before `copy` ever reaches `File::create`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn restore_leaves_the_destination_alone_when_the_backup_is_unreadable() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join("driveby-restore-test-locked-backup");
+        let _ = std::fs::remove_dir_all(&root);
+        let backup = root.join("backup");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(backup.join("report.docx"), b"backup copy").unwrap();
+        std::fs::write(dest.join("report.docx"), b"the user's existing file").unwrap();
+
+        // Deny all sharing, so the restore cannot open the backup's copy.
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(backup.join("report.docx"))
+            .unwrap();
+
+        let app = tauri::test::mock_app();
+        let payload = restore(app.handle(), backup.clone(), dest.clone())
+            .await
+            .expect("restore reports failure in its payload, not as an Err");
+
+        assert!(!payload.success, "the run should be reported as failed");
+        assert_eq!(
+            std::fs::read(dest.join("report.docx")).unwrap(),
+            b"the user's existing file",
+            "restore destroyed the file it was called to protect"
+        );
+
+        drop(_locked);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
