@@ -51,6 +51,14 @@ pub async fn restore(
     if !dest_meta.is_dir() {
         return Err(anyhow!("Destination is not a directory"));
     }
+    // Without this, restoring a backup *onto itself* destroys it: for every
+    // file `dst == src`, and `File::create(dst)` truncates the very file the
+    // already-open `File::open(src)` handle is about to read — so each file
+    // is read as 0 bytes, written as 0 bytes, and the run still reports
+    // success. The backup pipeline has always had this guard; restore did
+    // not, even though it is reachable from the UI in two clicks (History →
+    // Restore → pick the backup folder as the destination).
+    crate::fsutil::reject_overlap(&backup_path, &destination)?;
 
     let files = walk(&backup_path).await?;
     let total_files = files.len() as u64;

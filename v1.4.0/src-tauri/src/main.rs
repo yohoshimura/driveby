@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod backup;
+mod fsutil;
 mod glob;
 mod persist;
 mod restore;

@@ -118,6 +118,7 @@ export function AppProvider({ children }) {
             unchanged: data.unchanged,
             failed: data.failed,
             verified: data.verified,
+            unreadable: data.unreadable,
           },
           ...prev,
         ]);

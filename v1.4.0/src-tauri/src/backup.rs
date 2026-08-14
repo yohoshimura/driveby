@@ -1,3 +1,4 @@
+use crate::fsutil::{apply_attrs, long_path, read_attrs, reject_overlap, ATTR_KEEP};
 use crate::glob;
 use crate::persist;
 use anyhow::{anyhow, Context, Result};
@@ -135,6 +136,12 @@ pub struct CompletePayload {
     pub failed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
+    /// Source entries the walk could not enumerate or stat. Their
+    /// destination counterparts are deliberately left untouched by the
+    /// prune pass, so a non-zero value means "this backup is knowingly
+    /// incomplete but nothing was deleted for it".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<u64>,
 }
 
 struct FileEntry {
@@ -150,130 +157,6 @@ struct FileEntry {
 /// token directly — but having a single named constant keeps the in-function
 /// returns consistent and greppable.
 const CANCELLED_MSG: &str = "backup cancelled";
-
-// ─────────────────────────────────────────────────────────────────────
-// Cross-platform helpers
-// ─────────────────────────────────────────────────────────────────────
-
-#[cfg(windows)]
-fn long_path(p: &Path) -> PathBuf {
-    // `\\?\`-prefixed paths require backslashes only — Windows treats forward
-    // slashes under that prefix as literal filename characters. Normalize
-    // separators *first*, then apply the prefix.
-    let normalized: String = p.as_os_str().to_string_lossy().replace('/', r"\");
-    if normalized.starts_with(r"\\?\") || normalized.starts_with(r"\\.\") {
-        return PathBuf::from(normalized);
-    }
-    if Path::new(&normalized).is_absolute() {
-        if let Some(rest) = normalized.strip_prefix(r"\\") {
-            return PathBuf::from(format!(r"\\?\UNC\{}", rest));
-        }
-        return PathBuf::from(format!(r"\\?\{}", normalized));
-    }
-    PathBuf::from(normalized)
-}
-
-#[cfg(not(windows))]
-fn long_path(p: &Path) -> PathBuf {
-    p.to_path_buf()
-}
-
-// ─── Windows file attributes (preserves Hidden/System/ReadOnly so that
-// custom-folder-icon machinery — `desktop.ini` + the parent's System
-// attribute — keeps working in the destination tree) ─────────────────────
-
-#[cfg(windows)]
-fn read_attrs(p: &Path) -> Option<u32> {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::metadata(long_path(p))
-        .ok()
-        .map(|m| m.file_attributes())
-}
-
-#[cfg(windows)]
-fn apply_attrs(p: &Path, attrs: u32) {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
-    // Preserve only the user-meaningful bits — never propagate transient
-    // flags like ARCHIVE/REPARSE_POINT/etc. that the OS manages itself.
-    const KEEP: u32 = 0x1 /*READONLY*/ | 0x2 /*HIDDEN*/ | 0x4 /*SYSTEM*/;
-    let masked = attrs & KEEP;
-    if masked == 0 {
-        return;
-    }
-    let lp = long_path(p);
-    let wide: Vec<u16> = lp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // The previous version ignored the BOOL return value, so a failure to
-    // mirror the parent-folder bit (which is what makes Explorer render a
-    // custom desktop.ini icon) was silently invisible. Log on failure so
-    // the bug can't hide again.
-    let ok = unsafe { SetFileAttributesW(wide.as_ptr(), masked) };
-    if ok == 0 {
-        let err = unsafe { GetLastError() };
-        warn!(
-            "SetFileAttributesW failed for {}: GetLastError={}",
-            lp.display(),
-            err
-        );
-    }
-}
-
-#[cfg(not(windows))]
-fn read_attrs(_p: &Path) -> Option<u32> {
-    None
-}
-#[cfg(not(windows))]
-fn apply_attrs(_p: &Path, _attrs: u32) {}
-
-// ─── Path containment check for source/dest overlap (#3) ─────────────────
-
-/// True if `child` equals or is nested under `parent` (case-insensitive on
-/// Windows). Both inputs must be absolute. Falls back to lossy string compare
-/// if the paths can't be canonicalised yet (e.g. the destination doesn't
-/// exist) — we already validated existence in the caller. Critically: on
-/// Windows, `canonicalize()` prepends `\\?\` to existing paths but not to
-/// non-existing ones, so we strip that prefix on both sides before comparing
-/// — otherwise an existing parent would never appear to "contain" a
-/// not-yet-created child even when it lexically does.
-fn path_contains(parent: &Path, child: &Path) -> bool {
-    let p = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    let c = std::fs::canonicalize(child).unwrap_or_else(|_| child.to_path_buf());
-    let p_norm = normalize_for_compare(&p);
-    let c_norm = normalize_for_compare(&c);
-    if c_norm == p_norm {
-        return true;
-    }
-    let mut prefix = p_norm.clone();
-    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
-        prefix.push(std::path::MAIN_SEPARATOR);
-    }
-    c_norm.starts_with(&prefix)
-}
-
-#[cfg(windows)]
-fn normalize_for_compare(p: &Path) -> String {
-    let s = p.to_string_lossy().to_lowercase().replace('/', r"\");
-    // Strip the verbatim/extended-length prefix Windows' canonicalize adds
-    // to paths that exist on disk. We compare a (possibly) extended-length
-    // path against a (probably) non-extended one, so they must agree on
-    // surface form. UNC variant first to avoid a false match against `\\?\`.
-    if let Some(rest) = s.strip_prefix(r"\\?\unc\") {
-        format!(r"\\{}", rest)
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        s
-    }
-}
-#[cfg(not(windows))]
-fn normalize_for_compare(p: &Path) -> String {
-    p.to_string_lossy().to_string()
-}
 
 // ─────────────────────────────────────────────────────────────────────
 // Entry point
@@ -328,6 +211,7 @@ pub async fn run_backup(
             unchanged: None,
             failed: None,
             verified: None,
+            unreadable: None,
         },
     };
 
@@ -411,16 +295,9 @@ async fn execute(
     if !dest_meta.is_dir() {
         return Err(anyhow!("Destination is not a directory"));
     }
-    // Reject self-syncs and any nested overlap (#3): if dest sits inside src,
-    // walk() would enumerate the destination's own contents, copy them onto
-    // themselves, and the prune pass would loop on its own output. If src
-    // sits inside dest, prune would wipe the source on the next run.
-    if path_contains(&source, &destination) {
-        return Err(anyhow!("Destination cannot be inside the source folder"));
-    }
-    if path_contains(&destination, &source) {
-        return Err(anyhow!("Source cannot be inside the destination folder"));
-    }
+    // Reject self-syncs and any nested overlap (#3). Shared with restore(),
+    // which needs the same guard for an even sharper reason.
+    reject_overlap(&source, &destination)?;
 
     let _ = app.emit(
         "backup-started",
@@ -434,9 +311,21 @@ async fn execute(
     let patterns = glob::parse_patterns(&settings.exclude_patterns);
     // Walk returns BOTH the files we'll actually copy AND the set of relative
     // paths matched by exclude patterns, so prune can leave the latter alone.
-    let (files, mut dirs, total_bytes, skipped_count, excluded_rels) =
-        walk(&source, &patterns).await?;
+    let WalkResult {
+        files,
+        mut dirs,
+        total_bytes,
+        skipped: skipped_count,
+        excluded: excluded_rels,
+        unreadable: unreadable_rels,
+    } = walk(&source, &patterns).await?;
     let total_files = files.len() as u64;
+    if !unreadable_rels.is_empty() {
+        warn!(
+            "{} source path(s) could not be read — their destination copies are left untouched",
+            unreadable_rels.len()
+        );
+    }
 
     // Sync mode: mirror source into the destination directly. Files already
     // present with matching size + mtime (within 2s tolerance) are skipped.
@@ -571,6 +460,7 @@ async fn execute(
         &target,
         &source_paths,
         &excluded_rels,
+        &unreadable_rels,
         &patterns,
         token,
         &mut deleted_files,
@@ -678,7 +568,6 @@ async fn execute(
     // this point, and re-cloning every PathBuf+String into a new Vec just
     // to reverse-sort by depth is a `clippy::needless_clone` waste.
     dirs.sort_by_key(|(_, r)| std::cmp::Reverse(r.len()));
-    const ATTR_KEEP: u32 = 0x1 /*RO*/ | 0x2 /*HID*/ | 0x4 /*SYS*/;
     let mut attr_drift: u64 = 0;
     for (src_dir, rel) in &dirs {
         let dest_dir = target.join(rel);
@@ -773,17 +662,28 @@ async fn execute(
         unchanged: Some(unchanged_files),
         failed: Some(failed_files),
         verified: Some(verified),
+        unreadable: Some(unreadable_rels.len() as u64),
     })
 }
 
 /// Walk `root` and remove any file whose relative path is not present in
-/// `keep` AND not protected by `excluded` / `patterns`. Excluded paths are
-/// preserved so that adding `node_modules` to the exclude list never wipes
-/// pre-existing destination data (#2). Skipped on cancellation.
+/// `keep` AND not protected by `excluded` / `unreadable` / `patterns`.
+///
+/// Excluded paths are preserved so that adding `node_modules` to the exclude
+/// list never wipes pre-existing destination data (#2). Unreadable paths are
+/// preserved for a sharper reason: a source directory we failed to enumerate
+/// contributes nothing to `keep`, so without this guard a transient
+/// permission error or a locked folder would make prune delete that entire
+/// subtree from the destination — and the run would still report success.
+///
+/// Note that the guard skips the entry *without pushing it on the stack*, so
+/// protecting a directory protects its whole subtree. Skipped on cancellation.
+#[allow(clippy::too_many_arguments)]
 async fn prune_destination(
     root: &Path,
     keep: &HashSet<String>,
     excluded: &HashSet<String>,
+    unreadable: &HashSet<String>,
     patterns: &[String],
     token: &CancellationToken,
     deleted: &mut u64,
@@ -817,13 +717,16 @@ async fn prune_destination(
             if file_type.is_symlink() {
                 continue;
             }
-            let rel = path.strip_prefix(&root_canonical).unwrap_or(&path);
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = rel_of(&root_canonical, &path);
 
-            // Never touch destination paths the user told us to leave alone
-            // — and don't recurse into them either, since pruning their
-            // contents would still effectively delete excluded data.
-            if excluded.contains(&rel_str) || glob::matches(&rel_str, patterns) {
+            // Never touch destination paths the user told us to leave alone,
+            // nor those the source walk could not read — and don't recurse
+            // into them either, since pruning their contents would still
+            // effectively delete protected data.
+            if excluded.contains(&rel_str)
+                || unreadable.contains(&rel_str)
+                || glob::matches(&rel_str, patterns)
+            {
                 continue;
             }
 
@@ -940,28 +843,56 @@ fn is_icon_descriptor(rel_str: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn walk(
-    root: &Path,
-    patterns: &[String],
-) -> Result<(
-    Vec<FileEntry>,
-    Vec<(PathBuf, String)>,
-    u64,
-    usize,
-    HashSet<String>,
-)> {
+/// Everything the source walk learned, in one place.
+struct WalkResult {
+    files: Vec<FileEntry>,
+    dirs: Vec<(PathBuf, String)>,
+    total_bytes: u64,
+    skipped: usize,
+    /// Relative paths the user's exclude patterns matched.
+    excluded: HashSet<String>,
+    /// Relative paths we could not fully read: directories whose listing
+    /// failed or was cut short, files we could not stat, entries whose type
+    /// we could not determine. The prune pass must treat these exactly like
+    /// exclusions — see `prune_destination`.
+    unreadable: HashSet<String>,
+}
+
+/// Relative path of `path` under `root`, with `/` separators. Both walkers
+/// key their sets on this representation, so it has to be computed the same
+/// way in both places.
+fn rel_of(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+async fn walk(root: &Path, patterns: &[String]) -> Result<WalkResult> {
     let mut files = Vec::new();
     let mut dirs: Vec<(PathBuf, String)> = Vec::new();
     let mut excluded: HashSet<String> = HashSet::new();
+    let mut unreadable: HashSet<String> = HashSet::new();
     let mut total: u64 = 0;
     let mut skipped = 0usize;
-    let mut stack: Vec<PathBuf> = vec![long_path(root)];
     let root_canonical = long_path(root);
+    let mut stack: Vec<PathBuf> = vec![root_canonical.clone()];
 
     while let Some(dir) = stack.pop() {
         let mut entries = match fs::read_dir(&dir).await {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                // The root itself being unreadable is not a partial walk, it
+                // is no walk at all: continuing would hand prune an empty
+                // `keep` set and wipe the whole destination.
+                if dir == root_canonical {
+                    return Err(anyhow!("Source folder could not be read: {}", e));
+                }
+                // A subtree we cannot enumerate. Record it so prune leaves
+                // the destination copy alone instead of treating it as
+                // deleted-at-source (which silently destroyed backups).
+                warn!(dir = %dir.display(), "source directory could not be read: {}", e);
+                unreadable.insert(rel_of(&root_canonical, &dir));
                 skipped += 1;
                 continue;
             }
@@ -970,7 +901,11 @@ async fn walk(
             let entry = match entries.next_entry().await {
                 Ok(Some(e)) => e,
                 Ok(None) => break,
-                Err(_) => {
+                Err(e) => {
+                    // Enumeration stopped early — the rest of this directory
+                    // is unknown to us, so protect the whole directory.
+                    warn!(dir = %dir.display(), "source directory listing was cut short: {}", e);
+                    unreadable.insert(rel_of(&root_canonical, &dir));
                     skipped += 1;
                     break;
                 }
@@ -979,6 +914,7 @@ async fn walk(
             let file_type = match entry.file_type().await {
                 Ok(t) => t,
                 Err(_) => {
+                    unreadable.insert(rel_of(&root_canonical, &path));
                     skipped += 1;
                     continue;
                 }
@@ -986,8 +922,7 @@ async fn walk(
             if file_type.is_symlink() {
                 continue;
             }
-            let rel = path.strip_prefix(&root_canonical).unwrap_or(&path);
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = rel_of(&root_canonical, &path);
             // Don't propagate a source-root `desktop.ini` to the destination
             // root — that would hijack the destination folder's icon. Treat
             // it as if it were excluded by user pattern, so prune leaves any
@@ -1007,6 +942,10 @@ async fn walk(
                 let meta = match fs::metadata(&path).await {
                     Ok(m) => m,
                     Err(_) => {
+                        // We can't compare size/mtime for a file we can't
+                        // stat, so we won't copy it — which means prune must
+                        // not read its absence from `keep` as "deleted".
+                        unreadable.insert(rel_str);
                         skipped += 1;
                         continue;
                     }
@@ -1022,7 +961,14 @@ async fn walk(
             }
         }
     }
-    Ok((files, dirs, total, skipped, excluded))
+    Ok(WalkResult {
+        files,
+        dirs,
+        total_bytes: total,
+        skipped,
+        excluded,
+        unreadable,
+    })
 }
 
 async fn copy_with_retries<F: FnMut(u64)>(
@@ -1155,37 +1101,6 @@ async fn hash_file(path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn long_path_prefixes_absolute() {
-        let p = Path::new(r"C:\Users\me\file.txt");
-        assert_eq!(long_path(p).to_string_lossy(), r"\\?\C:\Users\me\file.txt");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn long_path_leaves_prefixed_alone() {
-        let p = Path::new(r"\\?\C:\foo");
-        assert_eq!(long_path(p).to_string_lossy(), r"\\?\C:\foo");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn long_path_handles_unc() {
-        let p = Path::new(r"\\server\share\file");
-        assert_eq!(long_path(p).to_string_lossy(), r"\\?\UNC\server\share\file");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn long_path_normalizes_forward_slashes() {
-        let p = Path::new("C:/Users/me/sub/file.txt");
-        assert_eq!(
-            long_path(p).to_string_lossy(),
-            r"\\?\C:\Users\me\sub\file.txt"
-        );
-    }
-
     #[test]
     fn icon_descriptor_matches_desktop_ini_at_any_depth() {
         assert!(is_icon_descriptor("desktop.ini"));
@@ -1221,63 +1136,69 @@ mod tests {
         assert!(!same_mtime(base, plus_3));
     }
 
-    // The path-overlap rejection in execute() is security-relevant: without
-    // it, "destination inside source" would copy the destination onto itself
-    // and the prune pass would loop on its own output, and "source inside
-    // destination" would let prune wipe the source on the next run. Tests
-    // here are platform-aware because canonicalize() requires the path to
-    // exist on Windows; we use temp-dir-relative paths that *do* exist so
-    // the comparison is meaningful.
-    #[test]
-    fn path_contains_self_is_true() {
-        let tmp = std::env::temp_dir();
-        assert!(path_contains(&tmp, &tmp));
-    }
-
-    /// Test helper: create a temp directory under env::temp_dir() so both
-    /// paths in path_contains() can canonicalize consistently. On Windows
-    /// `temp_dir()` may return an 8.3 short-name path (`YOSHIM~1`) which
-    /// `canonicalize()` expands; if one side of the comparison is the
-    /// original short form and the other is the expanded long form, the
-    /// prefix check fails. In production both paths are validated to exist
-    /// before `path_contains` is called, so this is a test-fixture concern,
-    /// not a bug.
-    fn make_test_dir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("driveby-test-{}", name));
-        let _ = std::fs::create_dir_all(&p);
+    /// Fresh, empty scratch directory for filesystem-touching tests.
+    fn scratch(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("driveby-backup-test-{}", name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
         p
     }
 
-    #[test]
-    fn path_contains_child_is_true() {
-        let parent = make_test_dir("contains-parent");
-        let child = parent.join("nested");
-        std::fs::create_dir_all(&child).unwrap();
-        assert!(path_contains(&parent, &child));
-        let _ = std::fs::remove_dir_all(&parent);
+    /// The data-loss regression: a source subtree that `walk()` could not
+    /// enumerate contributes nothing to `keep`, so prune used to read its
+    /// destination copy as "deleted at source" and remove it — while the run
+    /// still reported success. Anything named in `unreadable` must survive,
+    /// contents included, and genuinely orphaned files must still go.
+    #[tokio::test]
+    async fn prune_preserves_unreadable_subtree() {
+        let root = scratch("prune-unreadable");
+        std::fs::create_dir_all(root.join("locked/deep")).unwrap();
+        std::fs::write(root.join("locked/keep.txt"), b"precious").unwrap();
+        std::fs::write(root.join("locked/deep/keep2.txt"), b"also precious").unwrap();
+        std::fs::create_dir_all(root.join("gone")).unwrap();
+        std::fs::write(root.join("gone/orphan.txt"), b"stale").unwrap();
+
+        let keep: HashSet<String> = HashSet::new();
+        let excluded: HashSet<String> = HashSet::new();
+        let unreadable: HashSet<String> = ["locked".to_string()].into_iter().collect();
+        let token = CancellationToken::new();
+        let mut deleted = 0u64;
+
+        prune_destination(
+            &root,
+            &keep,
+            &excluded,
+            &unreadable,
+            &[],
+            &token,
+            &mut deleted,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            root.join("locked/keep.txt").exists(),
+            "file under an unreadable source subtree was deleted"
+        );
+        assert!(
+            root.join("locked/deep/keep2.txt").exists(),
+            "prune recursed into an unreadable subtree"
+        );
+        assert!(
+            !root.join("gone/orphan.txt").exists(),
+            "genuinely orphaned file should still be pruned"
+        );
+        assert_eq!(deleted, 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn path_contains_sibling_is_false() {
-        // Siblings: `tmp/foo` and `tmp/bar` should not be considered nested.
-        let foo = make_test_dir("sibling-foo");
-        let bar = make_test_dir("sibling-bar");
-        assert!(!path_contains(&foo, &bar));
-        assert!(!path_contains(&bar, &foo));
-        let _ = std::fs::remove_dir(&foo);
-        let _ = std::fs::remove_dir(&bar);
-    }
-
-    #[test]
-    fn path_contains_prefix_lookalike_is_false() {
-        // Important: "/a/b" must not be considered to contain "/a/bb" just
-        // because the string starts with "/a/b". The MAIN_SEPARATOR-padded
-        // prefix check guards against this.
-        let p = make_test_dir("lookalike-x");
-        let q = make_test_dir("lookalike-xx");
-        assert!(!path_contains(&p, &q));
-        assert!(!path_contains(&q, &p));
-        let _ = std::fs::remove_dir(&p);
-        let _ = std::fs::remove_dir(&q);
+    /// The root of the source being unreadable is not a partial walk, it is
+    /// no walk at all — returning an empty file list would hand prune an
+    /// empty `keep` set and wipe the entire destination.
+    #[tokio::test]
+    async fn walk_errors_when_root_is_missing() {
+        let missing = std::env::temp_dir().join("driveby-backup-test-does-not-exist");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(walk(&missing, &[]).await.is_err());
     }
 }

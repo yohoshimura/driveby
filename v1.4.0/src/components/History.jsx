@@ -87,6 +87,11 @@ export default function History() {
                 <div className="history-task-name">{entry.taskName}</div>
                 {entry.path && <div className="history-path" title={entry.path}>{entry.path}</div>}
                 {entry.error && <div className="history-path" style={{ color: 'var(--system-red)' }}>{entry.error}</div>}
+                {entry.unreadable > 0 && (
+                  <div className="history-path" style={{ color: 'var(--system-orange)' }}>
+                    {t('history.unreadable', { n: entry.unreadable })}
+                  </div>
+                )}
               </td>
               <td>
                 <span className={`badge badge--${entry.status}`}>
