@@ -1,4 +1,6 @@
-use crate::fsutil::{apply_attrs, long_path, read_attrs, reject_overlap, ATTR_KEEP};
+use crate::fsutil::{
+    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, ATTR_KEEP,
+};
 use crate::glob;
 use crate::persist;
 use anyhow::{anyhow, Context, Result};
@@ -733,11 +735,14 @@ async fn prune_destination(
             if file_type.is_dir() {
                 stack.push(path.clone());
                 dirs_to_check.push(path);
-            } else if file_type.is_file()
-                && !keep.contains(&rel_str)
-                && fs::remove_file(&path).await.is_ok()
-            {
-                *deleted += 1;
+            } else if file_type.is_file() && !keep.contains(&rel_str) {
+                // A destination file that inherited READONLY from a source
+                // file that has since been deleted would otherwise be
+                // un-prunable forever.
+                clear_readonly(&path);
+                if fs::remove_file(&path).await.is_ok() {
+                    *deleted += 1;
+                }
             }
         }
     }
@@ -745,6 +750,8 @@ async fn prune_destination(
     // Bottom-up: remove now-empty directories. Sort deepest-first by length.
     dirs_to_check.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
     for d in dirs_to_check {
+        // Custom-icon folders carry `+R`, which blocks RemoveDirectoryW.
+        clear_readonly(&d);
         let _ = fs::remove_dir(&d).await; // succeeds only if empty
     }
     Ok(())
@@ -983,6 +990,10 @@ async fn copy_with_retries<F: FnMut(u64)>(
     loop {
         attempts += 1;
         on_progress(0); // reset per-file progress for any prior failed attempt
+                        // std's remove_file already ignores READONLY on NTFS, but that fast
+                        // path needs FileDispositionInfoEx — unsupported on the FAT32/exFAT
+                        // volumes this app is most often pointed at. See fsutil::clear_readonly.
+        clear_readonly(&long_path(dest));
         let _ = fs::remove_file(long_path(dest)).await;
         let res = copy_file(src, dest, token, settings, &mut on_progress).await;
         match res {
@@ -995,6 +1006,7 @@ async fn copy_with_retries<F: FnMut(u64)>(
                     // Don't leave a half-written file in the destination after
                     // we give up — the next sync would either skip it on a
                     // size collision or re-copy redundantly (#12).
+                    clear_readonly(&long_path(dest));
                     let _ = fs::remove_file(long_path(dest)).await;
                     return Err(e);
                 }
@@ -1016,6 +1028,9 @@ async fn copy_file<F: FnMut(u64)>(
     let dest_l = long_path(dest);
     let src_meta = fs::metadata(&src_l).await.context("stat source")?;
     let mut reader = fs::File::open(&src_l).await.context("open source")?;
+    // File::create is a hard PermissionDenied against an existing +R file,
+    // so this must not be reached with the bit still set.
+    clear_readonly(&dest_l);
     let mut writer = fs::File::create(&dest_l)
         .await
         .context("create destination")?;
@@ -1189,6 +1204,61 @@ mod tests {
             "genuinely orphaned file should still be pruned"
         );
         assert_eq!(deleted, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A custom-icon folder carries `+R` by construction — that bit is half
+    /// of what makes Explorer render the icon, and apply_attrs mirrors it
+    /// onto the destination. `remove_dir` is a hard PermissionDenied against
+    /// such a folder, so once its contents left the source the emptied
+    /// directory stayed in the destination forever.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prune_removes_emptied_readonly_directory() {
+        let root = scratch("prune-readonly-dir");
+        let dir = root.join("iconfolder");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("orphan.txt"), b"stale").unwrap();
+        apply_attrs(&dir, 0x1); // what a custom-icon folder looks like
+
+        let empty: HashSet<String> = HashSet::new();
+        let token = CancellationToken::new();
+        let mut deleted = 0u64;
+        prune_destination(&root, &empty, &empty, &empty, &[], &token, &mut deleted)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            !dir.exists(),
+            "emptied read-only directory was left behind by prune"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Copying over a read-only destination file must work: `File::create`
+    /// is a hard PermissionDenied against one. On NTFS the preceding
+    /// `remove_file` already covers this (std deletes read-only files), so
+    /// this test only fails on filesystems without FileDispositionInfoEx —
+    /// it stands as a guard against removing either clear_readonly call.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn copy_with_retries_overwrites_readonly_destination() {
+        let root = scratch("readonly-dest");
+        let src = root.join("src.txt");
+        let dest = root.join("dest.txt");
+        std::fs::write(&src, b"new content").unwrap();
+        std::fs::write(&dest, b"stale").unwrap();
+        apply_attrs(&dest, 0x1);
+
+        let token = CancellationToken::new();
+        let settings = Settings::default();
+        copy_with_retries(&src, &dest, &token, &settings, |_| {})
+            .await
+            .expect("read-only destination must be overwritable");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+        clear_readonly(&dest);
         let _ = std::fs::remove_dir_all(&root);
     }
 

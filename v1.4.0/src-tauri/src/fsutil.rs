@@ -44,6 +44,8 @@ pub fn long_path(p: &Path) -> PathBuf {
 /// source to destination. Everything else (ARCHIVE, REPARSE_POINT, …) is
 /// managed by the OS and must not be propagated.
 pub const ATTR_KEEP: u32 = 0x1 /*READONLY*/ | 0x2 /*HIDDEN*/ | 0x4 /*SYSTEM*/;
+#[cfg(windows)]
+const ATTR_READONLY: u32 = 0x1;
 
 #[cfg(windows)]
 pub fn read_attrs(p: &Path) -> Option<u32> {
@@ -90,6 +92,40 @@ pub fn apply_attrs(p: &Path, attrs: u32) {
     set_attrs(p, masked);
 }
 
+/// Drop the READONLY bit from `p`, if it has one.
+///
+/// `apply_attrs` deliberately mirrors READONLY from source to destination,
+/// so the destination tree accumulates read-only files and directories.
+/// Measured behaviour of the std calls we make against them on Windows
+/// (NTFS, rustc 1.95):
+///
+/// | call                        | on a `+R` target |
+/// |-----------------------------|------------------|
+/// | `fs::remove_file`           | **Ok** — std deletes with `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE` |
+/// | `fs::File::create`          | `PermissionDenied` |
+/// | `fs::remove_dir`            | `PermissionDenied` |
+///
+/// So the two paths that actually break are `remove_dir` (the prune pass
+/// can never delete an emptied custom-icon folder, which carries `+R` by
+/// construction) and any `File::create` that isn't preceded by a delete —
+/// which is exactly `restore::copy`.
+///
+/// The copy path is additionally guarded even though `remove_file` covers
+/// it on NTFS: that std fast path needs `FileDispositionInfoEx`, which
+/// FAT32/exFAT do not support, and exFAT is the common format for the
+/// external drives this app exists to write to. Clearing the bit first
+/// costs one metadata call and removes the filesystem dependency.
+#[cfg(windows)]
+pub fn clear_readonly(p: &Path) {
+    let Some(attrs) = read_attrs(p) else {
+        return; // absent or unreadable — nothing to clear
+    };
+    if attrs & ATTR_READONLY == 0 {
+        return;
+    }
+    set_attrs(p, attrs & !ATTR_READONLY);
+}
+
 #[cfg(not(windows))]
 pub fn read_attrs(_p: &Path) -> Option<u32> {
     None
@@ -97,6 +133,9 @@ pub fn read_attrs(_p: &Path) -> Option<u32> {
 
 #[cfg(not(windows))]
 pub fn apply_attrs(_p: &Path, _attrs: u32) {}
+
+#[cfg(not(windows))]
+pub fn clear_readonly(_p: &Path) {}
 
 // ─────────────────────────────────────────────────────────────────────
 // Source / destination overlap rejection

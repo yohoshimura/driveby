@@ -164,6 +164,9 @@ async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
 async fn copy(src: &Path, dst: &Path) -> Result<()> {
     let src_meta = fs::metadata(src).await.context("stat source")?;
     let mut r = fs::File::open(src).await.context("open source")?;
+    // A read-only file already sitting in the chosen destination would make
+    // File::create fail outright on Windows and abort the whole restore.
+    crate::fsutil::clear_readonly(dst);
     let mut w = fs::File::create(dst).await.context("create destination")?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -182,4 +185,34 @@ async fn copy(src: &Path, dst: &Path) -> Result<()> {
         let _ = filetime::set_file_mtime(dst, FileTime::from_system_time(t));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unlike the backup pipeline, restore has no delete-then-create dance:
+    /// it goes straight to `File::create`, which is a hard PermissionDenied
+    /// against an existing read-only file. Any read-only file already living
+    /// in the chosen destination therefore aborted the whole restore.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn copy_overwrites_readonly_destination() {
+        let root = std::env::temp_dir().join("driveby-restore-test-readonly");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("src.txt");
+        let dst = root.join("dst.txt");
+        std::fs::write(&src, b"restored").unwrap();
+        std::fs::write(&dst, b"read-only leftover").unwrap();
+        crate::fsutil::apply_attrs(&dst, 0x1);
+
+        copy(&src, &dst)
+            .await
+            .expect("a read-only file in the destination must not abort the restore");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"restored");
+
+        crate::fsutil::clear_readonly(&dst);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
