@@ -31,31 +31,68 @@ fn glob_to_regex(glob: &str) -> String {
     re
 }
 
-pub fn matches(rel_path: &str, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        return false;
+/// The user's exclude patterns, compiled once.
+///
+/// This used to be a free `matches(rel_path, &[String])` that called
+/// `Regex::new` for every pattern on every path it was asked about — from
+/// the source walk *and* again from the prune pass. A 100k-file tree with
+/// five patterns meant a million regex compilations per run, all of them
+/// producing the same handful of automata.
+pub struct PatternSet {
+    /// (compiled pattern, is a `!` re-include)
+    rules: Vec<(regex::Regex, bool)>,
+}
+
+impl PatternSet {
+    pub fn new(patterns: &[String]) -> Self {
+        let rules = patterns
+            .iter()
+            .filter_map(|pattern| {
+                let (body, negated) = match pattern.strip_prefix('!') {
+                    Some(body) => (body, true),
+                    None => (pattern.as_str(), false),
+                };
+                // A pattern that doesn't compile is dropped rather than
+                // failing the run, matching the pre-1.5 behaviour.
+                regex::Regex::new(&glob_to_regex(body))
+                    .ok()
+                    .map(|re| (re, negated))
+            })
+            .collect();
+        Self { rules }
     }
-    let normalized = rel_path.replace('\\', "/");
-    let basename = normalized.rsplit('/').next().unwrap_or("");
-    let mut excluded = false;
-    for pattern in patterns {
-        let (body, negated) = if let Some(body) = pattern.strip_prefix('!') {
-            (body, true)
-        } else {
-            (pattern.as_str(), false)
-        };
-        let re = regex::Regex::new(&glob_to_regex(body));
-        let Ok(re) = re else { continue };
-        if re.is_match(&normalized) || re.is_match(basename) {
-            excluded = !negated;
+
+    pub fn from_input(input: &str) -> Self {
+        Self::new(&parse_patterns(input))
+    }
+
+    /// True if `rel_path` should be excluded. Each rule is tried against the
+    /// full relative path *and* against the basename — so `*.tmp` excludes
+    /// `a/b/c.tmp`, which is the user-friendly reading — and the last rule
+    /// to match wins, which is what makes `!keep.tmp` re-include.
+    pub fn matches(&self, rel_path: &str) -> bool {
+        if self.rules.is_empty() {
+            return false;
         }
+        let normalized = rel_path.replace('\\', "/");
+        let basename = normalized.rsplit('/').next().unwrap_or("");
+        let mut excluded = false;
+        for (re, negated) in &self.rules {
+            if re.is_match(&normalized) || re.is_match(basename) {
+                excluded = !negated;
+            }
+        }
+        excluded
     }
-    excluded
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set(patterns: &[&str]) -> PatternSet {
+        PatternSet::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
 
     #[test]
     fn parses_separators() {
@@ -67,15 +104,23 @@ mod tests {
 
     #[test]
     fn basename_match() {
-        assert!(matches("foo/bar.tmp", &["*.tmp".into()]));
-        assert!(!matches("foo/bar.txt", &["*.tmp".into()]));
+        assert!(set(&["*.tmp"]).matches("foo/bar.tmp"));
+        assert!(!set(&["*.tmp"]).matches("foo/bar.txt"));
     }
 
     #[test]
     fn negation_reincludes() {
-        let p = vec!["*.tmp".into(), "!keep.tmp".into()];
-        assert!(matches("skip.tmp", &p));
-        assert!(!matches("keep.tmp", &p));
+        let p = set(&["*.tmp", "!keep.tmp"]);
+        assert!(p.matches("skip.tmp"));
+        assert!(!p.matches("keep.tmp"));
+    }
+
+    #[test]
+    fn last_matching_rule_wins() {
+        // Order matters in both directions — a re-include can itself be
+        // overridden by a later exclude.
+        let p = set(&["*.tmp", "!keep.tmp", "keep.tmp"]);
+        assert!(p.matches("keep.tmp"));
     }
 
     #[test]
@@ -89,34 +134,43 @@ mod tests {
 
     #[test]
     fn empty_pattern_list_matches_nothing() {
-        // The early-return in matches() avoids ever feeding "" to glob_to_regex.
-        assert!(!matches("any/path/here.txt", &[]));
+        assert!(!set(&[]).matches("any/path/here.txt"));
     }
 
     #[test]
     fn double_star_crosses_directories() {
         // `**` matches across path separators in the full-rel-path check.
-        assert!(matches("a/b/c.tmp", &["**/*.tmp".into()]));
-        assert!(matches("deep/nested/file.log", &["**/file.log".into()]));
+        assert!(set(&["**/*.tmp"]).matches("a/b/c.tmp"));
+        assert!(set(&["**/file.log"]).matches("deep/nested/file.log"));
         // A bare `*` glob without `**` only matches a single segment when
         // checked against the full rel-path, but our matcher also tries
         // the *basename*, so `*.tmp` still excludes `a/b/c.tmp` via the
         // basename `c.tmp` — that's the user-friendly default.
-        assert!(matches("a/b/c.tmp", &["*.tmp".into()]));
+        assert!(set(&["*.tmp"]).matches("a/b/c.tmp"));
     }
 
     #[test]
     fn question_mark_is_single_non_slash() {
-        assert!(matches("a.b", &["?.b".into()]));
+        assert!(set(&["?.b"]).matches("a.b"));
         // `?` must not match `/`, otherwise an exclude like `a?b` would
         // accidentally swallow `a/b`.
-        assert!(!matches("a/b", &["a?b".into()]));
+        assert!(!set(&["a?b"]).matches("a/b"));
     }
 
     #[test]
     fn special_regex_chars_are_escaped() {
         // A literal `.` in a glob should match a literal `.`, not "any char".
-        assert!(matches("file.txt", &["file.txt".into()]));
-        assert!(!matches("fileXtxt", &["file.txt".into()]));
+        assert!(set(&["file.txt"]).matches("file.txt"));
+        assert!(!set(&["file.txt"]).matches("fileXtxt"));
+    }
+
+    #[test]
+    fn from_input_matches_parse_then_new() {
+        let input = "*.tmp,\n!keep.tmp";
+        let a = PatternSet::from_input(input);
+        let b = PatternSet::new(&parse_patterns(input));
+        for path in ["skip.tmp", "keep.tmp", "a/b/other.txt"] {
+            assert_eq!(a.matches(path), b.matches(path), "diverged on {}", path);
+        }
     }
 }

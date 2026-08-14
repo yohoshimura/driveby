@@ -310,7 +310,7 @@ async fn execute(
     );
 
     info!(task = %task.name, "walking source");
-    let patterns = glob::parse_patterns(&settings.exclude_patterns);
+    let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
     // Walk returns BOTH the files we'll actually copy AND the set of relative
     // paths matched by exclude patterns, so prune can leave the latter alone.
     let WalkResult {
@@ -686,7 +686,7 @@ async fn prune_destination(
     keep: &HashSet<String>,
     excluded: &HashSet<String>,
     unreadable: &HashSet<String>,
-    patterns: &[String],
+    patterns: &glob::PatternSet,
     token: &CancellationToken,
     deleted: &mut u64,
 ) -> Result<()> {
@@ -727,7 +727,7 @@ async fn prune_destination(
             // effectively delete protected data.
             if excluded.contains(&rel_str)
                 || unreadable.contains(&rel_str)
-                || glob::matches(&rel_str, patterns)
+                || patterns.matches(&rel_str)
             {
                 continue;
             }
@@ -875,7 +875,7 @@ fn rel_of(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-async fn walk(root: &Path, patterns: &[String]) -> Result<WalkResult> {
+async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
     let mut files = Vec::new();
     let mut dirs: Vec<(PathBuf, String)> = Vec::new();
     let mut excluded: HashSet<String> = HashSet::new();
@@ -938,7 +938,7 @@ async fn walk(root: &Path, patterns: &[String]) -> Result<WalkResult> {
                 excluded.insert(rel_str);
                 continue;
             }
-            if glob::matches(&rel_str, patterns) {
+            if patterns.matches(&rel_str) {
                 excluded.insert(rel_str);
                 continue;
             }
@@ -1184,7 +1184,7 @@ mod tests {
             &keep,
             &excluded,
             &unreadable,
-            &[],
+            &glob::PatternSet::new(&[]),
             &token,
             &mut deleted,
         )
@@ -1224,9 +1224,17 @@ mod tests {
         let empty: HashSet<String> = HashSet::new();
         let token = CancellationToken::new();
         let mut deleted = 0u64;
-        prune_destination(&root, &empty, &empty, &empty, &[], &token, &mut deleted)
-            .await
-            .unwrap();
+        prune_destination(
+            &root,
+            &empty,
+            &empty,
+            &empty,
+            &glob::PatternSet::new(&[]),
+            &token,
+            &mut deleted,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(deleted, 1);
         assert!(
@@ -1269,6 +1277,6 @@ mod tests {
     async fn walk_errors_when_root_is_missing() {
         let missing = std::env::temp_dir().join("driveby-backup-test-does-not-exist");
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(walk(&missing, &[]).await.is_err());
+        assert!(walk(&missing, &glob::PatternSet::new(&[])).await.is_err());
     }
 }
