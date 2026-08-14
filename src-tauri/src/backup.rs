@@ -774,6 +774,15 @@ async fn prune_destination(
     token: &CancellationToken,
     stats: &mut PhaseStats,
 ) -> Result<()> {
+    // An empty relative path is the root's own. Its presence means the source
+    // root itself could not be enumerated, so *nothing* in the destination
+    // can be shown to be orphaned — the entry-by-entry guard below would
+    // never match it, which is what once made prune wipe whole destinations.
+    if unreadable.contains("") {
+        warn!("source root was unreadable — skipping prune entirely");
+        return Ok(());
+    }
+
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
     let root_canonical = long_path(root);
@@ -990,6 +999,17 @@ struct WalkResult {
 /// Relative path of `path` under `root`, with `/` separators. Both walkers
 /// key their sets on this representation, so it has to be computed the same
 /// way in both places.
+/// Whether failing to enumerate `dir` has to abort the whole walk.
+///
+/// For a subdirectory it does not: we record its relative path in
+/// `unreadable` and prune leaves that subtree alone. The root has no such
+/// escape hatch — `rel_of(root, root)` is `""`, which matches no destination
+/// entry — so a root we could only list part-way is exactly as dangerous as
+/// a root we could not open at all, and is treated the same way.
+fn listing_failure_is_fatal(dir: &Path, root: &Path) -> bool {
+    dir == root
+}
+
 fn rel_of(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -1032,7 +1052,12 @@ async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
                 Ok(None) => break,
                 Err(e) => {
                     // Enumeration stopped early — the rest of this directory
-                    // is unknown to us, so protect the whole directory.
+                    // is unknown to us, so protect the whole directory. At
+                    // the root there is nothing to protect it with, so this
+                    // is fatal exactly like a root we could not open.
+                    if listing_failure_is_fatal(&dir, &root_canonical) {
+                        return Err(anyhow!("Source folder could not be listed: {}", e));
+                    }
                     warn!(dir = %dir.display(), "source directory listing was cut short: {}", e);
                     unreadable.insert(rel_of(&root_canonical, &dir));
                     skipped += 1;
@@ -1441,5 +1466,53 @@ mod tests {
         let missing = std::env::temp_dir().join("driveby-backup-test-does-not-exist");
         let _ = std::fs::remove_dir_all(&missing);
         assert!(walk(&missing, &glob::PatternSet::new(&[])).await.is_err());
+    }
+
+    /// `read_dir` on the root failing is fatal, but the sibling case — the
+    /// listing being cut short part-way through — used to fall into the
+    /// generic "record it and carry on" branch. There is nothing to record
+    /// it *with*: `rel_of(root, root)` is `""`, which matches no destination
+    /// entry, so the whole destination went unprotected.
+    #[test]
+    fn a_cut_short_listing_is_only_fatal_at_the_root() {
+        let root = Path::new("C:/src");
+        assert!(listing_failure_is_fatal(root, root));
+        assert!(!listing_failure_is_fatal(&root.join("sub"), root));
+    }
+
+    /// Defence in depth for the same bug: whatever put an empty relative
+    /// path into `unreadable`, it means "we do not know what the source root
+    /// holds" — which has to protect the whole destination, not nothing.
+    #[tokio::test]
+    async fn prune_is_a_no_op_when_the_root_itself_is_unreadable() {
+        let root = scratch("prune-unreadable-root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/keep.txt"), b"precious").unwrap();
+        std::fs::write(root.join("top.txt"), b"also precious").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let unreadable: HashSet<String> = [String::new()].into_iter().collect();
+        let token = CancellationToken::new();
+        let mut stats = PhaseStats::default();
+
+        prune_destination(
+            &root,
+            &KeepSet::new(std::iter::empty()),
+            &empty,
+            &unreadable,
+            &glob::PatternSet::new(&[]),
+            &token,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            root.join("top.txt").exists(),
+            "prune emptied the destination after an unreadable source root"
+        );
+        assert!(root.join("sub/keep.txt").exists());
+        assert_eq!(stats.deleted, 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
