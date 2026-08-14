@@ -456,8 +456,8 @@ async fn execute(
             phase: "pruning",
         },
     );
-    let source_paths: HashSet<String> = files.iter().map(|f| f.rel.clone()).collect();
-    let mut deleted_files: u64 = 0;
+    let source_paths = KeepSet::new(files.iter().map(|f| f.rel.clone()));
+    let mut prune_stats = PruneStats::default();
     if let Err(e) = prune_destination(
         &target,
         &source_paths,
@@ -465,7 +465,7 @@ async fn execute(
         &unreadable_rels,
         &patterns,
         token,
-        &mut deleted_files,
+        &mut prune_stats,
     )
     .await
     {
@@ -473,6 +473,12 @@ async fn execute(
             return Err(anyhow!(CANCELLED_MSG));
         }
         warn!("prune destination failed: {}", e);
+    }
+    if prune_stats.recased > 0 {
+        info!(
+            "restored source casing on {} destination file(s)",
+            prune_stats.recased
+        );
     }
 
     // ─── Folder-icon hash verification ────────────────────────────────
@@ -660,7 +666,7 @@ async fn execute(
         total_files: Some(total_files),
         duration_ms: Some(duration_ms),
         skipped: Some(skipped_count as u64),
-        cleaned: Some(deleted_files),
+        cleaned: Some(prune_stats.deleted),
         unchanged: Some(unchanged_files),
         failed: Some(failed_files),
         verified: Some(verified),
@@ -683,12 +689,12 @@ async fn execute(
 #[allow(clippy::too_many_arguments)]
 async fn prune_destination(
     root: &Path,
-    keep: &HashSet<String>,
+    keep: &KeepSet,
     excluded: &HashSet<String>,
     unreadable: &HashSet<String>,
     patterns: &glob::PatternSet,
     token: &CancellationToken,
-    deleted: &mut u64,
+    stats: &mut PruneStats,
 ) -> Result<()> {
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
@@ -735,13 +741,28 @@ async fn prune_destination(
             if file_type.is_dir() {
                 stack.push(path.clone());
                 dirs_to_check.push(path);
-            } else if file_type.is_file() && !keep.contains(&rel_str) {
-                // A destination file that inherited READONLY from a source
-                // file that has since been deleted would otherwise be
-                // un-prunable forever.
-                clear_readonly(&path);
-                if fs::remove_file(&path).await.is_ok() {
-                    *deleted += 1;
+            } else if file_type.is_file() {
+                match keep.status(&rel_str) {
+                    KeepStatus::Exact => {}
+                    KeepStatus::CaseDrift(source_rel) => {
+                        // NTFS is case-insensitive but case-*preserving*, so
+                        // when the user re-cases a source file the copy loop
+                        // writes through to the existing directory entry and
+                        // leaves the old spelling on disk. prune then failed
+                        // to find that spelling in `keep` and deleted the
+                        // file it had just copied — the backup silently lost
+                        // it until the following run. Re-spell instead.
+                        recase_entry(&path, source_rel, stats).await;
+                    }
+                    KeepStatus::Absent => {
+                        // A destination file that inherited READONLY from a
+                        // source file that has since been deleted would
+                        // otherwise be un-prunable forever.
+                        clear_readonly(&path);
+                        if fs::remove_file(&path).await.is_ok() {
+                            stats.deleted += 1;
+                        }
+                    }
                 }
             }
         }
@@ -755,6 +776,31 @@ async fn prune_destination(
         let _ = fs::remove_dir(&d).await; // succeeds only if empty
     }
     Ok(())
+}
+
+/// Rename a destination entry to the spelling the source uses.
+///
+/// Only the file name is re-spelled: if the case drift is in a *directory*
+/// component the basename already matches, `with_file_name` yields the path
+/// we started from, and we leave it alone. Directory-level case drift is not
+/// corrected — but the file is no longer deleted for it either, which was
+/// the part that lost data.
+async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PruneStats) {
+    let Some(name) = Path::new(source_rel).file_name() else {
+        return;
+    };
+    let target = path.with_file_name(name);
+    if target == path {
+        return; // drift is in a parent component, not the file name
+    }
+    match fs::rename(path, &target).await {
+        Ok(()) => stats.recased += 1,
+        Err(e) => warn!(
+            "could not restore source casing for {}: {}",
+            path.display(),
+            e
+        ),
+    }
 }
 
 /// Compare mtimes with a 2-second tolerance. FAT/exFAT (very common on
@@ -848,6 +894,60 @@ fn is_icon_descriptor(rel_str: &str) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().eq_ignore_ascii_case("desktop.ini"))
         .unwrap_or(false)
+}
+
+/// The relative paths the source says the destination should hold, with the
+/// lookup rules the prune pass needs.
+struct KeepSet {
+    exact: HashSet<String>,
+    /// Windows only: lowercased relative path -> the source's own spelling.
+    #[cfg(windows)]
+    by_lowercase: std::collections::HashMap<String, String>,
+}
+
+enum KeepStatus<'a> {
+    /// Spelled the same on both sides — leave it alone.
+    Exact,
+    /// The source has this file but spells it differently in case only.
+    /// Carries the source's spelling.
+    CaseDrift(&'a str),
+    /// Genuinely gone from the source.
+    Absent,
+}
+
+impl KeepSet {
+    fn new(rels: impl Iterator<Item = String>) -> Self {
+        let exact: HashSet<String> = rels.collect();
+        #[cfg(windows)]
+        let by_lowercase = exact
+            .iter()
+            .map(|r| (r.to_lowercase(), r.clone()))
+            .collect();
+        Self {
+            exact,
+            #[cfg(windows)]
+            by_lowercase,
+        }
+    }
+
+    fn status(&self, rel: &str) -> KeepStatus<'_> {
+        if self.exact.contains(rel) {
+            return KeepStatus::Exact;
+        }
+        #[cfg(windows)]
+        if let Some(source_rel) = self.by_lowercase.get(&rel.to_lowercase()) {
+            return KeepStatus::CaseDrift(source_rel);
+        }
+        KeepStatus::Absent
+    }
+}
+
+/// Running totals for the prune pass. Passed by `&mut` rather than returned
+/// so the counts survive an early cancellation.
+#[derive(Default)]
+struct PruneStats {
+    deleted: u64,
+    recased: u64,
 }
 
 /// Everything the source walk learned, in one place.
@@ -1173,11 +1273,11 @@ mod tests {
         std::fs::create_dir_all(root.join("gone")).unwrap();
         std::fs::write(root.join("gone/orphan.txt"), b"stale").unwrap();
 
-        let keep: HashSet<String> = HashSet::new();
+        let keep = KeepSet::new(std::iter::empty());
         let excluded: HashSet<String> = HashSet::new();
         let unreadable: HashSet<String> = ["locked".to_string()].into_iter().collect();
         let token = CancellationToken::new();
-        let mut deleted = 0u64;
+        let mut stats = PruneStats::default();
 
         prune_destination(
             &root,
@@ -1186,7 +1286,7 @@ mod tests {
             &unreadable,
             &glob::PatternSet::new(&[]),
             &token,
-            &mut deleted,
+            &mut stats,
         )
         .await
         .unwrap();
@@ -1203,7 +1303,7 @@ mod tests {
             !root.join("gone/orphan.txt").exists(),
             "genuinely orphaned file should still be pruned"
         );
-        assert_eq!(deleted, 1);
+        assert_eq!(stats.deleted, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1223,24 +1323,65 @@ mod tests {
 
         let empty: HashSet<String> = HashSet::new();
         let token = CancellationToken::new();
-        let mut deleted = 0u64;
+        let mut stats = PruneStats::default();
         prune_destination(
             &root,
-            &empty,
+            &KeepSet::new(std::iter::empty()),
             &empty,
             &empty,
             &glob::PatternSet::new(&[]),
             &token,
-            &mut deleted,
+            &mut stats,
         )
         .await
         .unwrap();
 
-        assert_eq!(deleted, 1);
+        assert_eq!(stats.deleted, 1);
         assert!(
             !dir.exists(),
             "emptied read-only directory was left behind by prune"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The user re-cases a source file (`readme.md` -> `README.md`). NTFS is
+    /// case-preserving, so the copy loop writes through the existing entry
+    /// and the destination keeps the old spelling. prune used to miss that
+    /// spelling in `keep` and delete the file it had just copied, leaving
+    /// the backup incomplete for a whole run while still reporting success.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn prune_recases_instead_of_deleting_on_case_only_rename() {
+        let root = scratch("prune-case-drift");
+        std::fs::write(root.join("Readme.md"), b"content").unwrap();
+        std::fs::write(root.join("dropped.txt"), b"stale").unwrap();
+
+        let keep = KeepSet::new(["README.md".to_string()].into_iter());
+        let empty: HashSet<String> = HashSet::new();
+        let token = CancellationToken::new();
+        let mut stats = PruneStats::default();
+        prune_destination(
+            &root,
+            &keep,
+            &empty,
+            &empty,
+            &glob::PatternSet::new(&[]),
+            &token,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        // exists() is case-insensitive on Windows, so check the actual
+        // directory entry to prove the spelling was corrected.
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["README.md".to_string()]);
+        assert_eq!(std::fs::read(root.join("README.md")).unwrap(), b"content");
+        assert_eq!(stats.recased, 1);
+        assert_eq!(stats.deleted, 1, "the genuinely orphaned file should go");
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -31,7 +31,19 @@ npm run tauri dev
 npm run tauri build
 ```
 
-## Open items for 1.5+
+## Open items for 1.6+
+
+- **Restore has no cancellation.** The backup pipeline threads a
+  `CancellationToken` through every phase; restore has none, so a restore of a
+  large tree can only be waited out. Needs a `RestoreState`, a `cancel_restore`
+  command and a stop button — deliberately left out of the 1.5 sweep rather
+  than half-done.
+- **Directory-level case drift is not corrected.** 1.5 stops prune from
+  deleting a file whose *name* the user re-cased at source, and re-spells it;
+  a re-cased *folder* keeps the destination's old spelling. No data is lost
+  either way.
+
+## Open items carried over from 1.4
 
 - **`execute()` decomposition.** ~350 lines of one function (preflight → walk → copy loop → prune → icon-verify → mirror-attrs → emit → optional verify). Splitting each phase into its own helper returning a typed `PhaseStats` accumulator would let each be tested in isolation — pure refactor, no functional change.
 - Locale-aware date/number formatting via `Intl.DateTimeFormat` / `Intl.NumberFormat` driven by the active language.

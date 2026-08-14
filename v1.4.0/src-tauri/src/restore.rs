@@ -1,3 +1,4 @@
+use crate::fsutil::{apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap};
 use anyhow::{anyhow, Context, Result};
 use filetime::FileTime;
 use serde::Serialize;
@@ -39,13 +40,13 @@ pub async fn restore(
     if !backup_path.is_absolute() || !destination.is_absolute() {
         return Err(anyhow!("Paths must be absolute"));
     }
-    let src_meta = fs::metadata(&backup_path)
+    let src_meta = fs::metadata(long_path(&backup_path))
         .await
         .map_err(|_| anyhow!("Backup folder not found"))?;
     if !src_meta.is_dir() {
         return Err(anyhow!("Backup path is not a directory"));
     }
-    let dest_meta = fs::metadata(&destination)
+    let dest_meta = fs::metadata(long_path(&destination))
         .await
         .map_err(|_| anyhow!("Destination not found"))?;
     if !dest_meta.is_dir() {
@@ -58,7 +59,7 @@ pub async fn restore(
     // success. The backup pipeline has always had this guard; restore did
     // not, even though it is reachable from the UI in two clicks (History →
     // Restore → pick the backup folder as the destination).
-    crate::fsutil::reject_overlap(&backup_path, &destination)?;
+    reject_overlap(&backup_path, &destination)?;
 
     let files = walk(&backup_path).await?;
     let total_files = files.len() as u64;
@@ -69,13 +70,14 @@ pub async fn restore(
     let mut copied_files: u64 = 0;
 
     for (rel, src, size) in &files {
-        let dst = destination.join(rel);
+        let dst = long_path(&destination.join(rel));
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).await?;
         }
         if let Err(e) = copy(src, &dst).await {
             // Drop the half-written file so a re-run of restore doesn't
             // collide on size and quietly accept it.
+            clear_readonly(&dst);
             let _ = fs::remove_file(&dst).await;
             return Ok(RestorePayload {
                 backup_path: backup_path.to_string_lossy().to_string(),
@@ -124,6 +126,10 @@ pub async fn restore(
 // (#6) — a missed file in a "successful" restore is a quiet data-loss bug.
 async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
     let mut out = Vec::new();
+    // Extended-length form throughout, so a backup of a deep tree — which
+    // the backup pipeline handles fine — is also restorable.
+    let root = long_path(root);
+    let root = root.as_path();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let mut entries = fs::read_dir(&dir)
@@ -162,11 +168,14 @@ async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
 }
 
 async fn copy(src: &Path, dst: &Path) -> Result<()> {
+    let src = long_path(src);
+    let dst = long_path(dst);
+    let (src, dst) = (src.as_path(), dst.as_path());
     let src_meta = fs::metadata(src).await.context("stat source")?;
     let mut r = fs::File::open(src).await.context("open source")?;
     // A read-only file already sitting in the chosen destination would make
     // File::create fail outright on Windows and abort the whole restore.
-    crate::fsutil::clear_readonly(dst);
+    clear_readonly(dst);
     let mut w = fs::File::create(dst).await.context("create destination")?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
@@ -183,6 +192,13 @@ async fn copy(src: &Path, dst: &Path) -> Result<()> {
     // Round-trip mtime so a follow-up sync doesn't re-copy everything (#6).
     if let Ok(t) = src_meta.modified() {
         let _ = filetime::set_file_mtime(dst, FileTime::from_system_time(t));
+    }
+    // Mirror Hidden/System/ReadOnly the way the backup pipeline does — a
+    // restored `desktop.ini` without its attributes leaves the folder
+    // rendering with a default icon, which is precisely the thing the
+    // backup side goes to some length to preserve.
+    if let Some(attrs) = read_attrs(src) {
+        apply_attrs(dst, attrs);
     }
     Ok(())
 }
