@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Driveby",
+  "productName": "driveby",
   "version": "1.4.0",
   "identifier": "com.driveby.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Driveby",
+        "title": "driveby",
         "width": 1040,
         "height": 720,
         "minWidth": 820,
@@ -42,7 +42,7 @@
     ],
     "category": "Utility",
     "shortDescription": "Desktop backup application",
-    "longDescription": "Driveby is a fast, lightweight desktop backup tool with a macOS-inspired UI."
+    "longDescription": "driveby is a fast, lightweight desktop backup tool with a macOS-inspired UI."
   },
   "plugins": {
     "updater": {

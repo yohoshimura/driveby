@@ -163,7 +163,7 @@ fn main() {
                 let _ = std::fs::create_dir_all(&dir);
             }
             setup_logging(app.handle());
-            info!("Driveby 1.4 starting");
+            info!("driveby 1.4 starting");
             scheduler::spawn(app.handle().clone());
             Ok(())
         });

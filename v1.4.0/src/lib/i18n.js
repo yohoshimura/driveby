@@ -77,7 +77,7 @@ const MESSAGES = {
     'form.label.schedule': 'Schedule',
     'form.placeholder.name': 'Documents — April',
     'form.placeholder.choose': 'Choose folder…',
-    'form.hint.schedule': 'Automatic runs require Driveby to be open',
+    'form.hint.schedule': 'Automatic runs require driveby to be open',
     'form.action.add': 'Add Task',
     'form.action.save': 'Save',
     'form.error.name': 'Task name required',
@@ -89,7 +89,7 @@ const MESSAGES = {
     'backup.toast.complete': 'Backup complete',
     'backup.toast.cancelled': 'Backup cancelled',
     'backup.toast.failed': 'Backup failed: {error}',
-    'backup.notification.title': 'Driveby',
+    'backup.notification.title': 'driveby',
     'backup.notification.body': 'Backup of “{name}” complete',
 
     'restore.dialog.select': 'Select restore destination',
@@ -152,8 +152,8 @@ const MESSAGES = {
     'settings.label.language': 'Language',
     'settings.label.logs': 'Application logs',
 
-    'settings.tip.verify': 'After copying, Driveby reads each file back and compares it against the original to make sure nothing got corrupted on the way. A bit slower, but recommended for important data.',
-    'settings.tip.continue_on_error': "If a single file can't be copied — for example because it's locked by another app or you don't have permission — Driveby will skip it and keep backing up everything else instead of stopping the whole job.",
+    'settings.tip.verify': 'After copying, driveby reads each file back and compares it against the original to make sure nothing got corrupted on the way. A bit slower, but recommended for important data.',
+    'settings.tip.continue_on_error': "If a single file can't be copied — for example because it's locked by another app or you don't have permission — driveby will skip it and keep backing up everything else instead of stopping the whole job.",
     'settings.tip.preserve_mtime': "Keeps each file's original 'last modified' date when it's copied to the destination. This lets later backups instantly skip files that haven't changed, making repeat runs much faster.",
     'settings.tip.exclude': "List the files or folders you don't want backed up — one per line, or separated by commas. Use * to match any characters in a name, ** to match across folders, and ? for a single character. Start a line with ! to bring something back in (for example, !important.tmp keeps that file even if *.tmp is excluded).",
 
@@ -229,7 +229,7 @@ const MESSAGES = {
     'form.label.schedule': 'Planification',
     'form.placeholder.name': 'Documents — Avril',
     'form.placeholder.choose': 'Choisir un dossier…',
-    'form.hint.schedule': "Les exécutions automatiques nécessitent que Driveby soit ouvert",
+    'form.hint.schedule': "Les exécutions automatiques nécessitent que driveby soit ouvert",
     'form.action.add': 'Ajouter',
     'form.action.save': 'Enregistrer',
     'form.error.name': 'Le nom de la tâche est requis',
@@ -241,7 +241,7 @@ const MESSAGES = {
     'backup.toast.complete': 'Sauvegarde terminée',
     'backup.toast.cancelled': 'Sauvegarde annulée',
     'backup.toast.failed': 'Échec de la sauvegarde : {error}',
-    'backup.notification.title': 'Driveby',
+    'backup.notification.title': 'driveby',
     'backup.notification.body': 'Sauvegarde de « {name} » terminée',
 
     'restore.dialog.select': 'Sélectionner la destination de restauration',
@@ -304,8 +304,8 @@ const MESSAGES = {
     'settings.label.language': 'Langue',
     'settings.label.logs': 'Journaux d’application',
 
-    'settings.tip.verify': "Après la copie, Driveby relit chaque fichier et le compare à l’original pour s’assurer qu’aucune corruption n’est survenue. Un peu plus lent, mais recommandé pour les données importantes.",
-    'settings.tip.continue_on_error': "Si un fichier ne peut pas être copié — par exemple parce qu’il est verrouillé par une autre application ou que vous n’avez pas les droits — Driveby le saute et continue avec les autres au lieu d’arrêter toute la tâche.",
+    'settings.tip.verify': "Après la copie, driveby relit chaque fichier et le compare à l’original pour s’assurer qu’aucune corruption n’est survenue. Un peu plus lent, mais recommandé pour les données importantes.",
+    'settings.tip.continue_on_error': "Si un fichier ne peut pas être copié — par exemple parce qu’il est verrouillé par une autre application ou que vous n’avez pas les droits — driveby le saute et continue avec les autres au lieu d’arrêter toute la tâche.",
     'settings.tip.preserve_mtime': "Conserve la date de « dernière modification » d’origine de chaque fichier copié vers la destination. Cela permet aux sauvegardes suivantes de sauter immédiatement les fichiers inchangés, accélérant nettement les exécutions répétées.",
     'settings.tip.exclude': "Listez les fichiers ou dossiers à ne pas sauvegarder — un par ligne ou séparés par des virgules. Utilisez * pour n’importe quels caractères dans un nom, ** pour traverser les dossiers, et ? pour un seul caractère. Commencez une ligne par ! pour réinclure un élément (par exemple, !important.tmp conserve ce fichier même si *.tmp est exclu).",
 

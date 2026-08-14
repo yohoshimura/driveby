@@ -1,4 +1,4 @@
-# Driveby
+# driveby
 
 Active release: [`v1.4.0`](./v1.4.0/) — the only version kept in the working tree.
 

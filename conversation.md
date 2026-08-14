@@ -87,12 +87,12 @@ Built on the 0.7 audit — shipped the **Critical** block only.
 
 **New event:** `task-updated` (Task JSON). **New bridge method:** `onTaskUpdated(cb)`.
 
-### 1.0 — sync rewrite, rebrand to Driveby, Statistics view, polish
+### 1.0 — sync rewrite, rebrand to driveby, Statistics view, polish
 
-This release pivoted the backup model and rebranded the app. Active folder is now `v1.0.0/`; all earlier folders were renamed `v0.0.1-beta` … `v0.7.0-beta` (plus the former `v1.8.0` (now folded into `v1.0.0`) which was promoted into this release). The repo folder itself was renamed `backup-drive` → `Driveby` (then reverted at end of session — see Session-end note).
+This release pivoted the backup model and rebranded the app. Active folder is now `v1.0.0/`; all earlier folders were renamed `v0.0.1-beta` … `v0.7.0-beta` (plus the former `v1.8.0` (now folded into `v1.0.0`) which was promoted into this release). The repo folder itself was renamed `backup-drive` → `driveby` (then reverted at end of session — see Session-end note).
 
 **Rebrand**
-- App name **BackupDrive → Driveby** everywhere user-facing: `package.json` (`"name": "driveby"`, `"version": "1.0.0"`), `Cargo.toml` (package + `[[bin]]` name `driveby`, version 1.0.0), `tauri.conf.json` (productName, identifier `com.driveby.app`, window title, longDescription), `index.html` `<title>`, `styles.css` header, `Sidebar.jsx` brand block ("Driveby — Version 1.0"), `NewTaskForm.jsx` schedule hint, `AppContext.jsx` notification title, `capabilities/default.json`, log filename `driveby.log`, startup `info!("Driveby 1.0 starting")`, root README + v1.0.0/README.
+- App name **BackupDrive → driveby** everywhere user-facing: `package.json` (`"name": "driveby"`, `"version": "1.0.0"`), `Cargo.toml` (package + `[[bin]]` name `driveby`, version 1.0.0), `tauri.conf.json` (productName, identifier `com.driveby.app`, window title, longDescription), `index.html` `<title>`, `styles.css` header, `Sidebar.jsx` brand block ("driveby — Version 1.0"), `NewTaskForm.jsx` schedule hint, `AppContext.jsx` notification title, `capabilities/default.json`, log filename `driveby.log`, startup `info!("driveby 1.0 starting")`, root README + v1.0.0/README.
 
 **Backup engine — major behavioral pivot (`backup.rs`)**
 - **Sync into destination directly** — no `<name>_<timestamp>` wrapper folder, no `manifest.json` written. Files matching destination by size + mtime are skipped (`unchanged_files` counter).
@@ -136,7 +136,7 @@ This release pivoted the backup model and rebranded the app. Active folder is no
 - Removed dead-code warning: `fn incremental` accessor deleted from `impl Settings`.
 
 **Session-end housekeeping**
-- The repo folder was renamed `backup-drive → Driveby` externally; we then attempted to undo it back to `backup-drive`. Inside the running session the rename failed (Windows refused — `Driveby` is the cwd of this Claude Code process). An empty `backup-drive` stub was cleaned up. The user must finish the rename from outside the session: `Rename-Item Driveby backup-drive` in PowerShell, plus rename the Claude project state dir `~/.claude/projects/C--Users-Yoshimura-Documents-Github-Driveby` → `…-backup-drive` so the JSONL transcript `e048a705-0e65-40a7-8cc1-450250038fc5.jsonl` keeps pairing.
+- The repo folder was renamed `backup-drive → driveby` externally; we then attempted to undo it back to `backup-drive`. Inside the running session the rename failed (Windows refused — `driveby` is the cwd of this Claude Code process). An empty `backup-drive` stub was cleaned up. The user must finish the rename from outside the session: `Rename-Item driveby backup-drive` in PowerShell, plus rename the Claude project state dir `~/.claude/projects/C--Users-Yoshimura-Documents-Github-driveby` → `…-backup-drive` so the JSONL transcript `e048a705-0e65-40a7-8cc1-450250038fc5.jsonl` keeps pairing.
 
 ### 1.1 — motion + Modify Task
 
@@ -145,7 +145,7 @@ This release pivoted the backup model and rebranded the app. Active folder is no
 - **Modify action.** `TaskCard` got a `Modify` button that disables while a backup is running and reuses `NewTaskForm` in edit mode. `Home.jsx` introduced an `editingId` state and an `useExitTransition`-backed mount/unmount so the form animates in/out cleanly. New `editTask(id, patch)` in `AppContext` writes through `bridge.saveTasks`; `lastEditingRef` keeps the form populated while it's animating away. Toast `"Task updated"`.
 - **Motion system.** `cubic-bezier(0.32, 0.72, 0, 1)` easing throughout. Route cross-fade in `App.jsx` (`<div className="view-route" key={view}>`); staggered task list mount via `--stagger` CSS var; sidebar item pop + icon scale; animated progress bar with shimmer; button press-scale + hover lift; tooltip fade/scale; Statistics chart mount-in (area path fade, bars grow upward, list rows stagger). Durations 100–340 ms.
 - **`prefers-reduced-motion`.** Single media-query block in `styles.css` collapses every animation/transition to ~0 ms.
-- **Sidebar/version label.** "Driveby — Version 1.1".
+- **Sidebar/version label.** "driveby — Version 1.1".
 
 ### 1.2 — correctness pass + folder-icon round-trip + new app icon
 
@@ -184,7 +184,7 @@ Triggered by an audit request: "analyse v1.1.0 to find some flaws". The audit su
 - **`src/hooks/useT.js`** — `useT()` returns a `useCallback`'d `t` bound to the current `settings.language`. Components do `const t = useT(); t('view.tasks')`. Inside `AppContext` itself the provider can't use the hook, so a local `tr()` helper reads from a `settingsRef` and calls `translate()` directly — that way async event listeners (the `backup-complete` toast in particular) always pick up the active language without re-binding.
 - **Settings — Language section.** New segmented picker between Appearance and Diagnostics, two buttons (English / Français). Writes `language` via `updateSetting`, which round-trips through `bridge.saveSettings` and re-renders every consumer of `useT`.
 - **Persistence.** `language: "en"` added to `default_settings()` in `src-tauri/src/main.rs` and `DEFAULT_SETTINGS` in `AppContext.jsx`. Validated against `SUPPORTED_LANGUAGES` at the read site so an unknown stored value falls back to `en` instead of crashing.
-- **Translation coverage.** Every user-visible string in `App`, `Sidebar` (sections, items, search placeholder + aria, brand version, region aria), `Toolbar`, `Home`, `TaskCard` (last-run line interpolated, all four buttons + their aria-labels, schedule labels), `NewTaskForm` (every label/placeholder/option/error/dialog title), `Settings` (every section header, every label, every InfoTip, theme options, log button + toast), `History` (header, search, filter labels + `<select>` options, all column headers, status badges, all three row actions, empty state), `Statistics` (block headers, both chart `aria-label`s, the `<title>` tooltips inside `GroupedBarChart`, both empty states, legend), `ConfirmDialog` (Cancel + OK fallback). Brand "Driveby" intentionally untranslated.
+- **Translation coverage.** Every user-visible string in `App`, `Sidebar` (sections, items, search placeholder + aria, brand version, region aria), `Toolbar`, `Home`, `TaskCard` (last-run line interpolated, all four buttons + their aria-labels, schedule labels), `NewTaskForm` (every label/placeholder/option/error/dialog title), `Settings` (every section header, every label, every InfoTip, theme options, log button + toast), `History` (header, search, filter labels + `<select>` options, all column headers, status badges, all three row actions, empty state), `Statistics` (block headers, both chart `aria-label`s, the `<title>` tooltips inside `GroupedBarChart`, both empty states, legend), `ConfirmDialog` (Cancel + OK fallback). Brand "driveby" intentionally untranslated.
 - **Behavioural shape.** No re-mount when language changes — the picker just bumps `settings.language`, every `t()` consumer reads it, React re-renders. Sidebar item search filtering already operates on the localised label list because the `useMemo` depends on `t`.
 - **Sidebar version label.** Bumped to "Version 1.3".
 
@@ -221,7 +221,7 @@ Folder layout reshuffled to match the conceptual phasing of the project: the `v1
 | `v2.2.0`      | `v1.2.0`       |
 | `v2.3.0`      | `v1.3.0`       |
 
-Done via `git mv`. The last move (`v2.3.0` → `v1.3.0`) was blocked by a running Vite dev server on port 1420 holding `node_modules`/watching `src`; the user finished it from outside the dev session after stopping the server. Internal version strings inside each folder (`package.json`, `Cargo.toml`, `tauri.conf.json`, README, sidebar label, `info!()` startup line) were then *also* re-tagged in a follow-up pass so the codebase matches the directory layout: pre-Tauri Electron snapshots now report `0.x-beta`, the Tauri-rebrand series now reports `1.x`. Earlier sections of this log still refer to the *original* folder/version names ("Driveby 2.0 starting", `v2.1.0`, etc.) because that's how things were named at session time; the renumber row in this section is the canonical mapping.
+Done via `git mv`. The last move (`v2.3.0` → `v1.3.0`) was blocked by a running Vite dev server on port 1420 holding `node_modules`/watching `src`; the user finished it from outside the dev session after stopping the server. Internal version strings inside each folder (`package.json`, `Cargo.toml`, `tauri.conf.json`, README, sidebar label, `info!()` startup line) were then *also* re-tagged in a follow-up pass so the codebase matches the directory layout: pre-Tauri Electron snapshots now report `0.x-beta`, the Tauri-rebrand series now reports `1.x`. Earlier sections of this log still refer to the *original* folder/version names ("driveby 2.0 starting", `v2.1.0`, etc.) because that's how things were named at session time; the renumber row in this section is the canonical mapping.
 
 ### 1.4 — Rust audit pass
 
@@ -246,7 +246,7 @@ Triggered by an explicit checklist review request covering safety, idiom, owners
 **Polish:**
 
 - `main()`'s panic message changed from `"error while running tauri application"` to `"Tauri runtime failed to start (check logs in app_log_dir/driveby.log)"` so an end-user log dump tells operators where to look first.
-- `info!("Driveby 1.4 starting")` startup line, sidebar `Version 1.4` label (i18n EN + FR), `package.json` / `Cargo.toml` / `tauri.conf.json` all bumped to `1.4.0`.
+- `info!("driveby 1.4 starting")` startup line, sidebar `Version 1.4` label (i18n EN + FR), `package.json` / `Cargo.toml` / `tauri.conf.json` all bumped to `1.4.0`.
 
 **Tests added (12 new, 19 total, all green):**
 

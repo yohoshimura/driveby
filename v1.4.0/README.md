@@ -1,4 +1,4 @@
-# Driveby 1.4
+# driveby 1.4
 
 A local-drive backup app with a macOS-style sidebar UI — **Tauri 2 + Rust** backend, **React 18 + Vite** frontend.
 
