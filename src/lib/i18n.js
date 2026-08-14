@@ -26,7 +26,7 @@ const MESSAGES = {
     'sidebar.search': 'Search',
     'sidebar.section.library': 'Library',
     'sidebar.section.application': 'Application',
-    'sidebar.brand.version': 'Version 1.4',
+    'sidebar.brand.version': 'Version 1.5',
 
     'toolbar.toggle.show': 'Show sidebar',
     'toolbar.toggle.hide': 'Hide sidebar',
@@ -179,7 +179,7 @@ const MESSAGES = {
     'sidebar.search': 'Rechercher',
     'sidebar.section.library': 'Bibliothèque',
     'sidebar.section.application': 'Application',
-    'sidebar.brand.version': 'Version 1.4',
+    'sidebar.brand.version': 'Version 1.5',
 
     'toolbar.toggle.show': 'Afficher la barre latérale',
     'toolbar.toggle.hide': 'Masquer la barre latérale',
