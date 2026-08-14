@@ -818,7 +818,12 @@ async fn prune_destination(
             // nor those the source walk could not read — and don't recurse
             // into them either, since pruning their contents would still
             // effectively delete protected data.
-            if excluded.contains(&rel_str)
+            // The destination root's icon descriptor is protected on its own
+            // terms, not via `excluded`: that set is filled in by the source
+            // walk, so relying on it meant the destination only kept its
+            // icon when the source root happened to have one too.
+            if is_root_icon_marker(&rel_str)
+                || excluded.contains(&rel_str)
                 || unreadable.contains(&rel_str)
                 || patterns.matches(&rel_str)
             {
@@ -1403,6 +1408,48 @@ mod tests {
             !dir.exists(),
             "emptied read-only directory was left behind by prune"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The destination root's own `desktop.ini` is what gives the backup
+    /// drive its icon in Explorer, and prune_destination's contract says it
+    /// is never removed. It only ever was, though, when the *source* root
+    /// happened to carry one too: the guard read from the `excluded` set,
+    /// which the source walk fills in. Back up a source whose root has no
+    /// desktop.ini and the destination lost its icon on the first run.
+    ///
+    /// A *nested* desktop.ini is a real sub-folder's icon and still tracks
+    /// the source like any other file.
+    #[tokio::test]
+    async fn prune_never_removes_the_destination_roots_icon_descriptor() {
+        let root = scratch("prune-root-icon");
+        std::fs::write(root.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::write(root.join("orphan.txt"), b"stale").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/desktop.ini"), b"nested").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let token = CancellationToken::new();
+        let mut stats = PhaseStats::default();
+        prune_destination(
+            &root,
+            &KeepSet::new(std::iter::empty()),
+            &empty,
+            &empty,
+            &glob::PatternSet::new(&[]),
+            &token,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            root.join("desktop.ini").exists(),
+            "prune removed the destination root's icon descriptor"
+        );
+        assert!(!root.join("orphan.txt").exists());
+        assert!(!root.join("sub/desktop.ini").exists());
+        assert_eq!(stats.deleted, 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
