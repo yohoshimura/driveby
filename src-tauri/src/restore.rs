@@ -71,14 +71,7 @@ pub async fn restore(
 
     for (rel, src, size) in &files {
         let dst = long_path(&destination.join(rel));
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        if let Err(e) = copy(src, &dst).await {
-            // Drop the half-written file so a re-run of restore doesn't
-            // collide on size and quietly accept it.
-            clear_readonly(&dst);
-            let _ = fs::remove_file(&dst).await;
+        if let Err(e) = restore_one(src, &dst).await {
             return Ok(RestorePayload {
                 backup_path: backup_path.to_string_lossy().to_string(),
                 destination: destination.to_string_lossy().to_string(),
@@ -167,6 +160,22 @@ async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
     Ok(out)
 }
 
+/// Restore one file of the backup into the destination tree.
+///
+/// Cleanup on failure is deliberately narrow. The restore loop used to drop
+/// `dst` on *any* error from `copy`, but `copy` can fail before it ever
+/// opens the destination — `stat source` and `open source` both come first.
+/// An unreadable file in the backup therefore deleted the good file the
+/// user already had at the destination, which is the exact opposite of what
+/// a restore is for. Only `copy` knows whether it got as far as creating
+/// the file, so only `copy` takes it back out again.
+async fn restore_one(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    copy(src, dst).await
+}
+
 async fn copy(src: &Path, dst: &Path) -> Result<()> {
     let src = long_path(src);
     let dst = long_path(dst);
@@ -177,18 +186,29 @@ async fn copy(src: &Path, dst: &Path) -> Result<()> {
     // File::create fail outright on Windows and abort the whole restore.
     clear_readonly(dst);
     let mut w = fs::File::create(dst).await.context("create destination")?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = r.read(&mut buf).await.context("read source")?;
-        if n == 0 {
-            break;
+    // Past this line the destination holds our bytes rather than the user's,
+    // so a failure has to take the half-written file back out — otherwise a
+    // re-run can collide on size and quietly accept the truncated copy.
+    let streamed = async {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = r.read(&mut buf).await.context("read source")?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n]).await.context("write destination")?;
         }
-        w.write_all(&buf[..n]).await.context("write destination")?;
+        w.flush().await?;
+        // Durability: don't claim "restored" before the bytes hit disk.
+        w.sync_all().await.context("sync destination")
     }
-    w.flush().await?;
-    // Durability: don't claim "restored" before the bytes hit disk.
-    w.sync_all().await.context("sync destination")?;
+    .await;
     drop(w);
+    if let Err(e) = streamed {
+        clear_readonly(dst);
+        let _ = fs::remove_file(dst).await;
+        return Err(e);
+    }
     // Round-trip mtime so a follow-up sync doesn't re-copy everything (#6).
     if let Ok(t) = src_meta.modified() {
         let _ = filetime::set_file_mtime(dst, FileTime::from_system_time(t));
@@ -229,6 +249,32 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"restored");
 
         crate::fsutil::clear_readonly(&dst);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The restore loop used to drop the destination file on *any* copy
+    /// error, including the ones raised before `File::create` is reached.
+    /// A backup file that cannot be read therefore destroyed the perfectly
+    /// good file the user already had at the destination — the opposite of
+    /// what a restore is for.
+    #[tokio::test]
+    async fn a_copy_that_never_opened_the_destination_leaves_it_alone() {
+        let root = std::env::temp_dir().join("driveby-restore-test-unreadable-src");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("missing-in-backup.txt");
+        let dst = root.join("report.docx");
+        std::fs::write(&dst, b"the user's existing file").unwrap();
+
+        assert!(
+            restore_one(&src, &dst).await.is_err(),
+            "source does not exist"
+        );
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"the user's existing file",
+            "restore deleted a destination file it never wrote to"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
