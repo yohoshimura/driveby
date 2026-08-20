@@ -1,6 +1,7 @@
 use crate::backup::{self, BackupState, Settings, Task};
 use crate::persist;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Months, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,12 +12,34 @@ use tauri::{AppHandle, Manager};
 use tokio::time;
 use tracing::info;
 
-fn interval_for(schedule: Option<&str>) -> Option<chrono::Duration> {
+/// A schedule's spacing. Monthly is its own variant because a calendar
+/// month is not a fixed number of days — "every 30 days" drifts through
+/// the calendar a day or two per cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Interval {
+    Fixed(chrono::Duration),
+    Monthly,
+}
+
+fn interval_for(schedule: Option<&str>) -> Option<Interval> {
     match schedule {
-        Some("daily") => Some(chrono::Duration::days(1)),
-        Some("weekly") => Some(chrono::Duration::weeks(1)),
-        Some("monthly") => Some(chrono::Duration::days(30)),
+        Some("hourly") => Some(Interval::Fixed(chrono::Duration::hours(1))),
+        Some("daily") => Some(Interval::Fixed(chrono::Duration::days(1))),
+        Some("weekly") => Some(Interval::Fixed(chrono::Duration::weeks(1))),
+        Some("monthly") => Some(Interval::Monthly),
         _ => None,
+    }
+}
+
+/// When a run anchored at `anchor` next comes due. Monthly clamps to the
+/// end of shorter months (Jan 31 → Feb 28/29) via `checked_add_months`.
+fn next_due(anchor: DateTime<Utc>, interval: Interval) -> DateTime<Utc> {
+    match interval {
+        Interval::Fixed(d) => anchor + d,
+        Interval::Monthly => anchor
+            .checked_add_months(Months::new(1))
+            // Unreachable this side of year 262143; fall back to 31 days.
+            .unwrap_or(anchor + chrono::Duration::days(31)),
     }
 }
 
@@ -37,9 +60,9 @@ fn is_due(
     now: DateTime<Utc>,
     last: Option<DateTime<Utc>>,
     clock: TaskClock,
-    interval: chrono::Duration,
+    interval: Interval,
 ) -> bool {
-    let on_schedule = now - last.unwrap_or(clock.first_seen) >= interval;
+    let on_schedule = now >= next_due(last.unwrap_or(clock.first_seen), interval);
     // A run that fails never advances `last` — `update_last_backup` only
     // writes on success, so that partial failures don't reset the schedule
     // clock. Without a second anchor the schedule alone therefore held the
@@ -47,16 +70,21 @@ fn is_due(
     // a task whose drive was unplugged retried once a minute forever and
     // filled the history with one failure row per minute. Attempts are
     // spaced by the same interval as successful runs.
-    let retry_ready = clock.last_attempt.is_none_or(|a| now - a >= interval);
+    let retry_ready = clock
+        .last_attempt
+        .is_none_or(|a| now >= next_due(a, interval));
     on_schedule && retry_ready
 }
 
-/// What this process remembers about a task between ticks. `tasks.json`
+/// What the scheduler remembers about a task between ticks. `tasks.json`
 /// only records *successful* runs, so neither field can be recovered from
-/// it after a restart — they are deliberately per-process.
-#[derive(Clone, Copy)]
+/// it — the map is persisted to `scheduler.json` so an app restart neither
+/// re-anchors a never-run task's clock nor forgets that a failing task
+/// just attempted (which used to allow an immediate retry on relaunch).
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TaskClock {
-    /// When this process first observed the task.
+    /// When the scheduler first observed the task.
     first_seen: DateTime<Utc>,
     /// When we last started a run for it, successful or not.
     last_attempt: Option<DateTime<Utc>>,
@@ -65,11 +93,19 @@ struct TaskClock {
 pub fn spawn(app: AppHandle) {
     async_runtime::spawn(async move {
         time::sleep(Duration::from_secs(10)).await;
-        // Tasks observed for the first time on this app run start their
-        // schedule clock from that observation instead of 1970, so a fresh
-        // install with five daily tasks doesn't fire all five 10s after
-        // launch (#13).
-        let seen: Mutex<HashMap<String, TaskClock>> = Mutex::new(HashMap::new());
+        // Tasks observed for the first time start their schedule clock from
+        // that observation instead of 1970, so a fresh install with five
+        // daily tasks doesn't fire all five 10s after launch (#13). The
+        // clocks are reloaded from scheduler.json so "first observation"
+        // means first ever, not first since the last app restart.
+        let initial: HashMap<String, TaskClock> = match data_path(&app, "scheduler.json") {
+            Some(p) => {
+                let v = persist::read_json_or(&p, serde_json::json!({})).await;
+                serde_json::from_value(v).unwrap_or_default()
+            }
+            None => HashMap::new(),
+        };
+        let seen: Mutex<HashMap<String, TaskClock>> = Mutex::new(initial);
         loop {
             if let Err(e) = tick(&app, &seen).await {
                 tracing::warn!("scheduler tick failed: {}", e);
@@ -101,6 +137,8 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
 
     let now = Utc::now();
     let live_ids: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    // Batch clock mutations into at most one scheduler.json write per tick.
+    let mut dirty = false;
     for task in tasks {
         let Some(interval) = interval_for(task.schedule.as_deref()) else {
             continue;
@@ -115,10 +153,10 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|d| d.with_timezone(&Utc));
 
-        // First time we observe this scheduled task in this process: record
-        // *when* we saw it and don't fire. The user's launch shouldn't double
-        // as a backup trigger; the next interval boundary is when it should
-        // start running on its own.
+        // First time we observe this scheduled task: record *when* we saw
+        // it and don't fire. The user's launch shouldn't double as a backup
+        // trigger; the next interval boundary is when it should start
+        // running on its own.
         //
         // Recovering from poisoning rather than `.unwrap()`-panicking keeps
         // the scheduler alive across an earlier-tick panic; the worst case is
@@ -137,6 +175,7 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
                 }
             }
         };
+        dirty |= first_observation;
         if first_observation && last.is_none() {
             continue;
         }
@@ -152,6 +191,7 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
             let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(c) = s.get_mut(&task.id) {
                 c.last_attempt = Some(now);
+                dirty = true;
             }
         }
 
@@ -169,10 +209,20 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
     }
 
     // Forget tasks the user has deleted, so the map tracks the task list
-    // rather than growing for the lifetime of the process.
-    {
+    // rather than growing for the lifetime of the file.
+    let snapshot = {
         let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = s.len();
         s.retain(|id, _| live_ids.contains(id));
+        dirty |= s.len() != before;
+        if dirty {
+            Some(s.clone())
+        } else {
+            None
+        }
+    };
+    if let (Some(snapshot), Some(path)) = (snapshot, data_path(app, "scheduler.json")) {
+        persist::write_json_atomic(&path, &snapshot).await?;
     }
     Ok(())
 }
@@ -194,6 +244,10 @@ mod tests {
         }
     }
 
+    fn day() -> Interval {
+        Interval::Fixed(chrono::Duration::days(1))
+    }
+
     /// A task whose backup keeps failing never updates `lastBackup` — that
     /// is only written on success — so the schedule clock was its only
     /// anchor and it came due again on the very next 60-second tick, and on
@@ -201,24 +255,22 @@ mod tests {
     /// turns into another failure row in the history.
     #[test]
     fn a_failing_task_waits_a_full_interval_before_retrying() {
-        let day = chrono::Duration::days(1);
         let clock = TaskClock {
             first_seen: at(0),
             last_attempt: Some(at(24 * HOUR)),
         };
         // The run at 24h failed, so `last` still says "never ran".
-        assert!(!is_due(at(24 * HOUR + 60), None, clock, day));
-        assert!(!is_due(at(47 * HOUR), None, clock, day));
-        assert!(is_due(at(48 * HOUR), None, clock, day));
+        assert!(!is_due(at(24 * HOUR + 60), None, clock, day()));
+        assert!(!is_due(at(47 * HOUR), None, clock, day()));
+        assert!(is_due(at(48 * HOUR), None, clock, day()));
     }
 
     /// The retry gate must not swallow the catch-up run: a task last backed
     /// up days ago is due the moment we notice it, before any attempt.
     #[test]
     fn a_stale_task_is_due_immediately_on_first_sighting() {
-        let day = chrono::Duration::days(1);
         let clock = clock_seen_at(72 * HOUR);
-        assert!(is_due(at(72 * HOUR), Some(at(0)), clock, day));
+        assert!(is_due(at(72 * HOUR), Some(at(0)), clock, day()));
     }
 
     /// The regression: a scheduled task that has never been backed up by
@@ -227,33 +279,80 @@ mod tests {
     /// "now" on every tick, so this case never became due.
     #[test]
     fn never_backed_up_task_becomes_due_one_interval_after_first_sighting() {
-        let day = chrono::Duration::days(1);
-        assert!(!is_due(at(12 * HOUR), None, clock_seen_at(0), day));
-        assert!(is_due(at(24 * HOUR), None, clock_seen_at(0), day));
-        assert!(is_due(at(48 * HOUR), None, clock_seen_at(0), day));
+        assert!(!is_due(at(12 * HOUR), None, clock_seen_at(0), day()));
+        assert!(is_due(at(24 * HOUR), None, clock_seen_at(0), day()));
+        assert!(is_due(at(48 * HOUR), None, clock_seen_at(0), day()));
     }
 
     #[test]
     fn last_backup_takes_precedence_over_first_sighting() {
         let last = Some(at(20 * HOUR));
-        let day = chrono::Duration::days(1);
         // 24h after first sighting but only 4h after the last run.
-        assert!(!is_due(at(24 * HOUR), last, clock_seen_at(0), day));
-        assert!(is_due(at(44 * HOUR), last, clock_seen_at(0), day));
+        assert!(!is_due(at(24 * HOUR), last, clock_seen_at(0), day()));
+        assert!(is_due(at(44 * HOUR), last, clock_seen_at(0), day()));
     }
 
     #[test]
     fn interval_for_recognises_supported_schedules() {
-        assert_eq!(interval_for(Some("daily")), Some(chrono::Duration::days(1)));
+        assert_eq!(
+            interval_for(Some("hourly")),
+            Some(Interval::Fixed(chrono::Duration::hours(1)))
+        );
+        assert_eq!(
+            interval_for(Some("daily")),
+            Some(Interval::Fixed(chrono::Duration::days(1)))
+        );
         assert_eq!(
             interval_for(Some("weekly")),
-            Some(chrono::Duration::weeks(1))
+            Some(Interval::Fixed(chrono::Duration::weeks(1)))
         );
-        assert_eq!(
-            interval_for(Some("monthly")),
-            Some(chrono::Duration::days(30))
-        );
-        assert_eq!(interval_for(Some("hourly")), None);
+        assert_eq!(interval_for(Some("monthly")), Some(Interval::Monthly));
         assert_eq!(interval_for(None), None);
+        assert_eq!(interval_for(Some("fortnightly")), None);
+    }
+
+    #[test]
+    fn hourly_task_becomes_due_after_an_hour() {
+        let hourly = Interval::Fixed(chrono::Duration::hours(1));
+        assert!(!is_due(at(HOUR - 60), None, clock_seen_at(0), hourly));
+        assert!(is_due(at(HOUR), None, clock_seen_at(0), hourly));
+    }
+
+    /// "Monthly" means a calendar month, not 30 fixed days — anchored at
+    /// Jan 31 the next due date clamps to the end of February instead of
+    /// drifting into early March a few days at a time.
+    #[test]
+    fn monthly_means_calendar_month_with_end_clamping() {
+        let jan31 = DateTime::parse_from_rfc3339("2026-01-31T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let feb28 = DateTime::parse_from_rfc3339("2026-02-28T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(next_due(jan31, Interval::Monthly), feb28);
+
+        let mar15 = DateTime::parse_from_rfc3339("2026-03-15T08:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let apr15 = DateTime::parse_from_rfc3339("2026-04-15T08:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(next_due(mar15, Interval::Monthly), apr15);
+    }
+
+    /// The clock is persisted to scheduler.json between app runs, so the
+    /// JSON shape is a contract: camelCase keys, RFC3339 timestamps.
+    #[test]
+    fn task_clock_round_trips_through_json() {
+        let clock = TaskClock {
+            first_seen: at(1_000_000),
+            last_attempt: Some(at(2_000_000)),
+        };
+        let json = serde_json::to_string(&clock).unwrap();
+        assert!(json.contains("firstSeen"), "camelCase contract: {json}");
+        assert!(json.contains("lastAttempt"), "camelCase contract: {json}");
+        let back: TaskClock = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.first_seen, clock.first_seen);
+        assert_eq!(back.last_attempt, clock.last_attempt);
     }
 }

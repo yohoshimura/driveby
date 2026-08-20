@@ -1,17 +1,28 @@
 import React from 'react';
 import Button from './common/Button';
-import { formatTime } from '../lib/format';
+import { useFormat } from '../hooks/useFormat';
 import { useT } from '../hooks/useT';
 
 const SCHEDULE_KEY = {
   manual: 'task.schedule.manual',
+  hourly: 'task.schedule.hourly',
   daily: 'task.schedule.daily',
   weekly: 'task.schedule.weekly',
   monthly: 'task.schedule.monthly',
 };
 
+const PHASE_KEY = {
+  syncing: 'backup.phase.syncing',
+  copying: 'backup.phase.copying',
+  pruning: 'backup.phase.pruning',
+  'verifying-icons': 'backup.phase.verifying_icons',
+  finishing: 'backup.phase.finishing',
+  verifying: 'backup.phase.verifying',
+};
+
 export default function TaskCard({ task, backup, onRun, onCancel, onModify, onDelete, index = 0 }) {
   const t = useT();
+  const { formatTime, formatSpeed, formatDuration, formatNumber } = useFormat();
   const isRunning = !!backup;
   const scheduleLabel = t(SCHEDULE_KEY[task.schedule] || 'task.schedule.manual');
   const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
@@ -36,6 +47,18 @@ export default function TaskCard({ task, backup, onRun, onCancel, onModify, onDe
               aria-valuemax={100}
             >
               <div className="progressbar__fill" style={{ width: `${backup.progress || 0}%` }} />
+            </div>
+            <div className="task__progress-meta">
+              <span>{t(PHASE_KEY[backup.phase] || 'backup.phase.copying')}</span>
+              {backup.totalFiles > 0 && (
+                <span className="mono">
+                  {formatNumber(backup.copiedFiles)}/{formatNumber(backup.totalFiles)}
+                </span>
+              )}
+              {backup.speedBps > 0 && <span className="mono">{formatSpeed(backup.speedBps)}</span>}
+              {backup.etaSeconds != null && backup.etaSeconds > 0 && (
+                <span className="mono">{formatDuration(backup.etaSeconds)}</span>
+              )}
             </div>
           </div>
         )}

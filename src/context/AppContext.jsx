@@ -1,8 +1,18 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { bridge } from '../lib/tauri';
 import { useSystemTheme } from '../hooks/useSystemTheme';
+import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
+import { DEFAULT_HISTORY_LIMIT, trimHistory } from '../lib/history';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
 
 const AppContext = createContext(null);
@@ -18,6 +28,8 @@ const DEFAULT_SETTINGS = {
   verify: false,
   continueOnError: true,
   preserveMtime: true,
+  parallelCopies: 4,
+  historyLimit: DEFAULT_HISTORY_LIMIT,
   sidebarOpen: true,
   lastView: 'home',
 };
@@ -26,14 +38,19 @@ export function AppProvider({ children }) {
   const [tasks, setTasks] = useState([]);
   const [history, setHistory] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [activeBackups, setActiveBackups] = useState({});
   const [loaded, setLoaded] = useState(false);
   const [toast, setToast] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
+  const { beginRestore, endRestore } = useProgress();
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const toastTimer = useRef(null);
+  // A restore is a single global operation; the ref is the in-flight guard
+  // that stops a double-click launching a second one before the backend's
+  // own RestoreState can refuse it.
+  const restoreBusy = useRef(false);
 
   // Local helper bound to the current locale. The provider can't use the
   // useT() hook because it *is* the provider, so it goes through translate()
@@ -56,9 +73,12 @@ export function AppProvider({ children }) {
           bridge.getTasks(),
           bridge.getHistory(),
         ]);
-        setSettings({ ...DEFAULT_SETTINGS, ...(s || {}) });
+        const merged = { ...DEFAULT_SETTINGS, ...(s || {}) };
+        setSettings(merged);
         setTasks(Array.isArray(t) ? t : []);
-        setHistory(Array.isArray(h) ? h : []);
+        // Trim at load too, so a history.json that predates the cap (or was
+        // written with a larger one) shrinks on the next save.
+        setHistory(trimHistory(h, merged.historyLimit));
       } finally {
         setLoaded(true);
       }
@@ -84,44 +104,37 @@ export function AppProvider({ children }) {
     const unlisten = [];
     let cancelled = false;
     (async () => {
-      const offStart = await bridge.onBackupStarted((data) => {
-        setActiveBackups((prev) => ({
-          ...prev,
-          [data.taskId]: { progress: 0, copiedBytes: 0, totalBytes: 0, copiedFiles: 0, totalFiles: 0 },
-        }));
-      });
-      const offProgress = await bridge.onBackupProgress((data) => {
-        setActiveBackups((prev) => ({ ...prev, [data.taskId]: data }));
-      });
+      // Progress events are ProgressContext's business; this listener is
+      // here for the history row and the toast, which AppContext owns.
       const offComplete = await bridge.onBackupComplete((data) => {
-        setActiveBackups((prev) => {
-          const next = { ...prev };
-          delete next[data.taskId];
-          return next;
-        });
         // lastBackup is now owned by Rust — it emits task-updated which the
         // listener below applies. Don't mutate tasks locally on complete.
         const existingTask = tasksRef.current.find((t) => t.id === data.taskId);
-        setHistory((prev) => [
-          {
-            id: uuidv4(),
-            taskId: data.taskId,
-            taskName: existingTask?.name || 'Backup',
-            timestamp: new Date().toISOString(),
-            status: data.success ? 'success' : data.cancelled ? 'cancelled' : 'error',
-            path: data.path,
-            totalBytes: data.totalBytes,
-            totalFiles: data.totalFiles,
-            durationMs: data.durationMs,
-            error: data.error,
-            skipped: data.skipped,
-            unchanged: data.unchanged,
-            failed: data.failed,
-            verified: data.verified,
-            unreadable: data.unreadable,
-          },
-          ...prev,
-        ]);
+        setHistory((prev) =>
+          trimHistory(
+            [
+              {
+                id: uuidv4(),
+                taskId: data.taskId,
+                taskName: existingTask?.name || tr('common.backup'),
+                timestamp: new Date().toISOString(),
+                status: data.success ? 'success' : data.cancelled ? 'cancelled' : 'error',
+                path: data.path,
+                totalBytes: data.totalBytes,
+                totalFiles: data.totalFiles,
+                durationMs: data.durationMs,
+                error: data.error,
+                skipped: data.skipped,
+                unchanged: data.unchanged,
+                failed: data.failed,
+                verified: data.verified,
+                unreadable: data.unreadable,
+              },
+              ...prev,
+            ],
+            settingsRef.current.historyLimit,
+          ),
+        );
         if (data.success) {
           showToast(tr('backup.toast.complete'));
           if (settingsRef.current.showNotifications) {
@@ -145,9 +158,9 @@ export function AppProvider({ children }) {
         });
       });
       if (cancelled) {
-        offStart?.(); offProgress?.(); offComplete?.(); offTaskUpdated?.();
+        offComplete?.(); offTaskUpdated?.();
       } else {
-        unlisten.push(offStart, offProgress, offComplete, offTaskUpdated);
+        unlisten.push(offComplete, offTaskUpdated);
       }
     })();
     return () => {
@@ -156,9 +169,20 @@ export function AppProvider({ children }) {
     };
   }, []);
 
+  // Clear the pending timer before arming a new one: two toasts in quick
+  // succession used to share the first one's deadline, so the second
+  // vanished early.
   const showToast = useCallback((message, kind = 'info') => {
     setToast({ message, kind, id: Date.now() });
-    setTimeout(() => setToast(null), 3000);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => {
+      toastTimer.current = null;
+      setToast(null);
+    }, 3000);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
 
   const confirm = useCallback((opts) => new Promise((resolve) => {
@@ -255,6 +279,11 @@ export function AppProvider({ children }) {
       bridge.saveSettings(next);
       return next;
     });
+    // Lowering the cap has to bite now, not at the next completed run —
+    // otherwise the setting looks like it did nothing.
+    if (key === 'historyLimit') {
+      setHistory((prev) => trimHistory(prev, value));
+    }
   }, []);
 
   const revealFolder = useCallback(async (folderPath) => {
@@ -263,6 +292,10 @@ export function AppProvider({ children }) {
   }, [showToast, tr]);
 
   const restoreBackup = useCallback(async (backupPath) => {
+    if (restoreBusy.current) {
+      showToast(tr('restore.busy'), 'error');
+      return;
+    }
     const destination = await bridge.selectDirectory(tr('restore.dialog.select'));
     if (!destination) return;
     const ok = await confirm({
@@ -271,24 +304,46 @@ export function AppProvider({ children }) {
       confirmLabel: tr('restore.dialog.action'),
     });
     if (!ok) return;
+    restoreBusy.current = true;
+    beginRestore();
     try {
       const res = await bridge.restoreBackup(backupPath, destination);
-      if (res.success) {
-        showToast(tr('restore.toast.success', { n: res.copiedFiles }));
+      if (res.cancelled) {
+        showToast(tr('restore.toast.cancelled'));
+      } else if (res.success) {
+        showToast(tr('restore.toast.success', { n: res.copiedFiles, count: res.copiedFiles }));
       } else {
         showToast(tr('restore.toast.failed', { error: res.error }), 'error');
       }
     } catch (e) {
       showToast(tr('restore.toast.failed', { error: e }), 'error');
+    } finally {
+      restoreBusy.current = false;
+      endRestore();
     }
-  }, [confirm, showToast, tr]);
+  }, [confirm, showToast, tr, beginRestore, endRestore]);
 
-  const value = {
-    tasks, history, settings, activeBackups, loaded, toast, confirmState, resolvedTheme,
+  const cancelRestore = useCallback(async () => {
+    await bridge.cancelRestore();
+  }, []);
+
+  // Memoised so a value identity change — and the re-render of every
+  // consumer that comes with it — happens only when something actually
+  // changed, not on each render of the provider.
+  // Deliberately no activeRestore/activeBackups here — live progress stays
+  // in ProgressContext so a running job doesn't invalidate this value ten
+  // times a second and re-render every consumer with it.
+  const value = useMemo(() => ({
+    tasks, history, settings, loaded, toast, confirmState, resolvedTheme,
     startBackup, cancelBackup, addTask, editTask, deleteTask,
-    deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup,
+    deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
     showToast, handleConfirm, confirm, tr,
-  };
+  }), [
+    tasks, history, settings, loaded, toast, confirmState, resolvedTheme,
+    startBackup, cancelBackup, addTask, editTask, deleteTask,
+    deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
+    showToast, handleConfirm, confirm, tr,
+  ]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

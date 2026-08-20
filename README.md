@@ -1,8 +1,72 @@
-# driveby 1.5
+# driveby 1.6
 
 A local-drive backup app with a macOS-style sidebar UI — **Tauri 2 + Rust** backend, **React 18 + Vite** frontend.
 
-Where 1.4 was an idiom-and-lint audit, 1.5 is a **correctness sweep**: no new feature and almost no UI surface change, but a long pass through the backend hunting behavioural bugs. Five of the fixes below destroyed user data *and reported the run as successful*. Verified clean on `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and **41/41 unit tests pass**.
+Where 1.5 was a correctness sweep, **1.6 closes the gaps 1.5 left open and makes the app shippable to other people**: restore gets the cancellation, progress and concurrency guard that backup already had; the copy loop runs files in parallel and fingerprints them as it writes, so verification no longer re-reads both sides; dates and numbers follow the app's language instead of the OS locale; the app survives its window being closed so scheduled backups actually fire; and CI builds signed bundles for Windows, macOS and Linux. Verified clean on `cargo clippy --all-targets` with **55 Rust tests and 19 frontend tests passing**.
+
+See [1.5 and earlier](#data-loss--fixed-in-15) below for the history.
+
+## What's new in 1.6
+
+### Restore parity
+
+| Gap | Fix |
+|-----|-----|
+| **A restore could not be stopped.** The backup pipeline threaded a `CancellationToken` through every phase; restore had none, so a restore of a large tree could only be waited out. | `RestoreState` — a single-slot registry, not the task-keyed `DashMap` backup uses, because the UI exposes one restore flow — hands out a token that `copy()` selects on with the same `biased` `tokio::select!` the backup path uses. Cancellation is byte-granular and routes through the existing cleanup, so no partial file survives. `cancel_restore` is the new command; the stop button lives in the restore overlay. |
+| **Two restores could run at once.** Nothing stopped a double-click launching a second one over the same destination. | `try_begin()` refuses a concurrent restore backend-side; the frontend also holds an in-flight ref and disables every Restore button while one runs. |
+| **A restore looked like nothing was happening.** Rust emitted `restore-progress` and `bridge.onRestoreProgress` existed — nothing consumed either. The window sat idle for the whole copy. | A restore overlay subscribes to the events and shows files, bytes and a progress bar. The backend emit is now throttled to 100 ms like backup's, instead of firing once per file. |
+
+### Performance
+
+- **Parallel copies.** `copy_phase` keeps `parallelCopies` files in flight (default 4, settable to 1/2/4/8 in Settings; **1 reproduces the old sequential behaviour exactly** — the escape hatch for spinning disks). Bounded concurrency comes from a manual window over `FuturesUnordered` rather than spawned tasks: tokio's fs calls already offload to the blocking pool, so borrowed futures get real I/O overlap without `'static` bounds, and per-file results come back as values so `PhaseStats` stays single-owner.
+- **Hash during copy.** `copy_file` folds bytes into an `Xxh3` as it writes them. `verify` therefore re-reads only the *destination*, comparing against the fingerprint taken while copying — it used to read both sides, doubling the I/O of an already-slow option. Scope note: verification now covers files copied by this run; files skipped as unchanged were verified by the run that copied them.
+- **Bounded history.** `history.json` had no cap and was rewritten in full on every change. `historyLimit` (default 1000, `All` still available) trims on append, at load, and immediately when lowered.
+- **No more 10 Hz whole-tree re-renders.** Live progress moved out of `AppContext` into a `ProgressContext` that only `Home`, `History` and the restore overlay consume, and the remaining context value is memoised. A running backup used to invalidate the context ten times a second and re-render everything, history table included.
+
+**Platform-native fast copy was evaluated and rejected for 1.6.** `CopyFile2` / `clonefile` / `copy_file_range` each break hash-during-copy (forcing verification back to a source re-read), and each carries its own partial-file, cancellation and mtime semantics — three platform paths, none of them exercised off Windows until this release's CI exists. Worth revisiting in 1.7 now that it does.
+
+### Correctness
+
+- **Directory-level case drift is corrected.** 1.5 stopped prune deleting a file whose *name* was re-cased at source; a re-cased *folder* kept the destination's stale spelling forever, because `recase_entry`'s `with_file_name` can't reach a parent component. A `recase_dirs_phase` now runs between copy and prune, driven by the source's own directory list: it asks the filesystem for each destination directory's real spelling (`FindFirstFileW`) and renames case-only mismatches shallow-first. Windows-only, like the rest of the case machinery — with a `TODO(macOS)` where APFS will need the same.
+- **Scheduler.** Hourly schedules are supported; "monthly" means a calendar month (`checked_add_months`, so Jan 31 clamps to Feb 28/29) instead of a fixed 30 days; and the retry clock persists to `scheduler.json`, so restarting the app no longer forgets that a failing task just attempted — nor re-anchors a never-run task's schedule.
+- **Toasts no longer cut each other short.** The 3-second timer was never cleared, so two toasts in quick succession shared the first one's deadline.
+- **An error boundary** catches a render throw instead of blanking the window.
+
+### Locale-aware formatting
+
+`formatTime` passed `undefined` to `toLocaleString`, which means *the OS locale* — so a French UI showed system-format dates. All formatters are now built per-language by `makeFormatters(lang)` behind a `useFormat()` hook: `Intl.DateTimeFormat` for dates and chart day labels (which were hardcoded DD/MM), `Intl.NumberFormat` for byte sizes (French gets `Ko`/`Mo`/`Go` and a decimal comma) and thousands separators. Plurals go through `Intl.PluralRules` with `.one`/`.other` keys, replacing the faked `item(s)`; the leftover untranslated literals (`Never`, `Backup`, `Task`) are keys now.
+
+### Background operation
+
+The scheduler runs in-process, so closing the window ended the app and with it every schedule. Both new toggles default **off** — with them off, 1.6 behaves exactly like 1.5:
+
+- **Keep running when the window is closed** hides to a tray icon instead of quitting. The webview stays alive, so schedules, history writes and notifications keep working.
+- **Start driveby at login** registers autostart and launches hidden (`--hidden`).
+
+The tray icon itself is always created — it's the only way back to a hidden window, and creating/destroying it as a setting changes is where the platform bugs live.
+
+### Distribution
+
+- **CI** (`.github/workflows/ci.yml`) runs the Rust and frontend tests on Windows plus a Linux job that keeps the `#[cfg(not(windows))]` paths honest.
+- **Releases** (`.github/workflows/release.yml`) build on a tag: Windows (MSI + NSIS), macOS (universal), Linux (AppImage + deb).
+- **Auto-update** is wired end to end — plugin, capabilities, a Settings section with a manual check and a silent check at launch that only ever raises a toast. It stays inert until signing keys exist; see [Enabling auto-update](#enabling-auto-update).
+- **The version lives in two files** (`package.json`, `src-tauri/Cargo.toml`) instead of five: `tauri.conf.json` has no `version` key so it reads Cargo's, `main.rs` logs `CARGO_PKG_VERSION`, and the sidebar string is a `{version}` parameter fed by vite's `__APP_VERSION__`. `npm run bump-version 1.6.1` updates both manifests.
+
+## Enabling auto-update
+
+Committed state builds fine and ships no updater artifacts. To turn it on:
+
+1. `npm run tauri signer generate -- -w ~/.driveby-updater.key` — **never commit the private key.**
+2. Put the public key in `src-tauri/tauri.updater.conf.json` (replacing `REPLACE_WITH_PUBLIC_KEY`).
+3. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to the repository's GitHub Actions secrets.
+
+The release workflow layers that config in only when the secret is present, so local `npm run tauri build` keeps working untouched either way.
+
+---
+
+## 1.5 — the correctness sweep
+
+Where 1.4 was an idiom-and-lint audit, 1.5 was a **correctness sweep**: no new feature and almost no UI surface change, but a long pass through the backend hunting behavioural bugs. Five of the fixes below destroyed user data *and reported the run as successful*.
 
 > **Note on numbering:** what was previously branded `v2.x` was renumbered to `v1.x` (the actual 1.0+ shipping line, post-Tauri-rebrand). The pre-Tauri Electron snapshots that used to be `v1.x-beta` are now `v0.x-beta`. This README refers to features by the new numbers; `conversation.md` keeps the original session-time labels for historical accuracy.
 
@@ -63,7 +127,7 @@ Matching semantics are unchanged and deliberately so: each rule is still tried a
 
 `src-tauri/src/fsutil.rs` was added to hold the cross-platform helpers both pipelines need (`long_path`, `read_attrs`/`apply_attrs`, `path_contains`, `reject_overlap`, `clear_readonly`) plus a shared `rel_of()` replacing four copies of the strip-prefix-and-normalize pair.
 
-## Tests
+## Tests (as of 1.5)
 
 41 unit tests, up from 19 at the end of 1.4. The ones guarding a data-loss path were each confirmed to fail against the pre-fix code rather than merely passing after it:
 
@@ -77,7 +141,7 @@ Matching semantics are unchanged and deliberately so: each rule is still tried a
 
 `restore` is generic over the Tauri runtime purely so that last test can pass a mock handle; production infers `R = Wry` and no call site changed. The `test` feature is a dev-dependency, so the release build is unaffected.
 
-Two caveats worth keeping in view. `execute()` takes an `AppHandle` and is still not directly unit-testable — the phase tests are the regression net. And the scheduler evidence is unit-level only: an end-to-end daily trigger would take 24 h to observe.
+Two caveats worth keeping in view. `execute()` takes an `AppHandle` and is still not directly unit-testable — the phase tests are the regression net. And the scheduler evidence is unit-level only: an end-to-end daily trigger would take 24 h to observe. *(1.6 closed the first of these: `execute()` is generic over the runtime and driven end to end by `mock_app()`.)*
 
 ## What's retained from 1.4 and 1.3
 
@@ -93,9 +157,10 @@ npm run tauri dev
 npm run tauri build
 ```
 
-## Open items for 1.6+
+## Open items for 1.7+
 
-- **Restore has no cancellation.** The backup pipeline threads a `CancellationToken` through every phase; restore has none, so a restore of a large tree can only be waited out. Needs a `RestoreState`, a `cancel_restore` command and a stop button — deliberately left out of the 1.5 sweep rather than half-done.
-- **Directory-level case drift is not corrected.** 1.5 stops prune from deleting a file whose *name* the user re-cased at source, and re-spells it; a re-cased *folder* keeps the destination's old spelling. No data is lost either way.
-- Locale-aware date/number formatting via `Intl.DateTimeFormat` / `Intl.NumberFormat` driven by the active language.
-- Parallel copies, platform-native fast copy (`clonefile` / `copy_file_range` / `CopyFile2`), streaming hash-during-copy, per-run snapshots with restore-from-snapshot, history virtualization.
+- **Per-run snapshots with restore-from-snapshot.** Deliberately deferred: backup is a live mirror with no manifest or versioning, so snapshots change the storage model (format, retention, garbage collection) and deserve their own design cycle rather than a corner of a release that was otherwise about parity and performance.
+- **Platform-native fast copy**, revisited now that the CI matrix exists to exercise it — see the reasoning under [Performance](#performance).
+- **Case handling on macOS.** APFS is case-insensitive by default, so `KeepSet::by_lowercase`, `fsutil::on_disk_name` and `recase_dirs_phase` should extend there; all three carry a `TODO(macOS)`.
+- **A localized tray menu.** Its labels are English-only, because the menu has to be rebuilt to change them.
+- **End-to-end backup tests in CI.** `execute()` is now generic over the Tauri runtime and driven by `tauri::test::mock_app()`, which is what made the parallel-copy and directory-recase regressions testable; the scheduler is still unit-level only, since observing a real daily trigger takes a day.

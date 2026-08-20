@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
+import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
 
 export const bridge = {
   getSettings: () => invoke('get_settings'),
@@ -14,6 +15,7 @@ export const bridge = {
   startBackup: (task, settings) => invoke('start_backup', { task, settings }),
   cancelBackup: (taskId) => invoke('cancel_backup', { taskId }),
   restoreBackup: (backupPath, destination) => invoke('restore_backup', { backupPath, destination }),
+  cancelRestore: () => invoke('cancel_restore'),
   revealLogsFolder: () => invoke('reveal_logs_folder'),
 
   selectDirectory: async (title) => {
@@ -27,6 +29,26 @@ export const bridge = {
       return { success: true };
     } catch (e) {
       return { success: false, error: String(e) };
+    }
+  },
+
+  // Autostart is registered with the OS, not stored by us, so these read
+  // and write the real registration.
+  isAutostartEnabled: async () => {
+    try {
+      return await isAutostartEnabled();
+    } catch {
+      return false;
+    }
+  },
+
+  setAutostart: async (want) => {
+    try {
+      if (want) await enableAutostart();
+      else await disableAutostart();
+      return true;
+    } catch {
+      return false;
     }
   },
 

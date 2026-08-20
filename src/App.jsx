@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
+import { ProgressProvider } from './context/ProgressContext';
 import { useKeyboard } from './hooks/useKeyboard';
 import Sidebar from './components/Sidebar';
 import Toolbar from './components/Toolbar';
@@ -8,7 +9,9 @@ import History from './components/History';
 import Settings from './components/Settings';
 import Statistics from './components/Statistics';
 import ConfirmDialog from './components/ConfirmDialog';
+import RestoreOverlay from './components/RestoreOverlay';
 import Toast from './components/Toast';
+import { checkForUpdate } from './lib/updater';
 import { useT } from './hooks/useT';
 
 const TITLE_KEYS = {
@@ -19,15 +22,19 @@ const TITLE_KEYS = {
 };
 
 export default function App() {
+  // ProgressProvider wraps AppProvider, not the other way round: it depends
+  // on nothing, while AppContext needs it to flag a restore as in flight.
   return (
-    <AppProvider>
-      <Shell />
-    </AppProvider>
+    <ProgressProvider>
+      <AppProvider>
+        <Shell />
+      </AppProvider>
+    </ProgressProvider>
   );
 }
 
 function Shell() {
-  const { loaded, toast, confirmState, handleConfirm, settings, updateSetting } = useApp();
+  const { loaded, toast, confirmState, handleConfirm, settings, updateSetting, showToast } = useApp();
   const t = useT();
   const [view, setView] = useState(() => settings.lastView || 'home');
   const [sidebarOpen, setSidebarOpen] = useState(() => settings.sidebarOpen !== false);
@@ -48,6 +55,18 @@ function Shell() {
     if (!loaded) return;
     if (settings.sidebarOpen !== sidebarOpen) updateSetting('sidebarOpen', sidebarOpen);
   }, [sidebarOpen, loaded]);
+
+  // One silent check at launch — it only ever raises a toast pointing at
+  // Settings; downloading and installing stays an explicit user action.
+  useEffect(() => {
+    if (!loaded || settings.checkUpdatesOnStart === false) return;
+    let alive = true;
+    checkForUpdate().then((res) => {
+      if (alive && res.available) showToast(t('updates.toast.available'));
+    });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   // Memoise so the keydown listener isn't re-attached on every render (#10).
   // Setters from useState are stable, so an empty dep list is fine.
@@ -83,6 +102,7 @@ function Shell() {
         </main>
       </div>
       <ConfirmDialog state={confirmState} onResolve={handleConfirm} />
+      <RestoreOverlay />
       <Toast toast={toast} />
     </div>
   );

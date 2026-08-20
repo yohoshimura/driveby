@@ -7,12 +7,14 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
 use filetime::FileTime;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +45,8 @@ pub struct Settings {
     pub continue_on_error: Option<bool>,
     #[serde(default, rename = "preserveMtime")]
     pub preserve_mtime: Option<bool>,
+    #[serde(default, rename = "parallelCopies")]
+    pub parallel_copies: Option<u32>,
 }
 
 impl Settings {
@@ -54,6 +58,13 @@ impl Settings {
     }
     fn preserve_mtime(&self) -> bool {
         self.preserve_mtime.unwrap_or(true)
+    }
+    /// How many files the copy loop keeps in flight. 1 is the escape hatch
+    /// that reproduces the historical sequential behavior exactly (spinning
+    /// disks can prefer it); the cap keeps us from turning a USB drive into
+    /// a seek storm.
+    fn parallel_copies(&self) -> usize {
+        self.parallel_copies.unwrap_or(4).clamp(1, 8) as usize
     }
 }
 
@@ -164,8 +175,12 @@ const CANCELLED_MSG: &str = "backup cancelled";
 // Entry point
 // ─────────────────────────────────────────────────────────────────────
 
-pub async fn run_backup(
-    app: &AppHandle,
+/// Generic over the Tauri runtime purely so tests can drive the real
+/// pipeline against `tauri::test::mock_app()`. Production passes an
+/// `AppHandle` (i.e. `AppHandle<Wry>`) and infers `R` from it, so no call
+/// site changes.
+pub async fn run_backup<R: Runtime>(
+    app: &AppHandle<R>,
     state: &BackupState,
     task: Task,
     settings: Settings,
@@ -239,7 +254,7 @@ pub async fn run_backup(
     Ok(payload)
 }
 
-async fn update_last_backup(app: &AppHandle, task_id: &str) -> Result<()> {
+async fn update_last_backup<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Result<()> {
     let dir = app.path().app_data_dir().ok();
     let Some(dir) = dir else {
         return Ok(());
@@ -274,8 +289,8 @@ async fn update_last_backup(app: &AppHandle, task_id: &str) -> Result<()> {
 /// The immutable facts about a run, plus the progress channel back to the
 /// UI. Every phase gets one of these instead of the eight loose parameters
 /// each of them used to need.
-struct RunCtx<'a> {
-    app: &'a AppHandle,
+struct RunCtx<'a, R: Runtime> {
+    app: &'a AppHandle<R>,
     backup_id: &'a str,
     task_id: &'a str,
     target: &'a Path,
@@ -286,7 +301,7 @@ struct RunCtx<'a> {
     total_files: u64,
 }
 
-impl RunCtx<'_> {
+impl<R: Runtime> RunCtx<'_, R> {
     /// Err(CANCELLED_MSG) if the user asked to stop. Phases call this at
     /// every point where stopping is safe.
     fn check_cancelled(&self) -> Result<()> {
@@ -324,18 +339,20 @@ impl RunCtx<'_> {
     }
 
     /// Throttled progress emit for the copy loop: at most one event per
-    /// 100ms, with speed and ETA derived from elapsed wall time.
-    fn maybe_emit(
-        &self,
-        last_emit: &mut Instant,
-        copied_bytes: u64,
-        copied_files: u64,
-        phase: &'static str,
-    ) {
+    /// 100ms across all in-flight workers, with speed and ETA derived from
+    /// elapsed wall time. `try_lock` keeps workers from queueing behind the
+    /// throttle — a contended tick is simply skipped and the next chunk
+    /// emits instead.
+    fn maybe_emit(&self, live: &LiveProgress, phase: &'static str) {
+        let Ok(mut last_emit) = live.last_emit.try_lock() else {
+            return;
+        };
         if last_emit.elapsed().as_millis() < 100 {
             return;
         }
         *last_emit = Instant::now();
+        let copied_bytes = live.bytes.load(Ordering::Relaxed);
+        let copied_files = live.files.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64();
         let speed = if elapsed > 0.0 {
             (copied_bytes as f64 / elapsed) as u64
@@ -368,6 +385,35 @@ impl RunCtx<'_> {
                 phase,
             },
         );
+    }
+}
+
+/// Shared live progress for the concurrent copy loop. Workers add byte
+/// deltas as chunks land and roll their own bytes back out when an attempt
+/// fails or is cancelled, so the global count stays monotone-accurate
+/// without a coordinator task.
+struct LiveProgress {
+    bytes: AtomicU64,
+    files: AtomicU64,
+    last_emit: std::sync::Mutex<Instant>,
+}
+
+impl LiveProgress {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            files: AtomicU64::new(0),
+            last_emit: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+    /// Positive deltas are streamed chunks; a negative delta is a worker
+    /// taking a failed attempt's bytes back out.
+    fn on_delta(&self, delta: i64) {
+        if delta >= 0 {
+            self.bytes.fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            self.bytes.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -414,102 +460,223 @@ async fn preflight(task: &Task) -> Result<(PathBuf, PathBuf)> {
     Ok((source, destination))
 }
 
-/// Mirror the source files into the destination. Files already present with
-/// matching size + mtime (within the 2s tolerance) are skipped.
-async fn copy_phase(ctx: &RunCtx<'_>, files: &[FileEntry], stats: &mut PhaseStats) -> Result<()> {
-    let mut copied_bytes: u64 = 0;
-    let mut copied_files: u64 = 0;
-    let mut last_emit = Instant::now();
+/// Outcome of one file's trip through the copy loop, folded into
+/// `PhaseStats` by the single consumer of the worker stream — workers
+/// return values, so the stats stay single-owner.
+enum FileOutcome {
+    Copied { rel: String, hash: u64 },
+    Unchanged,
+    Failed { rel: String, error: anyhow::Error },
+    /// The run was cancelled or aborted while (or before) this file was in
+    /// flight — nothing to count.
+    Aborted,
+}
 
-    for file in files {
-        ctx.check_cancelled()?;
-        let dest_path = ctx.target.join(&file.rel);
-        if let Some(parent) = dest_path.parent() {
-            // Don't kill the whole job because one parent can't be made (#8).
-            if let Err(e) = fs::create_dir_all(long_path(parent)).await {
-                stats.failed += 1;
-                warn!(target = %file.rel, "create parent failed: {}", e);
-                stats
-                    .errors
-                    .push(format!("{}: create parent: {}", file.rel, e));
-                if !ctx.settings.continue_on_error() {
-                    return Err(anyhow!("create parent for {}: {}", file.rel, e));
-                }
-                continue;
+/// Mirror the source files into the destination, `parallelCopies` files at
+/// a time. Files already present with matching size + mtime (within the 2s
+/// tolerance) are skipped. Returns the copy-time xxh3 of every file
+/// actually copied — what the verify phase later checks the destination
+/// against.
+///
+/// Concurrency notes: a bounded window of borrowed futures — not spawned
+/// tasks — because tokio's fs ops already run on the blocking pool, so
+/// concurrent futures on this one task get real I/O overlap without
+/// `'static` bounds. Platform-native fast copies (CopyFile2 /
+/// clonefile / copy_file_range) were considered and rejected for now: each
+/// breaks hash-during-copy (forcing verify back to re-reading the source),
+/// carries its own partial-file and cancellation semantics, and none of it
+/// is exercised by CI off Windows yet.
+async fn copy_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
+    files: &[FileEntry],
+    stats: &mut PhaseStats,
+) -> Result<Vec<(String, u64)>> {
+    let live = LiveProgress::new();
+    // A child token lets a fatal error (continueOnError=false) stop the
+    // other workers without tripping the parent — run_backup reads the
+    // parent afterwards to tell user cancellation apart from an abort.
+    let abort = ctx.token.child_token();
+
+    let mut hashes: Vec<(String, u64)> = Vec::new();
+    let mut first_error: Option<anyhow::Error> = None;
+
+    // Manual window over FuturesUnordered rather than buffer_unordered —
+    // same bounded concurrency, no closure, and therefore none of the
+    // higher-ranked lifetime trouble closures cause in a Send future.
+    let mut pending = files.iter();
+    let mut in_flight = FuturesUnordered::new();
+    loop {
+        while in_flight.len() < ctx.settings.parallel_copies() {
+            match pending.next() {
+                Some(file) => in_flight.push(copy_one(ctx, file, &live, &abort)),
+                None => break,
             }
         }
-
-        // Skip if destination already has an identical file (size + mtime
-        // match within tolerance — see same_mtime). EXCEPT folder-icon
-        // descriptors (`desktop.ini`): always re-copy them so a stale or
-        // tampered destination copy can never silently leave a folder
-        // rendering with the wrong icon. They're tiny (typically <1 KB).
-        let skip = !is_icon_descriptor(&file.rel)
-            && match fs::metadata(long_path(&dest_path)).await {
-                Ok(meta) => {
-                    meta.is_file()
-                        && meta.len() == file.size
-                        && meta
-                            .modified()
-                            .ok()
-                            .is_some_and(|m| same_mtime(m, file.mtime))
+        let Some(outcome) = in_flight.next().await else {
+            break;
+        };
+        match outcome {
+            FileOutcome::Copied { rel, hash } => hashes.push((rel, hash)),
+            FileOutcome::Unchanged => stats.unchanged += 1,
+            FileOutcome::Failed { rel, error } => {
+                stats.failed += 1;
+                warn!(target = %rel, "copy failed: {}", error);
+                stats.errors.push(format!("{}: {}", rel, error));
+                if !ctx.settings.continue_on_error() && first_error.is_none() {
+                    first_error = Some(error);
+                    abort.cancel();
                 }
-                Err(_) => false,
+            }
+            FileOutcome::Aborted => {}
+        }
+    }
+
+    stats.copied_bytes = live.bytes.load(Ordering::Relaxed);
+    stats.copied_files = live.files.load(Ordering::Relaxed);
+
+    ctx.check_cancelled()?;
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    Ok(hashes)
+}
+
+/// One file through the copy loop: ensure the parent, skip if unchanged,
+/// otherwise copy with retries. Runs concurrently with its siblings — all
+/// shared mutation goes through `live`'s atomics.
+async fn copy_one<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
+    file: &FileEntry,
+    live: &LiveProgress,
+    abort: &CancellationToken,
+) -> FileOutcome {
+    if abort.is_cancelled() {
+        return FileOutcome::Aborted;
+    }
+    let dest_path = ctx.target.join(&file.rel);
+    if let Some(parent) = dest_path.parent() {
+        // Don't kill the whole job because one parent can't be made (#8).
+        if let Err(e) = fs::create_dir_all(long_path(parent)).await {
+            return FileOutcome::Failed {
+                rel: file.rel.clone(),
+                error: anyhow!("create parent: {}", e),
             };
-
-        if skip {
-            stats.unchanged += 1;
-            copied_bytes += file.size;
-            copied_files += 1;
-            ctx.maybe_emit(&mut last_emit, copied_bytes, copied_files, "syncing");
-            continue;
         }
+    }
 
-        // Track bytes within this file so retries don't double-count toward
-        // the global total — progress would overshoot and "stick" at 100%
-        // while the loop kept copying. The callback receives this file's
-        // cumulative bytes so far (resets to 0 on a retry).
-        let base_bytes = copied_bytes;
-        let result = copy_with_retries(
-            &file.path,
-            &dest_path,
-            ctx.token,
-            ctx.settings,
-            |file_so_far| {
-                copied_bytes = base_bytes + file_so_far;
-                ctx.maybe_emit(&mut last_emit, copied_bytes, copied_files, "copying");
-            },
-        )
-        .await;
-
-        match result {
-            Ok(()) => {
-                copied_files += 1;
-                copied_bytes = base_bytes + file.size;
+    // Skip if destination already has an identical file (size + mtime
+    // match within tolerance — see same_mtime). EXCEPT folder-icon
+    // descriptors (`desktop.ini`): always re-copy them so a stale or
+    // tampered destination copy can never silently leave a folder
+    // rendering with the wrong icon. They're tiny (typically <1 KB).
+    let skip = !is_icon_descriptor(&file.rel)
+        && match fs::metadata(long_path(&dest_path)).await {
+            Ok(meta) => {
+                meta.is_file()
+                    && meta.len() == file.size
+                    && meta
+                        .modified()
+                        .ok()
+                        .is_some_and(|m| same_mtime(m, file.mtime))
             }
-            Err(e) => {
-                ctx.check_cancelled()?;
-                stats.failed += 1;
-                copied_bytes = base_bytes; // discard partial progress for failed file
-                warn!(target = %file.rel, "copy failed: {}", e);
-                stats.errors.push(format!("{}: {}", file.rel, e));
-                if !ctx.settings.continue_on_error() {
-                    return Err(e);
+            Err(_) => false,
+        };
+
+    if skip {
+        live.bytes.fetch_add(file.size, Ordering::Relaxed);
+        live.files.fetch_add(1, Ordering::Relaxed);
+        ctx.maybe_emit(live, "syncing");
+        return FileOutcome::Unchanged;
+    }
+
+    let result = copy_with_retries(&file.path, &dest_path, abort, ctx.settings, &mut |delta| {
+        live.on_delta(delta);
+        if delta > 0 {
+            ctx.maybe_emit(live, "copying");
+        }
+    })
+    .await;
+
+    match result {
+        Ok(hash) => {
+            live.files.fetch_add(1, Ordering::Relaxed);
+            FileOutcome::Copied {
+                rel: file.rel.clone(),
+                hash,
+            }
+        }
+        Err(error) => {
+            if abort.is_cancelled() {
+                FileOutcome::Aborted
+            } else {
+                FileOutcome::Failed {
+                    rel: file.rel.clone(),
+                    error,
                 }
             }
         }
     }
+}
 
-    stats.copied_bytes = copied_bytes;
-    stats.copied_files = copied_files;
-    Ok(())
+/// Re-spell destination directories whose on-disk casing no longer matches
+/// the source: NTFS is case-insensitive but case-preserving, so when the
+/// user re-cases a folder at source, every write goes through the existing
+/// destination entry and the old spelling survives. File-level drift is
+/// `recase_entry`'s job during prune; this pass owns the directory
+/// components, which `with_file_name` can never reach.
+///
+/// Shallow-first so parents are corrected before children are looked at —
+/// though lookups resolve case-insensitively either way, so the pass is
+/// order-tolerant, and it is idempotent: a cancelled run finishes the job
+/// on the next one.
+// TODO(macOS): APFS is case-insensitive by default too — extend this cfg
+// (and KeepSet::by_lowercase, and fsutil::on_disk_name) once macOS is a
+// supported target.
+#[cfg(windows)]
+async fn recase_dirs_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
+    dirs: &[(PathBuf, String)],
+    stats: &mut PhaseStats,
+) {
+    let mut rels: Vec<&str> = dirs.iter().map(|(_, r)| r.as_str()).collect();
+    rels.sort_by_key(|r| r.matches('/').count());
+    for rel in rels {
+        if ctx.token.is_cancelled() {
+            return;
+        }
+        let Some(want) = Path::new(rel).file_name() else {
+            continue;
+        };
+        let dest = ctx.target.join(rel);
+        // Not created yet (empty source dirs only materialize in
+        // mirror_dir_attrs_phase) — nothing to re-spell.
+        let Some(actual) = crate::fsutil::on_disk_name(&dest) else {
+            continue;
+        };
+        if actual == want {
+            continue;
+        }
+        // The lookup found the entry under a different spelling. Only act
+        // when the difference is case-only: an 8.3 short-name alias could
+        // otherwise match a genuinely different name, and renaming that
+        // would not be a recase.
+        if actual.to_string_lossy().to_lowercase() != want.to_string_lossy().to_lowercase() {
+            continue;
+        }
+        let parent = dest.parent().unwrap_or(ctx.target);
+        let old = parent.join(&actual);
+        match fs::rename(long_path(&old), long_path(&dest)).await {
+            Ok(()) => stats.recased += 1,
+            Err(e) => warn!("could not restore source casing for directory {}: {}", rel, e),
+        }
+    }
 }
 
 /// Mirror-delete pass: remove anything in the destination that is no longer
 /// in the source. Excluded paths are *preserved* — exclude means "don't
 /// copy", not "delete from dest" (#2) — as are paths the walk could not read.
-async fn prune_phase(
-    ctx: &RunCtx<'_>,
+async fn prune_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
     files: &[FileEntry],
     walked: &WalkResult,
     patterns: &glob::PatternSet,
@@ -533,7 +700,7 @@ async fn prune_phase(
     }
     if stats.recased > 0 {
         info!(
-            "restored source casing on {} destination file(s)",
+            "restored source casing on {} destination path(s)",
             stats.recased
         );
     }
@@ -553,8 +720,8 @@ async fn prune_phase(
 /// parent-folder attribute apply, so the very last action on each icon
 /// folder is setting the `+R`/`+S` bit on a folder whose `desktop.ini` is
 /// known to match the source bit-for-bit.
-async fn verify_icons_phase(
-    ctx: &RunCtx<'_>,
+async fn verify_icons_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
     files: &[FileEntry],
     stats: &mut PhaseStats,
 ) -> Result<()> {
@@ -595,8 +762,10 @@ async fn verify_icons_phase(
             if let Some(parent) = dest_path.parent() {
                 let _ = fs::create_dir_all(long_path(parent)).await;
             }
-            match copy_with_retries(&f.path, &dest_path, ctx.token, ctx.settings, |_| {}).await {
-                Ok(()) => stats.icon_resyncs += 1,
+            match copy_with_retries(&f.path, &dest_path, ctx.token, ctx.settings, &mut |_| {})
+                .await
+            {
+                Ok(_) => stats.icon_resyncs += 1,
                 Err(e) => warn!("icon descriptor resync of {} failed: {}", f.rel, e),
             }
         }
@@ -625,8 +794,8 @@ async fn verify_icons_phase(
 /// mismatch is warned about — that's what surfaces filesystem-level
 /// limitations (e.g. exFAT silently dropping `+R` on directories) rather
 /// than letting the destination quietly render a default icon.
-async fn mirror_dir_attrs_phase(
-    ctx: &RunCtx<'_>,
+async fn mirror_dir_attrs_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
     dirs: &mut [(PathBuf, String)],
     stats: &mut PhaseStats,
 ) {
@@ -662,20 +831,26 @@ async fn mirror_dir_attrs_phase(
     }
 }
 
-/// Optional whole-tree hash verification. Only runs on a clean copy pass:
-/// re-reading files we already know failed would just report the failure a
-/// second time, more slowly.
-async fn verify_phase(ctx: &RunCtx<'_>, files: &[FileEntry], stats: &PhaseStats) -> Result<bool> {
+/// Optional hash verification of this run's copies. Only runs on a clean
+/// copy pass: re-reading files we already know failed would just report the
+/// failure a second time, more slowly. The source side's hash was captured
+/// while copying, so only the destination is re-read — and files skipped as
+/// unchanged were verified by the run that originally copied them.
+async fn verify_phase<R: Runtime>(
+    ctx: &RunCtx<'_, R>,
+    hashes: &[(String, u64)],
+    stats: &PhaseStats,
+) -> Result<bool> {
     if !ctx.settings.verify() || stats.failed != 0 {
         return Ok(false);
     }
     ctx.emit_phase("verifying", stats.copied_bytes, stats.copied_files, None);
-    verify_files(files, ctx.target, ctx.token).await?;
+    verify_files(hashes, ctx.target, ctx.token).await?;
     Ok(true)
 }
 
-async fn execute(
-    app: &AppHandle,
+async fn execute<R: Runtime>(
+    app: &AppHandle<R>,
     backup_id: &str,
     task: &Task,
     settings: &Settings,
@@ -714,7 +889,9 @@ async fn execute(
     };
     let mut stats = PhaseStats::default();
 
-    copy_phase(&ctx, &walked.files, &mut stats).await?;
+    let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
+    #[cfg(windows)]
+    recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
     prune_phase(&ctx, &walked.files, &walked, &patterns, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
     mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
@@ -723,7 +900,7 @@ async fn execute(
     // throttle would have skipped the last chunk.
     ctx.emit_phase("finishing", ctx.total_bytes, ctx.total_files, Some(0));
 
-    let verified = verify_phase(&ctx, &walked.files, &stats).await?;
+    let verified = verify_phase(&ctx, &hashes, &stats).await?;
 
     for e in &stats.errors {
         warn!("file error: {}", e);
@@ -889,9 +1066,9 @@ async fn prune_destination(
 ///
 /// Only the file name is re-spelled: if the case drift is in a *directory*
 /// component the basename already matches, `with_file_name` yields the path
-/// we started from, and we leave it alone. Directory-level case drift is not
-/// corrected — but the file is no longer deleted for it either, which was
-/// the part that lost data.
+/// we started from, and we leave it alone. That directory-level drift is
+/// `recase_dirs_phase`'s job, which runs before prune — so by the time this
+/// is reached, pure directory drift no longer reads as `CaseDrift` at all.
 async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PhaseStats) {
     let Some(name) = Path::new(source_rel).file_name() else {
         return;
@@ -1145,26 +1322,29 @@ async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
     })
 }
 
-async fn copy_with_retries<F: FnMut(u64)>(
+/// `on_progress` receives signed byte deltas: positive for streamed chunks,
+/// one negative correction when an attempt fails or is cancelled (the
+/// worker takes its own bytes back out of the shared counter). On success,
+/// returns the xxh3 of the bytes written.
+async fn copy_with_retries<F: FnMut(i64)>(
     src: &Path,
     dest: &Path,
     token: &CancellationToken,
     settings: &Settings,
-    mut on_progress: F,
-) -> Result<()> {
+    on_progress: &mut F,
+) -> Result<u64> {
     let mut attempts = 0;
     let max = 3;
     loop {
         attempts += 1;
-        on_progress(0); // reset per-file progress for any prior failed attempt
-                        // std's remove_file already ignores READONLY on NTFS, but that fast
-                        // path needs FileDispositionInfoEx — unsupported on the FAT32/exFAT
-                        // volumes this app is most often pointed at. See fsutil::clear_readonly.
+        // std's remove_file already ignores READONLY on NTFS, but that fast
+        // path needs FileDispositionInfoEx — unsupported on the FAT32/exFAT
+        // volumes this app is most often pointed at. See fsutil::clear_readonly.
         clear_readonly(&long_path(dest));
         let _ = fs::remove_file(long_path(dest)).await;
-        let res = copy_file(src, dest, token, settings, &mut on_progress).await;
+        let res = copy_file(src, dest, token, settings, on_progress).await;
         match res {
-            Ok(()) => return Ok(()),
+            Ok(hash) => return Ok(hash),
             Err(e) => {
                 if token.is_cancelled() {
                     return Err(e);
@@ -1184,13 +1364,13 @@ async fn copy_with_retries<F: FnMut(u64)>(
     }
 }
 
-async fn copy_file<F: FnMut(u64)>(
+async fn copy_file<F: FnMut(i64)>(
     src: &Path,
     dest: &Path,
     token: &CancellationToken,
     settings: &Settings,
-    mut on_progress: F,
-) -> Result<()> {
+    on_progress: &mut F,
+) -> Result<u64> {
     let src_l = long_path(src);
     let dest_l = long_path(dest);
     let src_meta = fs::metadata(&src_l).await.context("stat source")?;
@@ -1209,28 +1389,41 @@ async fn copy_file<F: FnMut(u64)>(
     };
     let mut buf = vec![0u8; buf_size];
     let mut file_so_far: u64 = 0;
+    // Hash while the bytes are already in memory — this is what lets the
+    // verify phase re-read only the destination instead of both sides.
+    let mut hasher = Xxh3::new();
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => {
-                drop(writer);
-                let _ = fs::remove_file(&dest_l).await;
-                return Err(anyhow!(CANCELLED_MSG));
-            }
-            read = reader.read(&mut buf) => {
-                let n = read.context("read source")?;
-                if n == 0 { break; }
-                writer.write_all(&buf[..n]).await.context("write destination")?;
-                file_so_far += n as u64;
-                on_progress(file_so_far);
+    let streamed: Result<()> = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    return Err(anyhow!(CANCELLED_MSG));
+                }
+                read = reader.read(&mut buf) => {
+                    let n = read.context("read source")?;
+                    if n == 0 { break; }
+                    writer.write_all(&buf[..n]).await.context("write destination")?;
+                    hasher.update(&buf[..n]);
+                    file_so_far += n as u64;
+                    on_progress(n as i64);
+                }
             }
         }
+        writer.flush().await?;
+        // Durability: actually commit to disk before returning success.
+        writer.sync_all().await.context("sync destination")
     }
-    writer.flush().await?;
-    // Durability: actually commit to disk before returning success.
-    writer.sync_all().await.context("sync destination")?;
+    .await;
     drop(writer);
+
+    if let Err(e) = streamed {
+        // Take this attempt's bytes back out of the shared counter, and
+        // the partial file with them — failure and cancellation alike.
+        on_progress(-(file_so_far as i64));
+        let _ = fs::remove_file(&dest_l).await;
+        return Err(e);
+    }
 
     if settings.preserve_mtime() {
         if let Ok(ft) = src_meta.modified() {
@@ -1243,23 +1436,21 @@ async fn copy_file<F: FnMut(u64)>(
     if let Some(attrs) = read_attrs(src) {
         apply_attrs(dest, attrs);
     }
-    Ok(())
+    Ok(hasher.digest())
 }
 
 async fn verify_files(
-    files: &[FileEntry],
+    hashes: &[(String, u64)],
     backup_path: &Path,
     token: &CancellationToken,
 ) -> Result<()> {
-    for f in files {
+    for (rel, src_hash) in hashes {
         if token.is_cancelled() {
             return Err(anyhow!(CANCELLED_MSG));
         }
-        let dest = backup_path.join(&f.rel);
-        let a = hash_file(&f.path).await?;
-        let b = hash_file(&dest).await?;
-        if a != b {
-            return Err(anyhow!("Hash mismatch for {}", f.rel));
+        let got = hash_file(&backup_path.join(rel)).await?;
+        if got != *src_hash {
+            return Err(anyhow!("Hash mismatch for {}", rel));
         }
     }
     Ok(())
@@ -1316,6 +1507,325 @@ mod tests {
         assert!(same_mtime(base, plus_1));
         assert!(same_mtime(base, plus_2));
         assert!(!same_mtime(base, plus_3));
+    }
+
+    /// End-to-end pipeline run against the mock Tauri runtime: copy a small
+    /// tree, prune an orphan, and report honest counts. This is the harness
+    /// the parallel-copy and recase regression tests build on.
+    #[tokio::test]
+    async fn execute_mirrors_source_into_destination_end_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(source.join("sub").join("b.txt"), b"beta").unwrap();
+        std::fs::write(dest.join("stale.txt"), b"orphan").unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "e2e".into(),
+            name: "e2e".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let token = CancellationToken::new();
+        let payload = execute(
+            app.handle(),
+            "backup-e2e",
+            &task,
+            &Settings::default(),
+            &token,
+        )
+        .await
+        .expect("pipeline should succeed");
+
+        assert!(payload.success);
+        assert!(!payload.cancelled);
+        assert_eq!(payload.total_files, Some(2));
+        assert_eq!(payload.failed, Some(0));
+        assert_eq!(payload.cleaned, Some(1), "orphan should be pruned");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(dest.join("sub").join("b.txt")).unwrap(),
+            b"beta"
+        );
+        assert!(!dest.join("stale.txt").exists());
+    }
+
+    /// A folder the user re-cased at source keeps the destination's stale
+    /// spelling forever: 1.5 stopped prune from *deleting* files through the
+    /// drifted directory, and 1.6 actually re-spells the directory entry.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn execute_respells_a_recased_directory_at_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("Docs")).unwrap();
+        std::fs::write(source.join("Docs").join("readme.md"), b"hello").unwrap();
+        std::fs::create_dir_all(dest.join("docs")).unwrap();
+        std::fs::write(dest.join("docs").join("readme.md"), b"hello").unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "recase".into(),
+            name: "recase".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let token = CancellationToken::new();
+        let payload = execute(
+            app.handle(),
+            "backup-recase",
+            &task,
+            &Settings::default(),
+            &token,
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert_eq!(
+            payload.cleaned,
+            Some(0),
+            "a case-only rename must not delete anything"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"Docs".to_string()),
+            "destination folder kept its stale casing: {:?}",
+            names
+        );
+        assert_eq!(
+            std::fs::read(dest.join("Docs").join("readme.md")).unwrap(),
+            b"hello"
+        );
+    }
+
+    /// Multi-level drift: every re-cased component of the path gets its
+    /// source spelling back, not just the deepest one.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn execute_respells_nested_recased_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("Alpha").join("Beta")).unwrap();
+        std::fs::write(source.join("Alpha").join("Beta").join("c.txt"), b"x").unwrap();
+        std::fs::create_dir_all(dest.join("alpha").join("beta")).unwrap();
+        std::fs::write(dest.join("alpha").join("beta").join("c.txt"), b"x").unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "recase-nested".into(),
+            name: "recase-nested".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let token = CancellationToken::new();
+        let payload = execute(
+            app.handle(),
+            "backup-recase-nested",
+            &task,
+            &Settings::default(),
+            &token,
+        )
+        .await
+        .unwrap();
+        assert!(payload.success);
+
+        let top: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(top.contains(&"Alpha".to_string()), "top level: {:?}", top);
+        let inner: Vec<String> = std::fs::read_dir(dest.join("Alpha"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(inner.contains(&"Beta".to_string()), "inner level: {:?}", inner);
+        assert!(dest.join("Alpha").join("Beta").join("c.txt").exists());
+    }
+
+    /// The parallel copy path must produce byte-identical results and the
+    /// same counts as the sequential one — `parallelCopies: 1` is the
+    /// escape hatch and has to stay a faithful baseline.
+    #[tokio::test]
+    async fn parallel_copies_match_sequential_results() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        for i in 0..40u32 {
+            std::fs::write(
+                source.join(format!("f{i}.bin")),
+                vec![i as u8; 1000 + i as usize],
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("nested").join(format!("n{i}.bin")),
+                vec![i as u8; 10 + i as usize],
+            )
+            .unwrap();
+        }
+
+        let app = tauri::test::mock_app();
+        let mut payloads = Vec::new();
+        for (name, n) in [("seq", 1u32), ("par", 4u32)] {
+            let dest = root.path().join(format!("dest-{name}"));
+            std::fs::create_dir_all(&dest).unwrap();
+            let task = Task {
+                id: name.into(),
+                name: name.into(),
+                source: source.to_string_lossy().to_string(),
+                destination: dest.to_string_lossy().to_string(),
+                schedule: None,
+                last_backup: None,
+            };
+            let settings = Settings {
+                parallel_copies: Some(n),
+                ..Default::default()
+            };
+            let token = CancellationToken::new();
+            let payload = execute(app.handle(), name, &task, &settings, &token)
+                .await
+                .unwrap();
+            assert!(payload.success);
+            assert_eq!(std::fs::read(dest.join("f7.bin")).unwrap(), vec![7u8; 1007]);
+            assert_eq!(
+                std::fs::read(dest.join("nested").join("n39.bin")).unwrap(),
+                vec![39u8; 49]
+            );
+            payloads.push(payload);
+        }
+        let (seq, par) = (&payloads[0], &payloads[1]);
+        assert_eq!(seq.total_files, par.total_files);
+        assert_eq!(seq.total_bytes, par.total_bytes);
+        assert_eq!(seq.failed, par.failed);
+        assert_eq!(seq.unchanged, par.unchanged);
+        assert_eq!(par.total_files, Some(80));
+        assert_eq!(par.failed, Some(0));
+    }
+
+    /// Every in-flight parallel copy must take its partial file back out on
+    /// cancellation, exactly like the sequential loop always has.
+    #[tokio::test]
+    async fn a_cancelled_parallel_copy_leaves_no_partial_files() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        for i in 0..10u8 {
+            std::fs::write(source.join(format!("f{i}.bin")), vec![i; 1024 * 1024]).unwrap();
+        }
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "cancel-par".into(),
+            name: "cancel-par".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let settings = Settings {
+            parallel_copies: Some(4),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = execute(app.handle(), "cancel-par", &task, &settings, &token).await;
+        assert!(result.is_err(), "a cancelled run must not report success");
+        let leftover: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "cancelled run left partial files: {:?}",
+            leftover
+        );
+    }
+
+    /// continueOnError=false stops the run on the first real failure — and
+    /// that abort must never be mistaken for a user cancellation, which is
+    /// what run_backup reads off the token afterwards.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_failing_file_aborts_the_run_without_reading_as_cancelled() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        for i in 0..8u8 {
+            std::fs::write(source.join(format!("ok{i}.bin")), vec![i; 512]).unwrap();
+        }
+        std::fs::write(source.join("locked.bin"), b"unreadable").unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(source.join("locked.bin"))
+            .unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "abort".into(),
+            name: "abort".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let settings = Settings {
+            continue_on_error: Some(false),
+            parallel_copies: Some(4),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+
+        let result = execute(app.handle(), "abort", &task, &settings, &token).await;
+        assert!(result.is_err(), "the run must abort on the locked file");
+        assert!(
+            !token.is_cancelled(),
+            "an abort must not read as user cancellation"
+        );
+    }
+
+    /// verify now checks captured copy-time hashes against a re-read of the
+    /// destination only — the redesign that stops verify doubling the I/O.
+    #[tokio::test]
+    async fn verify_files_flags_a_corrupted_destination() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.bin"), b"corrupted-content").unwrap();
+        let token = CancellationToken::new();
+
+        let mut expected = Xxh3::new();
+        expected.update(b"expected-content");
+        let bad = vec![("file.bin".to_string(), expected.digest())];
+        assert!(
+            verify_files(&bad, root.path(), &token).await.is_err(),
+            "a hash mismatch must fail verification"
+        );
+
+        let mut actual = Xxh3::new();
+        actual.update(b"corrupted-content");
+        let good = vec![("file.bin".to_string(), actual.digest())];
+        assert!(verify_files(&good, root.path(), &token).await.is_ok());
     }
 
     /// Fresh, empty scratch directory for filesystem-touching tests.
@@ -1553,7 +2063,7 @@ mod tests {
 
         let token = CancellationToken::new();
         let settings = Settings::default();
-        copy_with_retries(&src, &dest, &token, &settings, |_| {})
+        copy_with_retries(&src, &dest, &token, &settings, &mut |_| {})
             .await
             .expect("read-only destination must be overwritable");
 

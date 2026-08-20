@@ -1,9 +1,10 @@
 import React from 'react';
-import { formatTime } from '../../lib/format';
+import { useFormat } from '../../hooks/useFormat';
 import { useT } from '../../hooks/useT';
 
 const SCHEDULE_KEY = {
   manual: 'task.schedule.manual',
+  hourly: 'task.schedule.hourly',
   daily: 'task.schedule.daily',
   weekly: 'task.schedule.weekly',
   monthly: 'task.schedule.monthly',
@@ -11,6 +12,7 @@ const SCHEDULE_KEY = {
 
 export default function TaskList({ tasks }) {
   const t = useT();
+  const { formatTime } = useFormat();
   if (!tasks || tasks.length === 0) {
     return <div className="chart-empty">{t('chart.empty.tasks')}</div>;
   }

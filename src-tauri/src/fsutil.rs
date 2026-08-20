@@ -126,6 +126,43 @@ pub fn clear_readonly(p: &Path) {
     set_attrs(p, attrs & !ATTR_READONLY);
 }
 
+/// The exact on-disk spelling of `p`'s final component, resolved
+/// case-insensitively — i.e. what the directory entry is actually called,
+/// as opposed to what the caller spelled it as. None if the entry does not
+/// exist (or `p` has no final component, e.g. a drive root).
+#[cfg(windows)]
+pub fn on_disk_name(p: &Path) -> Option<std::ffi::OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    let lp = long_path(p);
+    let wide: Vec<u16> = lp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe { FindClose(handle) };
+    let len = data
+        .cFileName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(data.cFileName.len());
+    Some(std::ffi::OsString::from_wide(&data.cFileName[..len]))
+}
+
+// TODO(macOS): APFS is case-insensitive by default too — give this a
+// readdir-based lookup (and extend KeepSet::by_lowercase) when directory
+// recasing is brought to macOS.
+#[cfg(not(windows))]
+pub fn on_disk_name(_p: &Path) -> Option<std::ffi::OsString> {
+    None
+}
+
 #[cfg(not(windows))]
 pub fn read_attrs(_p: &Path) -> Option<u32> {
     None
@@ -267,6 +304,22 @@ mod tests {
         let p = std::env::temp_dir().join(format!("driveby-test-{}", name));
         let _ = std::fs::create_dir_all(&p);
         p
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_disk_name_reports_the_real_spelling() {
+        let root = make_test_dir("on-disk-name");
+        let dir = root.join("MixedCase");
+        let _ = std::fs::remove_dir(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Query with the wrong case: the answer is what's actually on disk.
+        assert_eq!(
+            on_disk_name(&root.join("mixedcase")).unwrap(),
+            std::ffi::OsStr::new("MixedCase")
+        );
+        assert!(on_disk_name(&root.join("absent")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

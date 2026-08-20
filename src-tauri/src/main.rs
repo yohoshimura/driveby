@@ -6,12 +6,15 @@ mod glob;
 mod persist;
 mod restore;
 mod scheduler;
+mod tray;
 
 use backup::{BackupState, CompletePayload, Settings, Task};
+use restore::RestoreState;
 use serde_json::Value;
 use std::path::PathBuf;
 use tauri::Manager;
 use tracing::info;
+use tray::UiFlags;
 
 fn data_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
@@ -32,10 +35,25 @@ fn default_settings() -> Value {
         "verify": false,
         "continueOnError": true,
         "preserveMtime": true,
+        "parallelCopies": 4,
+        "historyLimit": 1000,
+        "closeToTray": false,
+        "autostart": false,
+        "checkUpdatesOnStart": true,
         "sidebarOpen": true,
         "lastView": "home",
         "language": "en"
     })
+}
+
+/// Whether the app should keep running when the window is closed. Read at
+/// startup and re-read on every settings save, because the window-close
+/// handler is synchronous and cannot await a file read.
+fn close_to_tray_of(settings: &Value) -> bool {
+    settings
+        .get("closeToTray")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -45,8 +63,13 @@ async fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn save_settings(app: tauri::AppHandle, settings: Value) -> Result<(), String> {
+async fn save_settings(
+    app: tauri::AppHandle,
+    flags: tauri::State<'_, UiFlags>,
+    settings: Value,
+) -> Result<(), String> {
     let path = data_path(&app, "settings.json")?;
+    flags.set_close_to_tray(close_to_tray_of(&settings));
     persist::write_json_atomic(&path, &settings)
         .await
         .map_err(|e| e.to_string())
@@ -110,12 +133,24 @@ async fn cancel_backup(
 #[tauri::command]
 async fn restore_backup(
     app: tauri::AppHandle,
+    state: tauri::State<'_, RestoreState>,
     backup_path: String,
     destination: String,
 ) -> Result<restore::RestorePayload, String> {
-    restore::restore(&app, PathBuf::from(backup_path), PathBuf::from(destination))
-        .await
-        .map_err(|e| e.to_string())
+    restore::run_restore(
+        &app,
+        &state,
+        PathBuf::from(backup_path),
+        PathBuf::from(destination),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_restore(state: tauri::State<'_, RestoreState>) -> Result<(), String> {
+    state.cancel();
+    Ok(())
 }
 
 #[tauri::command]
@@ -148,23 +183,63 @@ fn setup_logging(app: &tauri::AppHandle) {
 fn main() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+            tray::show_main_window(app);
         }))
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            // Launched by the OS at login, the app should come up in the
+            // background rather than throwing a window at the user.
+            Some(vec!["--hidden"]),
+        ))
         .manage(BackupState::default())
+        .manage(RestoreState::default())
+        .manage(UiFlags::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let flags = window.state::<UiFlags>();
+                if flags.close_to_tray() {
+                    // Keep the process — and with it the scheduler — alive.
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             if let Ok(dir) = app.path().app_data_dir() {
                 let _ = std::fs::create_dir_all(&dir);
             }
             setup_logging(app.handle());
-            info!("driveby 1.5 starting");
+            info!("driveby {} starting", env!("CARGO_PKG_VERSION"));
+
+            if let Err(e) = tray::setup(app.handle()) {
+                tracing::warn!("could not create tray icon: {}", e);
+            }
+
+            // Seed the close-to-tray flag from disk; save_settings keeps it
+            // in step from then on.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(path) = data_path(&handle, "settings.json") {
+                    let settings = persist::read_json_or(&path, default_settings()).await;
+                    handle
+                        .state::<UiFlags>()
+                        .set_close_to_tray(close_to_tray_of(&settings));
+                }
+            });
+
+            // Autostart passes --hidden: come up in the tray only.
+            if std::env::args().any(|a| a == "--hidden") {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
+            }
+
             scheduler::spawn(app.handle().clone());
             Ok(())
         });
@@ -179,6 +254,7 @@ fn main() {
         start_backup,
         cancel_backup,
         restore_backup,
+        cancel_restore,
         reveal_logs_folder,
     ]);
 

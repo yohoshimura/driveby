@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef } from 'react';
 import { useApp } from '../context/AppContext';
+import { useProgress } from '../context/ProgressContext';
 import Button from './common/Button';
 import EmptyState from './common/EmptyState';
 import TaskCard from './TaskCard';
@@ -10,9 +11,10 @@ import { useT } from '../hooks/useT';
 
 export default function Home() {
   const {
-    tasks, activeBackups, settings,
+    tasks, settings,
     startBackup, cancelBackup, addTask, editTask, deleteTask, showToast,
   } = useApp();
+  const { activeBackups } = useProgress();
   const t = useT();
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);

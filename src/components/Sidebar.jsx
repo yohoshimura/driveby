@@ -92,7 +92,7 @@ export default function Sidebar({ view, setView, open = true }) {
           <HardDrive size={16} />
           <div className="sidebar__brand-text">
             <div className="sidebar__brand-name">driveby</div>
-            <div className="sidebar__brand-version">{t('sidebar.brand.version')}</div>
+            <div className="sidebar__brand-version">{t('sidebar.brand.version', { version: __APP_VERSION__ })}</div>
           </div>
         </div>
       </div>

@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useEffect } from 'react';
-import { formatBytes } from '../../lib/format';
+import { useFormat } from '../../hooks/useFormat';
 import { useT } from '../../hooks/useT';
 
 const PIE_SIZE = 140;
@@ -26,6 +26,8 @@ function arcPath(cx, cy, r, startAngle, endAngle) {
 
 export default function CandleChart({ entries }) {
   const t = useT();
+  const { formatBytes, formatDayLabel } = useFormat();
+  const fallbackName = t('common.task');
   const { days, taskColors, taskNames } = useMemo(() => {
     const byDay = new Map(); // dayKey -> Map<taskId, { name, bytes }>
     const names = new Map();
@@ -36,11 +38,11 @@ export default function CandleChart({ entries }) {
       if (!byDay.has(dayKey)) byDay.set(dayKey, new Map());
       const dayMap = byDay.get(dayKey);
       const id = e.taskId || 'unknown';
-      const prev = dayMap.get(id) || { name: e.taskName || 'Task', bytes: 0 };
+      const prev = dayMap.get(id) || { name: e.taskName || fallbackName, bytes: 0 };
       prev.bytes += e.totalBytes || 0;
       prev.name = e.taskName || prev.name;
       dayMap.set(id, prev);
-      names.set(id, e.taskName || 'Task');
+      names.set(id, e.taskName || fallbackName);
     }
     const sorted = Array.from(byDay.entries())
       .sort((a, b) => a[0].localeCompare(b[0]))
@@ -58,7 +60,7 @@ export default function CandleChart({ entries }) {
       for (const s of day.slices) colorForTask(s.taskId, colors);
     }
     return { days: sorted, taskColors: colors, taskNames: names };
-  }, [entries]);
+  }, [entries, fallbackName]);
 
   const scrollRef = useRef(null);
   useEffect(() => {
@@ -85,7 +87,7 @@ export default function CandleChart({ entries }) {
                   width={PIE_SIZE}
                   height={PIE_SIZE}
                   role="img"
-                  aria-label={t('statistics.aria.day', { day: day.dayKey, bytes: formatBytes(day.total) })}
+                  aria-label={t('statistics.aria.day', { day: formatDayLabel(day.dayKey), bytes: formatBytes(day.total) })}
                 >
                   {day.total > 0 ? (
                     // Single-slice day: SVG arcs degenerate when start and
@@ -127,9 +129,7 @@ export default function CandleChart({ entries }) {
                   )}
                 </svg>
                 <div className="day-pie__total">{formatBytes(day.total)}</div>
-                <div className="day-pie__date">
-                  {day.dayKey.slice(8, 10)}/{day.dayKey.slice(5, 7)}
-                </div>
+                <div className="day-pie__date">{formatDayLabel(day.dayKey)}</div>
               </div>
             );
           })}
@@ -140,7 +140,7 @@ export default function CandleChart({ entries }) {
           {Array.from(taskColors.entries()).map(([id, color]) => (
             <span key={id}>
               <span className="legend-dot" style={{ background: color }} />
-              {taskNames.get(id) || 'Task'}
+              {taskNames.get(id) || fallbackName}
             </span>
           ))}
         </div>

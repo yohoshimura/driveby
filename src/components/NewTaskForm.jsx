@@ -100,6 +100,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           onChange={(e) => setTask({ ...task, schedule: e.target.value })}
         >
           <option value="manual">{t('task.schedule.manual')}</option>
+          <option value="hourly">{t('task.schedule.hourly')}</option>
           <option value="daily">{t('task.schedule.daily')}</option>
           <option value="weekly">{t('task.schedule.weekly')}</option>
           <option value="monthly">{t('task.schedule.monthly')}</option>

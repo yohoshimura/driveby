@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
-import { formatTime, formatBytes, formatDuration } from '../lib/format';
+import { useProgress } from '../context/ProgressContext';
+import { useFormat } from '../hooks/useFormat';
 import Button from './common/Button';
 import EmptyState from './common/EmptyState';
 import { useT } from '../hooks/useT';
@@ -13,7 +14,9 @@ const STATUS_KEY = {
 
 export default function History() {
   const { history, deleteHistory, clearHistory, revealFolder, restoreBackup } = useApp();
+  const { activeRestore } = useProgress();
   const t = useT();
+  const { formatTime, formatBytes, formatDuration, formatNumber } = useFormat();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
 
@@ -89,7 +92,7 @@ export default function History() {
                 {entry.error && <div className="history-path" style={{ color: 'var(--system-red)' }}>{entry.error}</div>}
                 {entry.unreadable > 0 && (
                   <div className="history-path" style={{ color: 'var(--system-orange)' }}>
-                    {t('history.unreadable', { n: entry.unreadable })}
+                    {t('history.unreadable', { n: entry.unreadable, count: entry.unreadable })}
                   </div>
                 )}
               </td>
@@ -99,11 +102,18 @@ export default function History() {
                 </span>
               </td>
               <td className="td--right"><span className="mono">{entry.totalBytes ? formatBytes(entry.totalBytes) : t('common.dash')}</span></td>
-              <td className="td--right"><span className="mono">{entry.totalFiles ?? t('common.dash')}</span></td>
+              <td className="td--right"><span className="mono">{entry.totalFiles != null ? formatNumber(entry.totalFiles) : t('common.dash')}</span></td>
               <td className="td--right"><span className="mono">{entry.durationMs ? formatDuration(Math.round(entry.durationMs / 1000)) : t('common.dash')}</span></td>
               <td className="td--right">
                 {entry.path && entry.status === 'success' && (
-                  <Button size="small" variant="borderless" onClick={() => restoreBackup(entry.path)}>{t('common.restore')}</Button>
+                  <Button
+                    size="small"
+                    variant="borderless"
+                    onClick={() => restoreBackup(entry.path)}
+                    disabled={!!activeRestore}
+                  >
+                    {t('common.restore')}
+                  </Button>
                 )}
                 {entry.path && (
                   <Button size="small" variant="borderless" onClick={() => revealFolder(entry.path)}>{t('common.reveal')}</Button>
