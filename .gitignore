@@ -37,3 +37,6 @@ desktop.ini
 # Updater signing keys (kept outside the repo; this is a belt-and-braces guard)
 *.key
 *.key.pub
+
+# Locally preserved release bundles (not committed; rebuild with `npm run tauri build`)
+release-artifacts/
