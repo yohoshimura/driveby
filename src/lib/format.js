@@ -36,8 +36,6 @@ export function makeFormatters(lang) {
     return `${nf.format(n)} ${units[i]}`;
   };
 
-  const formatSpeed = (bps) => (!bps ? '—' : `${formatBytes(bps)}/s`);
-
   const formatDuration = (seconds) => {
     if (seconds == null) return '—';
     if (seconds < 60) return `${integer.format(seconds)}s`;
@@ -62,5 +60,5 @@ export function makeFormatters(lang) {
 
   const formatNumber = (n) => (n == null ? '—' : integer.format(n));
 
-  return { formatBytes, formatSpeed, formatDuration, formatTime, formatDayLabel, formatNumber };
+  return { formatBytes, formatDuration, formatTime, formatDayLabel, formatNumber };
 }

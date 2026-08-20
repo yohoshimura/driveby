@@ -1,10 +1,43 @@
-# driveby 1.6
+# driveby 1.6.1
 
 A local-drive backup app with a macOS-style sidebar UI — **Tauri 2 + Rust** backend, **React 18 + Vite** frontend.
 
-Where 1.5 was a correctness sweep, **1.6 closes the gaps 1.5 left open and makes the app shippable to other people**: restore gets the cancellation, progress and concurrency guard that backup already had; the copy loop runs files in parallel and fingerprints them as it writes, so verification no longer re-reads both sides; dates and numbers follow the app's language instead of the OS locale; the app survives its window being closed so scheduled backups actually fire; and CI builds signed bundles for Windows, macOS and Linux. Verified clean on `cargo clippy --all-targets` with **55 Rust tests and 19 frontend tests passing**.
+Where 1.5 was a correctness sweep, **1.6 closes the gaps 1.5 left open and makes the app shippable to other people**: restore gets the cancellation, progress and concurrency guard that backup already had; the copy loop runs files in parallel and fingerprints them as it writes, so verification no longer re-reads both sides; dates and numbers follow the app's language instead of the OS locale; the app survives its window being closed so scheduled backups actually fire; and CI builds signed bundles for Windows, macOS and Linux. Verified clean on `cargo clippy --all-targets` with **55 Rust tests and 28 frontend tests passing** as of 1.6.1.
 
 See [1.5 and earlier](#data-loss--fixed-in-15) below for the history.
+
+## What's new in 1.6.1
+
+A small release with two UI decisions and the distribution follow-through 1.6 set up but never triggered.
+
+### A quieter card during a backup
+
+The running task card showed a detail line under the progress bar — phase, file counts, throughput, ETA. 1.6 had added it because the progress payload already carried all four and the card was throwing them away. In use it reads as noise: four figures churning at 10 Hz on a card whose bar already says how far along the run is. The line is gone and the bar stands alone.
+
+It takes the accessibility budget with it, so the bar now carries an `aria-label` of its own — previously the phase text was what a screen reader announced. `PHASE_KEY`, the six `backup.phase.*` strings and `formatSpeed` had no other consumer and were removed rather than left behind. Nothing changed in the backend: `backup-progress` still carries `phase`, `copiedFiles`, `speedBps` and `etaSeconds`, and `ProgressContext` still stores them.
+
+### History retained by age
+
+`historyLimit` asked how many past runs to keep. That is not the question anyone has about a backup log — "how far back can I look" is. It becomes `historyRetention`:
+
+| Setting | Meaning |
+|---------|---------|
+| `1d` / `1w` | A fixed 24 hours / 7 days back. |
+| `1m` / `1y` (default `1m`) | A **calendar** month or year back, clamping the day of the month — 31 March minus a month is 28 February, not 3 March. This is the same rule the Rust scheduler applies through `checked_add_months`, so "a month" means one thing across the app. |
+| `all` | No date limit. **Not** unlimited — see the cap below. |
+
+Two decisions are worth stating outright:
+
+- **A hard cap of 5000 entries applies under every setting, `all` included.** The count *was* what bounded `history.json`; replacing it with an age alone would let an hourly task write 8 760 rows a year into a file that is rewritten in full on every change. The cap is not exposed in Settings — it is a floor under the feature, not a knob.
+- **An entry with a missing or unparseable timestamp is kept.** We do not delete what we cannot date; the cap still bounds the file.
+
+There is no migration path, because a count and an age have none: the old `historyLimit` key is dropped from `settings.json` when it loads, and every install starts at the one-month default. The purge points are unchanged — at load, on each completed run, and immediately when the setting is shortened. No timer sweeps the list, because every completed run already triggers a purge; the only way to drift is to leave the app open for days with no backup at all.
+
+### Distribution, actually executed
+
+1.6 wired `release.yml` for Windows, macOS and Linux and then never fired it — no `v*` tag was ever pushed, so no artifact ever existed. 1.6.1 is the first tagged release. See [Prerequisites / Running](#prerequisites--running) for what each platform produces.
+
+`npm run bump-version` now writes `package-lock.json` as well as `package.json` and `Cargo.toml`; that omission is why 1.6.0 shipped with a lockfile still claiming 1.5.0.
 
 ## What's new in 1.6
 
@@ -20,7 +53,7 @@ See [1.5 and earlier](#data-loss--fixed-in-15) below for the history.
 
 - **Parallel copies.** `copy_phase` keeps `parallelCopies` files in flight (default 4, settable to 1/2/4/8 in Settings; **1 reproduces the old sequential behaviour exactly** — the escape hatch for spinning disks). Bounded concurrency comes from a manual window over `FuturesUnordered` rather than spawned tasks: tokio's fs calls already offload to the blocking pool, so borrowed futures get real I/O overlap without `'static` bounds, and per-file results come back as values so `PhaseStats` stays single-owner.
 - **Hash during copy.** `copy_file` folds bytes into an `Xxh3` as it writes them. `verify` therefore re-reads only the *destination*, comparing against the fingerprint taken while copying — it used to read both sides, doubling the I/O of an already-slow option. Scope note: verification now covers files copied by this run; files skipped as unchanged were verified by the run that copied them.
-- **Bounded history.** `history.json` had no cap and was rewritten in full on every change. `historyLimit` (default 1000, `All` still available) trims on append, at load, and immediately when lowered.
+- **Bounded history.** `history.json` had no cap and was rewritten in full on every change. `historyLimit` (default 1000, `All` still available) trims on append, at load, and immediately when lowered. *(Superseded in 1.6.1 by an age-based `historyRetention` with a hard entry cap underneath it.)*
 - **No more 10 Hz whole-tree re-renders.** Live progress moved out of `AppContext` into a `ProgressContext` that only `Home`, `History` and the restore overlay consume, and the remaining context value is memoised. A running backup used to invalidate the context ten times a second and re-render everything, history table included.
 
 **Platform-native fast copy was evaluated and rejected for 1.6.** `CopyFile2` / `clonefile` / `copy_file_range` each break hash-during-copy (forcing verification back to a source re-read), and each carries its own partial-file, cancellation and mtime semantics — three platform paths, none of them exercised off Windows until this release's CI exists. Worth revisiting in 1.7 now that it does.

@@ -591,12 +591,6 @@ input, textarea { user-select: text; }
   font-size: 11px; color: var(--label-tertiary); margin-top: 4px;
 }
 .task__progress { margin-top: 8px; }
-.task__progress-row {
-  display: flex; justify-content: space-between;
-  font-size: 11px; color: var(--label-secondary);
-  margin-bottom: 4px;
-  font-feature-settings: 'tnum';
-}
 .progressbar {
   height: 4px;
   background: var(--label-quaternary);
@@ -627,14 +621,6 @@ input, textarea { user-select: text; }
 @keyframes progress-shimmer {
   0%   { transform: translateX(-100%); }
   100% { transform: translateX(100%); }
-}
-/* The payload carries speed, ETA, counts and phase; before 1.6 the card
-   showed only the bar and threw the rest away. */
-.task__progress-meta {
-  display: flex; flex-wrap: wrap; gap: 10px;
-  margin-top: 5px;
-  font-size: 11px; color: var(--label-tertiary);
-  font-feature-settings: 'tnum';
 }
 .task__actions { display: flex; gap: 6px; align-items: center; }
 

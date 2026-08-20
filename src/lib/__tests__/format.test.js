@@ -35,8 +35,7 @@ describe('makeFormatters (en)', () => {
     expect(en.formatDayLabel('2026-08-19')).toBe('08/19');
   });
 
-  test('placeholder dash for absent speed and duration', () => {
-    expect(en.formatSpeed(0)).toBe('—');
+  test('placeholder dash for an absent duration', () => {
     expect(en.formatDuration(null)).toBe('—');
   });
 

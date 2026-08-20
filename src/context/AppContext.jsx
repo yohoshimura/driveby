@@ -12,7 +12,7 @@ import { bridge } from '../lib/tauri';
 import { useSystemTheme } from '../hooks/useSystemTheme';
 import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
-import { DEFAULT_HISTORY_LIMIT, trimHistory } from '../lib/history';
+import { DEFAULT_HISTORY_RETENTION, trimHistory } from '../lib/history';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
 
 const AppContext = createContext(null);
@@ -29,7 +29,7 @@ const DEFAULT_SETTINGS = {
   continueOnError: true,
   preserveMtime: true,
   parallelCopies: 4,
-  historyLimit: DEFAULT_HISTORY_LIMIT,
+  historyRetention: DEFAULT_HISTORY_RETENTION,
   sidebarOpen: true,
   lastView: 'home',
 };
@@ -73,12 +73,16 @@ export function AppProvider({ children }) {
           bridge.getTasks(),
           bridge.getHistory(),
         ]);
-        const merged = { ...DEFAULT_SETTINGS, ...(s || {}) };
+        // historyLimit was a *count*; historyRetention is an *age*. There is
+        // no meaningful mapping between them, so the old key is dropped
+        // rather than left behind in settings.json for nobody to read.
+        const { historyLimit: _dropped, ...stored } = s || {};
+        const merged = { ...DEFAULT_SETTINGS, ...stored };
         setSettings(merged);
         setTasks(Array.isArray(t) ? t : []);
-        // Trim at load too, so a history.json that predates the cap (or was
-        // written with a larger one) shrinks on the next save.
-        setHistory(trimHistory(h, merged.historyLimit));
+        // Trim at load too, so a history.json written before the window
+        // existed — or under a longer one — shrinks on the next save.
+        setHistory(trimHistory(h, merged.historyRetention));
       } finally {
         setLoaded(true);
       }
@@ -132,7 +136,7 @@ export function AppProvider({ children }) {
               },
               ...prev,
             ],
-            settingsRef.current.historyLimit,
+            settingsRef.current.historyRetention,
           ),
         );
         if (data.success) {
@@ -279,9 +283,9 @@ export function AppProvider({ children }) {
       bridge.saveSettings(next);
       return next;
     });
-    // Lowering the cap has to bite now, not at the next completed run —
+    // Shortening the window has to bite now, not at the next completed run —
     // otherwise the setting looks like it did nothing.
-    if (key === 'historyLimit') {
+    if (key === 'historyRetention') {
       setHistory((prev) => trimHistory(prev, value));
     }
   }, []);

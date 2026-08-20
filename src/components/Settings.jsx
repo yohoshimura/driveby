@@ -6,7 +6,7 @@ import InfoTip from './common/InfoTip';
 import { bridge } from '../lib/tauri';
 import { checkForUpdate, installUpdate } from '../lib/updater';
 import { useT } from '../hooks/useT';
-import { DEFAULT_HISTORY_LIMIT } from '../lib/history';
+import { HISTORY_RETENTIONS, DEFAULT_HISTORY_RETENTION } from '../lib/history';
 import { SUPPORTED_LANGUAGES, LANGUAGE_LABELS, DEFAULT_LANGUAGE } from '../lib/i18n';
 
 const THEME_KEYS = {
@@ -15,8 +15,16 @@ const THEME_KEYS = {
   system: 'settings.theme.system',
 };
 
-// 0 is "unlimited" — see trimHistory.
-const HISTORY_LIMITS = [100, 500, 1000, 5000, 0];
+// The picker offers an age, not a count. 'all' still passes through the
+// hard entry cap inside trimHistory — it means 'no date limit', not
+// 'unbounded file'.
+const RETENTION_KEYS = {
+  '1d': 'settings.retention.1d',
+  '1w': 'settings.retention.1w',
+  '1m': 'settings.retention.1m',
+  '1y': 'settings.retention.1y',
+  all: 'common.unlimited',
+};
 
 export default function Settings() {
   const { settings, updateSetting, showToast } = useApp();
@@ -85,9 +93,9 @@ export default function Settings() {
   const activeParallel = [1, 2, 4, 8].includes(settings.parallelCopies)
     ? settings.parallelCopies
     : 4;
-  const activeHistoryLimit = HISTORY_LIMITS.includes(settings.historyLimit)
-    ? settings.historyLimit
-    : DEFAULT_HISTORY_LIMIT;
+  const activeRetention = HISTORY_RETENTIONS.includes(settings.historyRetention)
+    ? settings.historyRetention
+    : DEFAULT_HISTORY_RETENTION;
 
   return (
     <>
@@ -211,20 +219,20 @@ export default function Settings() {
         </div>
         <div className="setting-row">
           <div>
-            <div className="setting-row__label">{t('settings.label.history_limit')}</div>
+            <div className="setting-row__label">{t('settings.label.history_retention')}</div>
           </div>
           <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.history_limit')} />
-            <div className="segmented" role="radiogroup" aria-label={t('settings.label.history_limit')}>
-              {HISTORY_LIMITS.map((n) => (
+            <InfoTip text={t('settings.tip.history_retention')} />
+            <div className="segmented" role="radiogroup" aria-label={t('settings.label.history_retention')}>
+              {HISTORY_RETENTIONS.map((key) => (
                 <button
-                  key={n}
+                  key={key}
                   role="radio"
-                  aria-checked={activeHistoryLimit === n}
-                  className={`segmented__btn ${activeHistoryLimit === n ? 'segmented__btn--active' : ''}`}
-                  onClick={() => updateSetting('historyLimit', n)}
+                  aria-checked={activeRetention === key}
+                  className={`segmented__btn ${activeRetention === key ? 'segmented__btn--active' : ''}`}
+                  onClick={() => updateSetting('historyRetention', key)}
                 >
-                  {n === 0 ? t('common.unlimited') : n}
+                  {t(RETENTION_KEYS[key])}
                 </button>
               ))}
             </div>

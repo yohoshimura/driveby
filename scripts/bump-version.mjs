@@ -4,6 +4,10 @@
 // bundle, and main.rs logs via CARGO_PKG_VERSION). tauri.conf.json
 // deliberately has no "version" key so it can't drift from Cargo.toml.
 //
+// package-lock.json mirrors package.json's version in two places. npm
+// only rewrites them on the next install, which is how 1.6.0 shipped with
+// a lockfile still claiming 1.5.0 — so this script writes them too.
+//
 //   node scripts/bump-version.mjs 1.6.1
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -23,6 +27,13 @@ const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
 pkg.version = version;
 writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
 
+const lockPath = join(root, 'package-lock.json');
+const lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+lock.version = version;
+// The root package entry is keyed by the empty string.
+if (lock.packages?.['']) lock.packages[''].version = version;
+writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
 const cargoPath = join(root, 'src-tauri', 'Cargo.toml');
 const cargo = readFileSync(cargoPath, 'utf8');
 // Only the [package] version — the first `version = ` line — not any
@@ -34,5 +45,5 @@ if (bumped === cargo) {
 }
 writeFileSync(cargoPath, bumped);
 
-console.log(`version set to ${version} in package.json and src-tauri/Cargo.toml`);
+console.log(`version set to ${version} in package.json, package-lock.json and src-tauri/Cargo.toml`);
 console.log('next: commit, then tag with  git tag v' + version);

@@ -66,6 +66,7 @@ const MESSAGES = {
     'task.aria.cancel': 'Cancel {name}',
     'task.aria.modify': 'Modify {name}',
     'task.aria.delete': 'Delete {name}',
+    'task.aria.progress': 'Backup progress for {name}',
     'task.toast.added': 'Task added',
     'task.toast.updated': 'Task updated',
     'task.confirm.delete.title': 'Delete this task?',
@@ -97,13 +98,6 @@ const MESSAGES = {
     'backup.toast.failed': 'Backup failed: {error}',
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Backup of “{name}” complete',
-
-    'backup.phase.syncing': 'Comparing',
-    'backup.phase.copying': 'Copying',
-    'backup.phase.pruning': 'Cleaning up',
-    'backup.phase.verifying_icons': 'Checking folder icons',
-    'backup.phase.finishing': 'Finishing',
-    'backup.phase.verifying': 'Verifying',
 
     'restore.dialog.select': 'Select restore destination',
     'restore.dialog.title': 'Restore this backup?',
@@ -187,7 +181,7 @@ const MESSAGES = {
     'settings.label.continue_on_error': 'Continue on error',
     'settings.label.preserve_mtime': 'Preserve file modification time',
     'settings.label.parallel_copies': 'Files copied at once',
-    'settings.label.history_limit': 'History entries kept',
+    'settings.label.history_retention': 'History kept',
     'settings.label.exclude': 'Exclude patterns',
     'settings.label.appearance': 'Appearance',
     'settings.label.language': 'Language',
@@ -195,12 +189,17 @@ const MESSAGES = {
 
     'settings.tip.verify': 'After copying, driveby reads each copied file back from the destination and compares it against a fingerprint taken while it was being written, to make sure nothing got corrupted on the way. Files skipped as unchanged were verified by the run that copied them.',
     'settings.tip.parallel_copies': 'How many files driveby copies at the same time. 4 is a good default for SSDs and network drives. Set it to 1 for an older spinning hard disk, where copying several files at once can be slower rather than faster.',
-    'settings.tip.history_limit': 'How many past runs to keep in the history list. Older entries are dropped automatically. Existing backup folders are never affected.',
+    'settings.tip.history_retention': 'How far back the history list goes. Runs older than this are dropped automatically. Existing backup folders are never affected.',
     'settings.tip.continue_on_error': "If a single file can't be copied — for example because it's locked by another app or you don't have permission — driveby will skip it and keep backing up everything else instead of stopping the whole job.",
     'settings.tip.preserve_mtime': "Keeps each file's original 'last modified' date when it's copied to the destination. This lets later backups instantly skip files that haven't changed, making repeat runs much faster.",
     'settings.tip.exclude': "List the files or folders you don't want backed up — one per line, or separated by commas. Use * to match any characters in a name, ** to match across folders, and ? for a single character. Start a line with ! to bring something back in (for example, !important.tmp keeps that file even if *.tmp is excluded).",
 
     'settings.placeholder.exclude': '*.tmp\nnode_modules\n.DS_Store\n!important.tmp',
+
+    'settings.retention.1d': '1 day',
+    'settings.retention.1w': '1 week',
+    'settings.retention.1m': '1 month',
+    'settings.retention.1y': '1 year',
 
     'settings.theme.light': 'Light',
     'settings.theme.dark': 'Dark',
@@ -259,6 +258,7 @@ const MESSAGES = {
     'task.aria.cancel': 'Annuler {name}',
     'task.aria.modify': 'Modifier {name}',
     'task.aria.delete': 'Supprimer {name}',
+    'task.aria.progress': 'Progression de la sauvegarde de {name}',
     'task.toast.added': 'Tâche ajoutée',
     'task.toast.updated': 'Tâche mise à jour',
     'task.confirm.delete.title': 'Supprimer cette tâche ?',
@@ -290,13 +290,6 @@ const MESSAGES = {
     'backup.toast.failed': 'Échec de la sauvegarde : {error}',
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Sauvegarde de « {name} » terminée',
-
-    'backup.phase.syncing': 'Comparaison',
-    'backup.phase.copying': 'Copie',
-    'backup.phase.pruning': 'Nettoyage',
-    'backup.phase.verifying_icons': 'Vérification des icônes',
-    'backup.phase.finishing': 'Finalisation',
-    'backup.phase.verifying': 'Vérification',
 
     'restore.dialog.select': 'Sélectionner la destination de restauration',
     'restore.dialog.title': 'Restaurer cette sauvegarde ?',
@@ -380,7 +373,7 @@ const MESSAGES = {
     'settings.label.continue_on_error': 'Continuer en cas d’erreur',
     'settings.label.preserve_mtime': 'Préserver la date de modification',
     'settings.label.parallel_copies': 'Fichiers copiés simultanément',
-    'settings.label.history_limit': 'Entrées d’historique conservées',
+    'settings.label.history_retention': 'Historique conservé',
     'settings.label.exclude': 'Motifs d’exclusion',
     'settings.label.appearance': 'Apparence',
     'settings.label.language': 'Langue',
@@ -388,12 +381,17 @@ const MESSAGES = {
 
     'settings.tip.verify': "Après la copie, driveby relit chaque fichier copié depuis la destination et le compare à une empreinte calculée pendant l’écriture, pour s’assurer qu’aucune corruption n’est survenue. Les fichiers inchangés ont été vérifiés lors de la sauvegarde qui les a copiés.",
     'settings.tip.parallel_copies': "Nombre de fichiers copiés en même temps. 4 convient bien aux SSD et aux disques réseau. Choisissez 1 pour un disque dur mécanique, où copier plusieurs fichiers à la fois peut ralentir plutôt qu’accélérer.",
-    'settings.tip.history_limit': "Nombre d’exécutions passées conservées dans l’historique. Les plus anciennes sont supprimées automatiquement. Les dossiers de sauvegarde existants ne sont jamais affectés.",
+    'settings.tip.history_retention': "Ancienneté maximale des exécutions listées dans l’historique. Les plus anciennes sont supprimées automatiquement. Les dossiers de sauvegarde existants ne sont jamais affectés.",
     'settings.tip.continue_on_error': "Si un fichier ne peut pas être copié — par exemple parce qu’il est verrouillé par une autre application ou que vous n’avez pas les droits — driveby le saute et continue avec les autres au lieu d’arrêter toute la tâche.",
     'settings.tip.preserve_mtime': "Conserve la date de « dernière modification » d’origine de chaque fichier copié vers la destination. Cela permet aux sauvegardes suivantes de sauter immédiatement les fichiers inchangés, accélérant nettement les exécutions répétées.",
     'settings.tip.exclude': "Listez les fichiers ou dossiers à ne pas sauvegarder — un par ligne ou séparés par des virgules. Utilisez * pour n’importe quels caractères dans un nom, ** pour traverser les dossiers, et ? pour un seul caractère. Commencez une ligne par ! pour réinclure un élément (par exemple, !important.tmp conserve ce fichier même si *.tmp est exclu).",
 
     'settings.placeholder.exclude': '*.tmp\nnode_modules\n.DS_Store\n!important.tmp',
+
+    'settings.retention.1d': '1 jour',
+    'settings.retention.1w': '1 semaine',
+    'settings.retention.1m': '1 mois',
+    'settings.retention.1y': '1 an',
 
     'settings.theme.light': 'Clair',
     'settings.theme.dark': 'Sombre',
