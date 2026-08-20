@@ -82,18 +82,28 @@ The tray icon itself is always created — it's the only way back to a hidden wi
 
 - **CI** (`.github/workflows/ci.yml`) runs the Rust and frontend tests on Windows plus a Linux job that keeps the `#[cfg(not(windows))]` paths honest.
 - **Releases** (`.github/workflows/release.yml`) build on a tag: Windows (MSI + NSIS), macOS (universal), Linux (AppImage + deb).
-- **Auto-update** is wired end to end — plugin, capabilities, a Settings section with a manual check and a silent check at launch that only ever raises a toast. It stays inert until signing keys exist; see [Enabling auto-update](#enabling-auto-update).
+- **Auto-update** is wired end to end — plugin, capabilities, a Settings section with a manual check and a silent check at launch that only ever raises a toast. Signing keys are in place, so tagged releases ship signed updater artifacts; see [Update signing](#update-signing).
 - **The version lives in two files** (`package.json`, `src-tauri/Cargo.toml`) instead of five: `tauri.conf.json` has no `version` key so it reads Cargo's, `main.rs` logs `CARGO_PKG_VERSION`, and the sidebar string is a `{version}` parameter fed by vite's `__APP_VERSION__`. `npm run bump-version 1.6.1` updates both manifests.
 
-## Enabling auto-update
+## Update signing
 
-Committed state builds fine and ships no updater artifacts. To turn it on:
+Updates are signed with a minisign keypair produced by `npm run tauri signer generate`. The keypair lives **outside the repository** and is never committed:
 
-1. `npm run tauri signer generate -- -w ~/.driveby-updater.key` — **never commit the private key.**
-2. Put the public key in `src-tauri/tauri.updater.conf.json` (replacing `REPLACE_WITH_PUBLIC_KEY`).
-3. Add `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to the repository's GitHub Actions secrets.
+| File | Location |
+| --- | --- |
+| Private key | `C:\Users\Yoshimura\Keys\driveby\.driveby-updater.key` |
+| Public key | `C:\Users\Yoshimura\Keys\driveby\.driveby-updater.key.pub` |
 
-The release workflow layers that config in only when the secret is present, so local `npm run tauri build` keeps working untouched either way.
+The public half is already checked in as `plugins.updater.pubkey` in `src-tauri/tauri.updater.conf.json` (key ID `0883B477825312B9`). It must stay byte-identical to the `.pub` file, or clients reject every update.
+
+CI signs from two GitHub Actions secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY` — the full base64 contents of `.driveby-updater.key`.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — the passphrase chosen at generation time. **Required:** this key is passphrase-protected (its header declares the scrypt KDF), so signing fails without it.
+
+The release workflow layers `tauri.updater.conf.json` in only when `TAURI_SIGNING_PRIVATE_KEY` is present, so local `npm run tauri build` keeps working untouched either way.
+
+To rotate the keypair, regenerate it, then replace both the `.pub` contents in the updater config and the two secrets — and keep the old public key serving until every client has updated past it.
 
 ---
 

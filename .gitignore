@@ -33,3 +33,7 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Updater signing keys (kept outside the repo; this is a belt-and-braces guard)
+*.key
+*.key.pub
