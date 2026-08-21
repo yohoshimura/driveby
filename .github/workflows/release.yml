@@ -95,3 +95,41 @@ jobs:
           args: >-
             ${{ matrix.args }}
             ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config src-tauri/tauri.updater.conf.json' || '' }}
+
+  # tauri-action drafts the release, and every matrix job appends its own
+  # platform's assets to that same draft. Publishing from inside the matrix
+  # would therefore make the release public the moment the first job finished,
+  # leaving latest.json advertising Windows alone until macOS and Linux caught
+  # up a quarter of an hour later — an updater poll landing in that window
+  # finds no entry for its platform and reports "up to date". So the draft
+  # stays, and this job flips it once all three platforms are in. If any
+  # platform fails, `needs` skips this job and the release stays a draft.
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # tauri-action only takes a literal string for the release body, so every
+      # release was drafted pointing at CHANGELOG.md — a file the reader is not
+      # looking at, rendered as plain text rather than a link. Lift the real
+      # section out instead, and keep the placeholder if the tag has no entry.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="${TAG#v}" '
+            $0 == "## " v { flag = 1; next }
+            /^## /        { flag = 0 }
+            flag' CHANGELOG.md > notes.md
+          if grep -q '[^[:space:]]' notes.md; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --latest --notes-file notes.md
+          else
+            echo "::warning::no CHANGELOG.md section for $TAG - publishing with the default body"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

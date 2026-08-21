@@ -45,14 +45,33 @@ Available in English and French, with light and dark themes.
 
 ## Install
 
-Download the installer from the
-[latest release](https://github.com/yohoshimura/driveby/releases/latest) and run
-it. It installs for the current user only, so no administrator rights are
-needed, and it registers normally under **Settings → Apps**, where it can be
-uninstalled like any other program.
+Everything is on the
+[latest release](https://github.com/yohoshimura/driveby/releases/latest) page.
+The builds are unsigned, so Windows and macOS each raise a warning the first
+time — the steps below say how to get past it.
 
-driveby checks for updates on its own and can install them from the Settings
-screen.
+**Windows.** Take the `-setup.exe`. It installs for the current user only, so
+no administrator rights are needed, and it registers normally under
+**Settings → Apps**, where it can be uninstalled like any other program.
+SmartScreen shows a blue warning on first run: *More info*, then *Run anyway*.
+An `.msi` is published alongside it for deployment tooling.
+
+**macOS.** Take the `_universal.dmg` — one build for both Apple Silicon and
+Intel — and drag driveby to Applications. macOS refuses the first launch
+because the app is not notarised; open **System Settings → Privacy &
+Security**, find the message naming driveby, and click **Open Anyway**.
+
+**Linux.** The `.AppImage` runs on any distribution: `chmod +x` it and go. For
+a system install, take the `.deb` or the `.rpm` instead.
+
+```bash
+sudo apt install ./driveby_*_amd64.deb     # Debian, Ubuntu
+sudo dnf install ./driveby-*.x86_64.rpm    # Fedora, RHEL
+```
+
+driveby checks for updates on its own and installs them from the Settings
+screen. A `.deb` or `.rpm` install is the exception: a packaged install is
+updated through your package manager, not by the app.
 
 ## Limits
 
