@@ -104,9 +104,12 @@ async fn get_history(app: tauri::AppHandle) -> Result<Value, String> {
 #[tauri::command]
 async fn save_history(app: tauri::AppHandle, history: Value) -> Result<(), String> {
     let path = data_path(&app, "history.json")?;
-    persist::write_json_atomic(&path, &history)
-        .await
-        .map_err(|e| e.to_string())
+    persist::with_history_lock(|| async {
+        persist::write_json_atomic(&path, &history)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]

@@ -40,3 +40,6 @@ desktop.ini
 
 # Locally preserved release bundles (not committed; rebuild with `npm run tauri build`)
 release-artifacts/
+
+# Session notes kept locally as a re-reading source, not part of the repo
+conversation.md

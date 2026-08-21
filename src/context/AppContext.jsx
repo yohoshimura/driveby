@@ -46,6 +46,13 @@ export function AppProvider({ children }) {
   tasksRef.current = tasks;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // Armed by the user-facing mutators only, so the persist effects below
+  // stay inert for state that Rust pushed at us (task-updated). Persisting
+  // from an effect rather than from inside a setState updater keeps the
+  // updaters pure — StrictMode invokes them twice in development, which
+  // used to mint two uuids and fire two conflicting saves (#F6).
+  const tasksDirty = useRef(false);
+  const settingsDirty = useRef(false);
   const toastTimer = useRef(null);
   // A restore is a single global operation; the ref is the in-flight guard
   // that stops a double-click launching a second one before the backend's
@@ -97,6 +104,18 @@ export function AppProvider({ children }) {
     if (!loaded) return;
     bridge.saveHistory(history);
   }, [history, loaded]);
+
+  useEffect(() => {
+    if (!loaded || !tasksDirty.current) return;
+    tasksDirty.current = false;
+    bridge.saveTasks(tasks);
+  }, [tasks, loaded]);
+
+  useEffect(() => {
+    if (!loaded || !settingsDirty.current) return;
+    settingsDirty.current = false;
+    bridge.saveSettings(settings);
+  }, [settings, loaded]);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', resolvedTheme);
@@ -228,23 +247,17 @@ export function AppProvider({ children }) {
   const addTask = useCallback((taskDraft) => {
     const dest = taskDraft.destination || settings.defaultDestination;
     if (!taskDraft.name || !taskDraft.source || !dest) return false;
-    setTasks((prev) => {
-      const next = [
-        ...prev,
-        { id: uuidv4(), ...taskDraft, destination: dest, lastBackup: null },
-      ];
-      bridge.saveTasks(next);
-      return next;
-    });
+    // Built outside the updater: StrictMode calls the updater twice, and
+    // minting the id inside it produced two different tasks.
+    const created = { id: uuidv4(), ...taskDraft, destination: dest, lastBackup: null };
+    tasksDirty.current = true;
+    setTasks((prev) => [...prev, created]);
     return true;
   }, [settings.defaultDestination]);
 
   const editTask = useCallback((id, patch) => {
-    setTasks((prev) => {
-      const next = prev.map((t) => (t.id === id ? { ...t, ...patch } : t));
-      bridge.saveTasks(next);
-      return next;
-    });
+    tasksDirty.current = true;
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
   }, []);
 
   const deleteTask = useCallback(async (id) => {
@@ -255,11 +268,8 @@ export function AppProvider({ children }) {
       danger: true,
     });
     if (!ok) return;
-    setTasks((prev) => {
-      const next = prev.filter((t) => t.id !== id);
-      bridge.saveTasks(next);
-      return next;
-    });
+    tasksDirty.current = true;
+    setTasks((prev) => prev.filter((t) => t.id !== id));
   }, [confirm, tr]);
 
   const deleteHistory = useCallback((id) => {
@@ -278,11 +288,8 @@ export function AppProvider({ children }) {
   }, [confirm, tr]);
 
   const updateSetting = useCallback((key, value) => {
-    setSettings((prev) => {
-      const next = { ...prev, [key]: value };
-      bridge.saveSettings(next);
-      return next;
-    });
+    settingsDirty.current = true;
+    setSettings((prev) => ({ ...prev, [key]: value }));
     // Shortening the window has to bite now, not at the next completed run —
     // otherwise the setting looks like it did nothing.
     if (key === 'historyRetention') {
@@ -304,7 +311,9 @@ export function AppProvider({ children }) {
     if (!destination) return;
     const ok = await confirm({
       title: tr('restore.dialog.title'),
-      body: tr('restore.dialog.body', { destination }),
+      // Naming only the destination made it impossible to notice that a
+      // shifted History row had selected a different backup (#F7).
+      body: tr('restore.dialog.body', { source: backupPath, destination }),
       confirmLabel: tr('restore.dialog.action'),
     });
     if (!ok) return;

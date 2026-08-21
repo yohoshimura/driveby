@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.7.0
+
+A correctness release. A review of the whole codebase turned up sixteen defects; three of them could destroy data that had already been backed up, and all three were the same mistake made in three places.
+
+**A backup that cannot be read no longer destroys the copy it was meant to replace.** The retry loop deleted the destination file *before* it had opened the source. A file locked by another process — a running VM holding its own disk image is the everyday case — meant the previous copy was gone and nothing replaced it, while the run carried on and reported a single failure. Copies now stream into a scratch file beside the destination and swap in with an atomic rename, so nothing that was already safe is at risk until the replacement is on disk. The same change means cancelling a backup no longer removes files from the backup.
+
+**Cancelling a restore no longer deletes the file you already had.** The destination was opened with `File::create`, which truncates it, before the first byte was read. Cancelling then removed the emptied file — leaving neither your version nor the backup's. A bad sector on the backup drive, the exact situation a restore exists for, did the same. Restore now uses the same scratch-and-rename path.
+
+**`history.json` can no longer be corrupted by two runs finishing at once.** Every writer shared one fixed scratch filename, so a second write truncated the first mid-flight and the file ended up as interleaved JSON. On the next launch it failed to parse and the whole history was silently replaced with an empty list. Scratch names are now unique per write, and history writes are serialised the way task writes already were.
+
+**Stopping a backup holds the task until the run has actually finished.** Cancelling released the task's slot immediately, while the run was still draining its in-flight copies. Starting again straight away put two runs on the same destination, deleting each other's files under a run that reported success. A late-finishing run could also evict a newer one's cancellation token, leaving it impossible to stop.
+
+**A cancellation that lands late is reported as a cancellation.** Stopping a run after its last checkpoint let it return success, record a successful entry, and stamp `lastBackup` — resetting the schedule clock on a run the user had stopped.
+
+**Excluding a folder no longer deletes it from the backup.** Exclusions were matched case-sensitively against the destination's spelling while being keyed by the source's. Renaming a folder's case and then excluding it made the prune pass fail to see the protection and remove the whole subtree — the exact opposite of what "exclude" means.
+
+**Fixes across the interface.** Holding Enter no longer confirms a delete before the dialog can be read. The update button now has a real installing state, instead of reverting to an enabled "Check for updates" mid-download and inviting a second install. Escape while a confirmation is open no longer also closes the task form behind it and discards what was typed. Settings saved at launch no longer write the defaults over what was just loaded from disk. The restore confirmation now names the backup it is about to write, not only the destination.
+
+**A release can no longer ship the wrong version.** Nothing checked the tag against the manifests, so tagging without running `npm run bump-version` produced a green release whose `latest.json` still pointed at the previous version — every client reporting "up to date" forever. CI now fails on the mismatch. A manual workflow run can no longer draft a release tagged with a branch name, and the platform jobs no longer race each other writing `latest.json`.
+
+**A new logo, and a launch animation.** The old icon had a white halo baked into its pixels from being flattened onto a white background — invisible on white, an obvious outline on a dark taskbar. It has been rebuilt as vector geometry, which also made the launch animation possible: the drive appears, the arrow drops into it, the status lights come up.
+
+**Shorter help bubbles** in Settings, and the tray menu now reads *Open* and *Quit*.
+
+### Behaviour changes worth knowing
+
+- Copies now pass through a `.driveby-tmp` file beside each destination file. A run killed mid-copy can leave one behind; the next run's prune sweeps it.
+- Exclusion patterns match case-insensitively on Windows.
+- Cancelling a backup keeps the task busy until the run has finished stopping, so a second run cannot start in that window.
+- Stopping a run no longer advances `lastBackup`, so the schedule is not reset by a cancellation.
+
 ## 1.6.1
 
 **The task card is quieter while a backup runs.** The running card carried a detail line under the progress bar — phase, file counts, throughput, ETA. It is gone. The bar is the whole running-state affordance now, and it takes an accessible name of its own since no text sits beside it any more. `backup.phase.*` and `formatSpeed` had no other consumer and went with it. The backend still emits phase, counts, speed and ETA — only the display changed.

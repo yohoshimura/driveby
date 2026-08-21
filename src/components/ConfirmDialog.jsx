@@ -14,12 +14,29 @@ export default function ConfirmDialog({ state, onResolve }) {
   useEffect(() => {
     if (!state) return;
     dialogRef.current?.focus();
+    // Capture phase, so this runs before the app-wide shortcuts that also
+    // listen on window. Two bubble-phase listeners on the same target can't
+    // suppress each other, which is why cancelling a confirmation used to
+    // close the task form behind it and throw away what was typed (#F5).
+    const openedAt = Date.now();
     const handler = (e) => {
-      if (e.key === 'Escape') onResolve(false);
-      if (e.key === 'Enter') onResolve(true);
+      if (e.key !== 'Escape' && e.key !== 'Enter') return;
+      // Holding or double-tapping the key that opened this dialog fires a
+      // second keydown ~500ms later. Confirming on that repeat destroyed
+      // things before the dialog had been read (#F1).
+      if (e.repeat) return;
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onResolve(false);
+        return;
+      }
+      if (Date.now() - openedAt < 250) return;
+      if (!dialogRef.current?.contains(document.activeElement)) return;
+      e.stopPropagation();
+      onResolve(true);
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    window.addEventListener('keydown', handler, true);
+    return () => window.removeEventListener('keydown', handler, true);
   }, [state, onResolve]);
 
   if (!mounted) return null;

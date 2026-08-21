@@ -54,7 +54,16 @@ impl PatternSet {
                 };
                 // A pattern that doesn't compile is dropped rather than
                 // failing the run, matching the pre-1.5 behaviour.
-                regex::Regex::new(&glob_to_regex(body))
+                // Windows filenames are case-insensitive, and this same set
+                // is consulted by the source walk *and* by the prune pass.
+                // A case-sensitive pattern agrees with itself only as long
+                // as both sides see the same spelling: re-case a folder in
+                // the source and `raw` stops it being copied while `RAW` at
+                // the destination no longer looks protected, so prune wipes
+                // the subtree (#R6).
+                regex::RegexBuilder::new(&glob_to_regex(body))
+                    .case_insensitive(cfg!(windows))
+                    .build()
                     .ok()
                     .map(|re| (re, negated))
             })
@@ -89,6 +98,19 @@ impl PatternSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same PatternSet is consulted by the source walk and by the prune
+    /// pass, which see the source and destination spellings respectively.
+    /// On Windows those differ after a re-case, and a case-sensitive match
+    /// meant prune deleted a subtree the user had excluded (#R6).
+    #[cfg(windows)]
+    #[test]
+    fn patterns_ignore_case_on_windows() {
+        let set = PatternSet::from_input("raw");
+        assert!(set.matches("raw"), "the source spelling excludes");
+        assert!(set.matches("RAW"), "the destination spelling must too");
+        assert!(set.matches("Photos/Raw"), "and at depth");
+    }
 
     fn set(patterns: &[&str]) -> PatternSet {
         PatternSet::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())

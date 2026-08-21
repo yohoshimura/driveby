@@ -1,7 +1,7 @@
 {
   "name": "driveby",
   "private": true,
-  "version": "1.6.1",
+  "version": "1.7.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "bump-version": "node scripts/bump-version.mjs"
+    "bump-version": "node scripts/bump-version.mjs",
+    "clean": "node scripts/clean.mjs",
+    "clean:all": "node scripts/clean.mjs --all"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

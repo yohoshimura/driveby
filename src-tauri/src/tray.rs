@@ -36,10 +36,12 @@ impl UiFlags {
 // TODO(macOS): pair this with ActivationPolicy::Accessory so a
 // tray-only session can drop the dock icon.
 pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    // Menu labels stay English for 1.6 — the tray menu would have to be
-    // rebuilt on every language change to localize it.
-    let open = MenuItem::with_id(app, "open", "Open driveby", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit driveby", true, None::<&str>)?;
+    // Labels stay English and unqualified: the menu would have to be rebuilt
+    // on every language change to localize it, and the tray icon already
+    // says which app this is — repeating the name in every row only makes
+    // the menu wider.
+    let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
 

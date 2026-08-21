@@ -8,11 +8,21 @@ on:
 jobs:
   build:
     name: ${{ matrix.label }}
+    # workflow_dispatch runs against whatever ref was picked, so a manual run
+    # from master used to draft a release literally tagged `master`, complete
+    # with installers and a latest.json that the updater endpoint would then
+    # serve (#F8). Dispatch is still available — it just has to target a tag.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
+      # Each job merges its own platform into the shared latest.json and
+      # re-uploads it. Running them one at a time removes any chance of two
+      # read-modify-writes overlapping and dropping a platform's entry, at
+      # the cost of a slower release (#F9).
+      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
@@ -26,6 +36,23 @@ jobs:
             args: ''
     steps:
       - uses: actions/checkout@v4
+
+      # tauri.conf.json deliberately carries no version; the bundle version
+      # comes from Cargo.toml, which only scripts/bump-version.mjs updates —
+      # by hand. Tagging without running it produced a green release named
+      # v1.7.0 that shipped 1.6.1 binaries and a latest.json pinned to
+      # 1.6.1, so every client reported "up to date" forever (#F3).
+      - name: Tag must match the manifests
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          cargo="$(grep -m1 '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag  package.json=$pkg  Cargo.toml=$cargo"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$cargo" ]; then
+            echo "::error::version mismatch - run 'npm run bump-version $tag', commit, and re-tag"
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:

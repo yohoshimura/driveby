@@ -1,4 +1,6 @@
-use crate::fsutil::{apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap};
+use crate::fsutil::{
+    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, scratch_path,
+};
 use anyhow::{anyhow, Context, Result};
 use filetime::FileTime;
 use serde::Serialize;
@@ -302,15 +304,19 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
     let src = long_path(src);
     let dst = long_path(dst);
     let (src, dst) = (src.as_path(), dst.as_path());
+    let scratch = scratch_path(dst);
+    let tmp = scratch.as_path();
     let src_meta = fs::metadata(src).await.context("stat source")?;
     let mut r = fs::File::open(src).await.context("open source")?;
-    // A read-only file already sitting in the chosen destination would make
-    // File::create fail outright on Windows and abort the whole restore.
-    clear_readonly(dst);
-    let mut w = fs::File::create(dst).await.context("create destination")?;
-    // Past this line the destination holds our bytes rather than the user's,
-    // so a failure has to take the half-written file back out — otherwise a
-    // re-run can collide on size and quietly accept the truncated copy.
+    // Stream into a scratch file beside the destination. Creating the real
+    // file here would truncate whatever the user already had at that path,
+    // and a cancellation — or a bad sector on the backup drive, which is
+    // precisely why someone is restoring — would then leave them with
+    // neither their own copy nor ours. Nothing at `dst` is touched until
+    // the rename at the bottom.
+    // A scratch file left by a killed run may still carry +R.
+    clear_readonly(tmp);
+    let mut w = fs::File::create(tmp).await.context("create destination")?;
     let streamed = async {
         let mut buf = vec![0u8; 256 * 1024];
         loop {
@@ -337,27 +343,66 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
     .await;
     drop(w);
     if let Err(e) = streamed {
-        clear_readonly(dst);
-        let _ = fs::remove_file(dst).await;
+        // Only the scratch file goes. Whatever the user already had at the
+        // destination is still exactly as they left it.
+        clear_readonly(tmp);
+        let _ = fs::remove_file(tmp).await;
         return Err(e);
     }
     // Round-trip mtime so a follow-up sync doesn't re-copy everything (#6).
     if let Ok(t) = src_meta.modified() {
-        let _ = filetime::set_file_mtime(dst, FileTime::from_system_time(t));
+        let _ = filetime::set_file_mtime(tmp, FileTime::from_system_time(t));
     }
     // Mirror Hidden/System/ReadOnly the way the backup pipeline does — a
     // restored `desktop.ini` without its attributes leaves the folder
     // rendering with a default icon, which is precisely the thing the
     // backup side goes to some length to preserve.
     if let Some(attrs) = read_attrs(src) {
-        apply_attrs(dst, attrs);
+        apply_attrs(tmp, attrs);
     }
+    // A read-only file already sitting in the chosen destination would make
+    // the replace fail outright on Windows, so the bit comes off the
+    // outgoing file only — never off the scratch copy, which may carry the
+    // attribute forward from the backup.
+    clear_readonly(dst);
+    fs::rename(tmp, dst).await.context("commit destination")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cancelling a restore must not cost the user the file they already
+    /// had. The destination used to be opened with File::create — which
+    /// truncates it — before the first byte was read, so cancelling then
+    /// removed a file the restore had already emptied. Neither their copy
+    /// nor the backup's survived (#R2).
+    #[tokio::test]
+    async fn a_cancelled_restore_leaves_the_users_existing_file_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("backup.docx");
+        let dst = root.path().join("mine.docx");
+        // Big enough that the copy would have to loop, had it started.
+        std::fs::write(&src, vec![b'B'; 512 * 1024]).unwrap();
+        const MINE: &[u8] = b"the user's current working copy";
+        std::fs::write(&dst, MINE).unwrap();
+
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let res = copy(&src, &dst, &token).await;
+        assert!(res.is_err(), "a cancelled copy must not report success");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            MINE,
+            "cancelling the restore destroyed the user's own file"
+        );
+        assert!(
+            !root.path().join("mine.docx.driveby-tmp").exists(),
+            "scratch file left behind"
+        );
+    }
 
     /// The single-slot registry: one restore at a time, process-wide. A
     /// second begin while one is running must be refused, and the slot must

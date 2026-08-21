@@ -64,6 +64,10 @@ export default function Settings() {
   };
 
   const runInstall = async () => {
+    // The control below is disabled while installing, but a stray second
+    // call (keyboard repeat, a re-render mid-await) must not start a second
+    // download and a second relaunch.
+    if (updateState.status === 'installing') return;
     setUpdateState((prev) => ({ ...prev, status: 'installing' }));
     try {
       await installUpdate(updateState.update);
@@ -344,21 +348,28 @@ export default function Settings() {
           <div>
             <div className="setting-row__label">{t('settings.label.version')}</div>
             <div className="setting-row__sub">
-              {updateState.status === 'available'
-                ? t('updates.available', { version: updateState.version })
-                : updateState.status === 'current'
-                  ? t('updates.up_to_date')
-                  : t('sidebar.brand.version', { version: __APP_VERSION__ })}
+              {updateState.status === 'installing'
+                ? t('updates.installing')
+                : updateState.status === 'available'
+                  ? t('updates.available', { version: updateState.version })
+                  : updateState.status === 'current'
+                    ? t('updates.up_to_date')
+                    : t('sidebar.brand.version', { version: __APP_VERSION__ })}
             </div>
           </div>
           <div className="setting-row__control">
-            {updateState.status === 'available' ? (
-              <Button
-                size="small"
-                variant="primary"
-                onClick={runInstall}
-                disabled={updateState.status === 'installing'}
-              >
+            {/* `installing` had no branch of its own, so the moment the
+                download started this fell through to the else and rendered
+                an *enabled* "Check for updates" button with the current
+                version beside it — indistinguishable from idle. The
+                disabled={status === 'installing'} guard sat inside the
+                `available` branch, where it could never be true (#F2). */}
+            {updateState.status === 'installing' ? (
+              <Button size="small" variant="primary" disabled>
+                {t('updates.action.installing')}
+              </Button>
+            ) : updateState.status === 'available' ? (
+              <Button size="small" variant="primary" onClick={runInstall}>
                 {t('updates.action.install')}
               </Button>
             ) : (

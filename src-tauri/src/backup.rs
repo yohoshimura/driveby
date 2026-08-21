@@ -1,5 +1,5 @@
 use crate::fsutil::{
-    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, ATTR_KEEP,
+    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, scratch_path, ATTR_KEEP,
 };
 use crate::glob;
 use crate::persist;
@@ -68,14 +68,32 @@ impl Settings {
     }
 }
 
+/// One registered run: the token that stops it, plus a serial number so a
+/// run finishing late can only ever remove its *own* registration.
+struct Registration {
+    run: u64,
+    token: CancellationToken,
+}
+
 #[derive(Default)]
 pub struct BackupState {
-    active: Arc<DashMap<String, CancellationToken>>,
+    active: Arc<DashMap<String, Registration>>,
+    next_run: Arc<AtomicU64>,
 }
 
 impl BackupState {
+    /// Cancel the run without freeing its slot. Cancelling only trips the
+    /// token; the run then still has to drain its in-flight copies, which
+    /// can take seconds on a slow target. Releasing the slot here would let
+    /// a second run start against the same destination while the first is
+    /// still writing, and the two would delete each other's files. The slot
+    /// stays taken until the run itself unregisters — which is exactly how
+    /// RestoreState::cancel has always behaved (#R3).
     pub fn cancel(&self, task_id: &str) {
-        if let Some((_, token)) = self.active.remove(task_id) {
+        // Clone out and drop the map guard before cancelling, so no shard
+        // lock is held across the wakeups that cancel() triggers.
+        let token = self.active.get(task_id).map(|reg| reg.token.clone());
+        if let Some(token) = token {
             token.cancel();
         }
     }
@@ -84,19 +102,26 @@ impl BackupState {
     }
     /// Atomic register-if-absent. Returns None when a backup is already
     /// running for this task — the caller must not start a second one.
-    fn try_register(&self, task_id: &str) -> Option<CancellationToken> {
+    fn try_register(&self, task_id: &str) -> Option<(u64, CancellationToken)> {
         let token = CancellationToken::new();
+        let run = self.next_run.fetch_add(1, Ordering::Relaxed);
         // DashMap::entry gives us a single locked slot; insert only if vacant.
         match self.active.entry(task_id.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => None,
             dashmap::mapref::entry::Entry::Vacant(v) => {
-                v.insert(token.clone());
-                Some(token)
+                v.insert(Registration {
+                    run,
+                    token: token.clone(),
+                });
+                Some((run, token))
             }
         }
     }
-    fn unregister(&self, task_id: &str) {
-        self.active.remove(task_id);
+    /// Remove only our own registration. A run that finishes after a newer
+    /// one has started must not evict the newcomer's token — that would
+    /// leave the new run uncancellable and the slot open for a third.
+    fn unregister(&self, task_id: &str, run: u64) {
+        self.active.remove_if(task_id, |_, reg| reg.run == run);
     }
 }
 
@@ -190,7 +215,7 @@ pub async fn run_backup<R: Runtime>(
     // Atomic guard: refuse a second concurrent run for the same task. Without
     // this, double-click or scheduler-while-manual would race two writers
     // against the same destination tree (#1).
-    let token = match state.try_register(&task.id) {
+    let (run, token) = match state.try_register(&task.id) {
         Some(t) => t,
         None => {
             return Err(anyhow!("A backup is already running for this task"));
@@ -205,10 +230,18 @@ pub async fn run_backup<R: Runtime>(
     // always returns Ok, a cancelled one always has the token tripped, and
     // any other failure leaves the token alone.
     let cancelled = token.is_cancelled();
-    state.unregister(&task.id);
+    state.unregister(&task.id, run);
 
     let payload = match result {
-        Ok(p) => p,
+        // A cancellation landing after the last checkpoint still lets
+        // execute() return Ok. Taking that at face value would report a
+        // clean success and stamp lastBackup on a run the user stopped, so
+        // the token decides here too — mirroring restore::conclude (#R4).
+        Ok(p) => CompletePayload {
+            success: p.success && !cancelled,
+            cancelled,
+            ..p
+        },
         Err(err) => CompletePayload {
             backup_id: backup_id.clone(),
             task_id: task.id.clone(),
@@ -960,6 +993,21 @@ async fn prune_destination(
         return Ok(());
     }
 
+    // `excluded` and `unreadable` are keyed by the *source* spelling, but
+    // everything below walks the *destination* spelling. On a case-
+    // preserving filesystem those differ the moment the user re-cases a
+    // folder, and a literal comparison then fails to see the protection —
+    // deleting from the backup precisely what the user asked not to touch.
+    // Fold once here so the lookups stay O(1) (#R6).
+    #[cfg(windows)]
+    let folded_excluded: HashSet<String> = excluded.iter().map(|s| s.to_lowercase()).collect();
+    #[cfg(windows)]
+    let excluded = &folded_excluded;
+    #[cfg(windows)]
+    let folded_unreadable: HashSet<String> = unreadable.iter().map(|s| s.to_lowercase()).collect();
+    #[cfg(windows)]
+    let unreadable = &folded_unreadable;
+
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
     let root_canonical = long_path(root);
@@ -999,9 +1047,13 @@ async fn prune_destination(
             // terms, not via `excluded`: that set is filled in by the source
             // walk, so relying on it meant the destination only kept its
             // icon when the source root happened to have one too.
+            #[cfg(windows)]
+            let probe = rel_str.to_lowercase();
+            #[cfg(not(windows))]
+            let probe = rel_str.clone();
             if is_root_icon_marker(&rel_str)
-                || excluded.contains(&rel_str)
-                || unreadable.contains(&rel_str)
+                || excluded.contains(&probe)
+                || unreadable.contains(&probe)
                 || patterns.matches(&rel_str)
             {
                 continue;
@@ -1337,11 +1389,6 @@ async fn copy_with_retries<F: FnMut(i64)>(
     let max = 3;
     loop {
         attempts += 1;
-        // std's remove_file already ignores READONLY on NTFS, but that fast
-        // path needs FileDispositionInfoEx — unsupported on the FAT32/exFAT
-        // volumes this app is most often pointed at. See fsutil::clear_readonly.
-        clear_readonly(&long_path(dest));
-        let _ = fs::remove_file(long_path(dest)).await;
         let res = copy_file(src, dest, token, settings, on_progress).await;
         match res {
             Ok(hash) => return Ok(hash),
@@ -1350,11 +1397,10 @@ async fn copy_with_retries<F: FnMut(i64)>(
                     return Err(e);
                 }
                 if attempts >= max {
-                    // Don't leave a half-written file in the destination after
-                    // we give up — the next sync would either skip it on a
-                    // size collision or re-copy redundantly (#12).
-                    clear_readonly(&long_path(dest));
-                    let _ = fs::remove_file(long_path(dest)).await;
+                    // copy_file streams into a scratch file and removes it on
+                    // every failure path, so there is no half-written file to
+                    // clean up here (#12) — and the destination still holds
+                    // the last copy that succeeded.
                     return Err(e);
                 }
                 let backoff = 150u64 * (1u64 << (attempts - 1));
@@ -1373,12 +1419,18 @@ async fn copy_file<F: FnMut(i64)>(
 ) -> Result<u64> {
     let src_l = long_path(src);
     let dest_l = long_path(dest);
+    let tmp = scratch_path(dest);
+    let tmp_l = long_path(&tmp);
     let src_meta = fs::metadata(&src_l).await.context("stat source")?;
     let mut reader = fs::File::open(&src_l).await.context("open source")?;
-    // File::create is a hard PermissionDenied against an existing +R file,
-    // so this must not be reached with the bit still set.
-    clear_readonly(&dest_l);
-    let mut writer = fs::File::create(&dest_l)
+    // Stream into the scratch file rather than over the destination: until
+    // the rename at the bottom the previous backup is still whole, so an
+    // unreadable source, a write error or a cancellation costs nothing that
+    // was already copied. Opening the source first also means a locked file
+    // fails before anything at the destination has been disturbed.
+    // A scratch file left by a killed run may still carry +R.
+    clear_readonly(&tmp_l);
+    let mut writer = fs::File::create(&tmp_l)
         .await
         .context("create destination")?;
 
@@ -1421,21 +1473,28 @@ async fn copy_file<F: FnMut(i64)>(
         // Take this attempt's bytes back out of the shared counter, and
         // the partial file with them — failure and cancellation alike.
         on_progress(-(file_so_far as i64));
-        let _ = fs::remove_file(&dest_l).await;
+        let _ = fs::remove_file(&tmp_l).await;
         return Err(e);
     }
 
     if settings.preserve_mtime() {
         if let Ok(ft) = src_meta.modified() {
             let ft = FileTime::from_system_time(ft);
-            let _ = filetime::set_file_mtime(&dest_l, ft);
+            let _ = filetime::set_file_mtime(&tmp_l, ft);
         }
     }
     // Preserve Hidden / System / ReadOnly so things like `desktop.ini`
     // (which drives custom Windows folder icons) keep their attributes.
     if let Some(attrs) = read_attrs(src) {
-        apply_attrs(dest, attrs);
+        apply_attrs(&tmp, attrs);
     }
+    // MoveFileEx will not replace a +R file, so the bit has to come off the
+    // outgoing copy. Not off the scratch file: it may legitimately carry the
+    // attribute forward from the source.
+    clear_readonly(&dest_l);
+    fs::rename(&tmp_l, &dest_l)
+        .await
+        .context("commit destination")?;
     Ok(hasher.digest())
 }
 
@@ -1507,6 +1566,46 @@ mod tests {
         assert!(same_mtime(base, plus_1));
         assert!(same_mtime(base, plus_2));
         assert!(!same_mtime(base, plus_3));
+    }
+
+    /// Cancelling trips the token but must leave the task registered. The
+    /// run is still draining its in-flight copies; freeing the slot here let
+    /// a second run start against the same destination, and the two deleted
+    /// each other's files while reporting success (#R3).
+    #[test]
+    fn cancelling_keeps_the_slot_taken_while_the_run_drains() {
+        let state = BackupState::default();
+        let (_run, token) = state.try_register("t").expect("an idle task registers");
+
+        state.cancel("t");
+
+        assert!(token.is_cancelled(), "cancel must trip the token");
+        assert!(
+            state.is_active("t"),
+            "the slot must stay taken until the run itself unregisters"
+        );
+        assert!(
+            state.try_register("t").is_none(),
+            "a second run must still be refused while the first drains"
+        );
+    }
+
+    /// A run that finishes after a newer one has started must remove only
+    /// its own registration — evicting the newcomer left it uncancellable
+    /// and the slot open for a third run (#R3).
+    #[test]
+    fn a_late_finisher_does_not_evict_a_newer_run() {
+        let state = BackupState::default();
+        let (run_a, _token_a) = state.try_register("t").unwrap();
+        state.unregister("t", run_a);
+
+        let (_run_b, token_b) = state.try_register("t").expect("slot freed by run A");
+        // Run A's cleanup arrives late, after B has taken the slot.
+        state.unregister("t", run_a);
+
+        assert!(state.is_active("t"), "run B's registration was evicted");
+        state.cancel("t");
+        assert!(token_b.is_cancelled(), "run B must still be cancellable");
     }
 
     /// End-to-end pipeline run against the mock Tauri runtime: copy a small
@@ -1757,6 +1856,68 @@ mod tests {
             "cancelled run left partial files: {:?}",
             leftover
         );
+    }
+
+    /// A source we cannot open must not cost us the copy we already hold.
+    /// The destination used to be deleted at the top of the retry loop,
+    /// before anything had tried to open the source, so a single locked file
+    /// destroyed its own backup and nothing replaced it (#R1).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_unreadable_source_leaves_the_previous_backup_intact() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Last night's run already put a good copy in the destination.
+        const PREVIOUS: &[u8] = b"the previous good backup";
+        std::fs::write(source.join("vm.bin"), b"newer contents").unwrap();
+        std::fs::write(dest.join("vm.bin"), PREVIOUS).unwrap();
+        // Something else keeps a plain readable file alongside it, so the run
+        // has real work to do and doesn't bail for unrelated reasons.
+        std::fs::write(source.join("notes.txt"), b"readable").unwrap();
+
+        // Tonight the source is held open with no sharing — a running VM
+        // holding its own disk image.
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(source.join("vm.bin"))
+            .unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "locked-src".into(),
+            name: "locked-src".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: dest.to_string_lossy().to_string(),
+            schedule: None,
+            last_backup: None,
+        };
+        let settings = Settings {
+            continue_on_error: Some(true),
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+
+        let _ = execute(app.handle(), "locked-src", &task, &settings, &token).await;
+
+        assert_eq!(
+            std::fs::read(dest.join("vm.bin")).unwrap(),
+            PREVIOUS,
+            "an unreadable source destroyed the backup it could not replace"
+        );
+        // And no scratch file is left sitting in the destination.
+        let leftovers: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".driveby-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "scratch files left behind: {:?}", leftovers);
     }
 
     /// continueOnError=false stops the run on the first real failure — and

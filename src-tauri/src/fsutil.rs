@@ -34,6 +34,21 @@ pub fn long_path(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
+/// Scratch file a copy streams into before it is renamed onto the real
+/// destination. Both pipelines write here first so that an unreadable
+/// source, a failed write or a cancellation can never damage the file
+/// already sitting at `dest` — the swap only happens once the bytes are
+/// safely on disk. It lives in the destination's own directory so the
+/// rename stays within one volume, which is what makes it atomic.
+///
+/// A run killed mid-copy leaves one behind. The backup pipeline's prune
+/// sweeps it, since a scratch file is never in `keep`.
+pub fn scratch_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".driveby-tmp");
+    dest.with_file_name(name)
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Windows file attributes (preserves Hidden/System/ReadOnly so that
 // custom-folder-icon machinery — `desktop.ini` + the parent's System
