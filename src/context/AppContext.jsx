@@ -30,6 +30,7 @@ const DEFAULT_SETTINGS = {
   continueOnError: true,
   preserveMtime: true,
   parallelCopies: 4,
+  maxSpeedMbps: 0,
   historyRetention: DEFAULT_HISTORY_RETENTION,
   sidebarOpen: true,
   lastView: 'home',

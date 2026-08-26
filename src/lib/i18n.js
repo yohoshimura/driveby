@@ -198,6 +198,8 @@ const MESSAGES = {
     'settings.label.continue_on_error': 'Continue on error',
     'settings.label.preserve_mtime': 'Preserve file modification time',
     'settings.label.parallel_copies': 'Files copied at once',
+    'settings.label.max_speed': 'Maximum speed',
+    'settings.unit.mbps': 'MB/s',
     'settings.label.history_retention': 'History kept',
     'settings.label.exclude': 'Exclude patterns',
     'settings.label.appearance': 'Appearance',
@@ -206,6 +208,7 @@ const MESSAGES = {
 
     'settings.tip.verify': "Reads every copied file back and compares it against a fingerprint taken while writing, to catch corruption.",
     'settings.tip.parallel_copies': "How many files are copied at once. 4 suits SSDs and network drives; use 1 for a spinning hard disk.",
+    'settings.tip.max_speed': "Caps how fast backups write, so a run leaves the machine usable. Shared by every backup at once. Empty means no limit.",
     'settings.tip.history_retention': "How far back the history goes. Older runs are dropped; backup folders are never touched.",
     'settings.tip.continue_on_error': "Skips files that cannot be copied — locked, or not permitted — and carries on instead of stopping the whole job.",
     'settings.tip.preserve_mtime': "Keeps each file’s original modification date, which lets later runs skip unchanged files instantly.",
@@ -407,6 +410,8 @@ const MESSAGES = {
     'settings.label.continue_on_error': 'Continuer en cas d’erreur',
     'settings.label.preserve_mtime': 'Préserver la date de modification',
     'settings.label.parallel_copies': 'Fichiers copiés simultanément',
+    'settings.label.max_speed': 'Vitesse maximale',
+    'settings.unit.mbps': 'Mo/s',
     'settings.label.history_retention': 'Historique conservé',
     'settings.label.exclude': 'Motifs d’exclusion',
     'settings.label.appearance': 'Apparence',
@@ -415,6 +420,7 @@ const MESSAGES = {
 
     'settings.tip.verify': "Relit chaque fichier copié et le compare à une empreinte calculée pendant l’écriture, pour détecter toute corruption.",
     'settings.tip.parallel_copies': "Nombre de fichiers copiés simultanément. 4 convient aux SSD et aux disques réseau ; choisissez 1 pour un disque mécanique.",
+    'settings.tip.max_speed': "Plafonne la vitesse d’écriture des sauvegardes, pour qu’une exécution laisse la machine utilisable. Partagé par toutes les sauvegardes en cours. Vide = aucune limite.",
     'settings.tip.history_retention': "Ancienneté maximale de l’historique. Les exécutions plus anciennes sont supprimées ; les dossiers de sauvegarde ne sont jamais touchés.",
     'settings.tip.continue_on_error': "Saute les fichiers impossibles à copier — verrouillés ou sans droits — et poursuit au lieu d’arrêter toute la tâche.",
     'settings.tip.preserve_mtime': "Conserve la date de modification d’origine, ce qui permet aux exécutions suivantes de sauter instantanément les fichiers inchangés.",

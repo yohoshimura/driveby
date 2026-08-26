@@ -31,6 +31,11 @@ export default function Settings() {
   const t = useT();
   const [autostartOn, setAutostartOn] = useState(false);
   const [updateState, setUpdateState] = useState({ status: 'idle' });
+  // Kept locally while it is being typed: "50" passes through "5", and
+  // committing every keystroke would leave the ceiling at 5 MB/s for anyone
+  // who clicked away mid-number.
+  const [maxSpeed, setMaxSpeed] = useState(() =>
+    settings.maxSpeedMbps > 0 ? String(settings.maxSpeedMbps) : '');
 
   // The OS owns the autostart registration, so the toggle reflects what is
   // actually registered rather than what settings.json remembers.
@@ -75,6 +80,17 @@ export default function Settings() {
       setUpdateState({ status: 'idle' });
       showToast(t('updates.toast.failed', { error: e }), 'error');
     }
+  };
+
+  /// Anything that is not a positive number means "no ceiling" — an empty
+  /// field, a stray minus sign, a comma from a French keyboard that the
+  /// number input rejected. The upper bound is there so a typo of 500000
+  /// cannot be mistaken for a working setting.
+  const commitMaxSpeed = () => {
+    const parsed = Number.parseFloat(String(maxSpeed).replace(',', '.'));
+    const value = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 10000) : 0;
+    setMaxSpeed(value > 0 ? String(value) : '');
+    if (value !== settings.maxSpeedMbps) updateSetting('maxSpeedMbps', value);
   };
 
   const pickDefaultDestination = async () => {
@@ -218,6 +234,33 @@ export default function Settings() {
                   {n}
                 </button>
               ))}
+            </div>
+          </div>
+        </div>
+        <div className="setting-row">
+          <div>
+            <div className="setting-row__label">{t('settings.label.max_speed')}</div>
+          </div>
+          <div className="setting-row__control">
+            <InfoTip text={t('settings.tip.max_speed')} />
+            <div className="field-row">
+              <input
+                type="number"
+                min="0"
+                step="1"
+                inputMode="decimal"
+                className="field field--compact"
+                style={{ width: 90 }}
+                value={maxSpeed}
+                onChange={(e) => setMaxSpeed(e.target.value)}
+                onBlur={commitMaxSpeed}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                placeholder={t('common.unlimited')}
+                aria-label={t('settings.label.max_speed')}
+                autoComplete="off"
+                name="driveby-max-speed"
+              />
+              <span className="setting-row__sub">{t('settings.unit.mbps')}</span>
             </div>
           </div>
         </div>

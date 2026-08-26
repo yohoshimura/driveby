@@ -4,6 +4,7 @@ mod backup;
 mod fsutil;
 mod glob;
 mod persist;
+mod ratelimit;
 mod restore;
 mod scheduler;
 mod tray;
@@ -36,6 +37,7 @@ fn default_settings() -> Value {
         "continueOnError": true,
         "preserveMtime": true,
         "parallelCopies": 4,
+        "maxSpeedMbps": 0,
         "historyLimit": 1000,
         "closeToTray": false,
         "autostart": false,

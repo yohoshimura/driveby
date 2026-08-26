@@ -4,6 +4,7 @@ use crate::fsutil::{
 };
 use crate::glob;
 use crate::persist;
+use crate::ratelimit;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -81,6 +82,8 @@ pub struct Settings {
     pub preserve_mtime: Option<bool>,
     #[serde(default, rename = "parallelCopies")]
     pub parallel_copies: Option<u32>,
+    #[serde(default, rename = "maxSpeedMbps")]
+    pub max_speed_mbps: Option<f64>,
 }
 
 impl Settings {
@@ -99,6 +102,23 @@ impl Settings {
     /// a seek storm.
     fn parallel_copies(&self) -> usize {
         self.parallel_copies.unwrap_or(4).clamp(1, 8) as usize
+    }
+    /// The copy ceiling in bytes per second, 0 meaning none.
+    ///
+    /// The setting is in MiB/s: the UI says "MB" (English) and "Mo"
+    /// (French), and everywhere else in the app those already mean 1024²
+    /// bytes — `formatBytes` divides by 1024. A number that reads 50 in
+    /// Settings and 50 in the transfer speed beside it has to mean the same
+    /// thing in both places.
+    ///
+    /// A missing, zero, negative or NaN value is "no ceiling"; the `as`
+    /// cast saturates, so an absurd number is simply a very high ceiling
+    /// rather than a wrapped-around tiny one.
+    fn max_speed_bytes(&self) -> u64 {
+        match self.max_speed_mbps {
+            Some(mbps) if mbps > 0.0 => (mbps * 1024.0 * 1024.0) as u64,
+            _ => 0,
+        }
     }
 }
 
@@ -331,6 +351,12 @@ pub async fn run_backup<R: Runtime>(
             return Err(anyhow!("A backup is already running for this task"));
         }
     };
+
+    // The ceiling is process-wide, so the newest run's setting is the one in
+    // force — including for a run already under way, which is what makes
+    // lowering it while something is copying take effect at the next chunk
+    // instead of at the next backup.
+    ratelimit::shared().set_rate(settings.max_speed_bytes());
 
     let result = execute_all(app, &backup_id, &task, &settings, &token).await;
 
@@ -1784,6 +1810,17 @@ async fn copy_file<F: FnMut(i64)>(
                 read = reader.read(&mut buf) => {
                     let n = read.context("read source")?;
                     if n == 0 { break; }
+                    // Wait for the ceiling *before* writing, and wait
+                    // cancellably: at a low ceiling one chunk's worth of
+                    // budget is seconds, and a Stop that only lands between
+                    // chunks would sit there visibly doing nothing.
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            return Err(anyhow!(CANCELLED_MSG));
+                        }
+                        _ = ratelimit::shared().acquire(n as u64) => {}
+                    }
                     writer.write_all(&buf[..n]).await.context("write destination")?;
                     hasher.update(&buf[..n]);
                     file_so_far += n as u64;
@@ -2199,6 +2236,30 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    /// The conversion from what the user typed to what the bucket counts.
+    /// A factor-of-1000 slip here is invisible in the UI and turns a 50 MB/s
+    /// ceiling into a 50 KB/s one.
+    #[test]
+    fn max_speed_reads_as_mebibytes_per_second() {
+        let with = |mbps| Settings {
+            max_speed_mbps: mbps,
+            ..Default::default()
+        }
+        .max_speed_bytes();
+
+        assert_eq!(with(Some(50.0)), 50 * 1024 * 1024);
+        assert_eq!(with(Some(0.5)), 512 * 1024);
+        // Every way of saying "no ceiling", including the ones a hand-edited
+        // settings.json can produce.
+        assert_eq!(with(None), 0);
+        assert_eq!(with(Some(0.0)), 0);
+        assert_eq!(with(Some(-5.0)), 0);
+        assert_eq!(with(Some(f64::NAN)), 0);
+        // Absurd but harmless: the cast saturates rather than wrapping to a
+        // tiny ceiling that would stall every copy.
+        assert!(with(Some(f64::INFINITY)) > 0);
     }
 
     #[test]

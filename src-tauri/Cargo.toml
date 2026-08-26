@@ -41,6 +41,9 @@ tracing-appender = "0.2"
 # pipelines be driven end to end without a real webview.
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "test"] }
 tempfile = "3"
+# `test-util` is what lets the rate-limiter tests drive tokio's clock instead
+# of sleeping through the seconds they are asserting about.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
