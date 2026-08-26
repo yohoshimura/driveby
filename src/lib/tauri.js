@@ -67,4 +67,8 @@ export const bridge = {
   onBackupComplete: (cb) => listen('backup-complete', (e) => cb(e.payload)),
   onRestoreProgress: (cb) => listen('restore-progress', (e) => cb(e.payload)),
   onTaskUpdated: (cb) => listen('task-updated', (e) => cb(e.payload)),
+  // Emitted only when the answer changes, so the payload is the whole
+  // picture: every task with at least one destination missing.
+  onDestinationsStatus: (cb) => listen('destinations-status', (e) => cb(e.payload)),
+  onDestinationMissing: (cb) => listen('destination-missing', (e) => cb(e.payload)),
 };

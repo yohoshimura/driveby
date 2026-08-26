@@ -644,6 +644,11 @@ input, textarea { user-select: text; }
 .task__meta {
   font-size: 11px; color: var(--label-tertiary); margin-top: 4px;
 }
+/* A drive that is not plugged in. Orange rather than red: nothing has gone
+   wrong, something is missing. */
+.task__missing {
+  font-size: 11px; color: var(--system-orange); margin-top: 4px;
+}
 .task__progress { margin-top: 8px; }
 .progressbar {
   height: 4px;
@@ -830,6 +835,27 @@ input, textarea { user-select: text; }
 /* Stacked destination rows in the task form, plus the button that adds one. */
 .dest-list { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .dest-list .field-row { width: 100%; }
+
+/* Day-of-week picker for a custom schedule. Short day names rather than
+   initials: M and M, S and S are the same letter in both languages. */
+.day-picker { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.day-picker__days { display: flex; gap: 4px; flex-wrap: wrap; }
+.day-picker__day {
+  min-width: 44px; padding: 5px 8px;
+  border-radius: var(--radius-md);
+  border: 0.5px solid var(--separator);
+  background: var(--bg-control);
+  color: var(--label-secondary);
+  font-size: 11px; font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.day-picker__day:hover { background: var(--bg-control-hover); }
+.day-picker__day--on {
+  background: var(--accent); border-color: transparent;
+  color: #fff; font-weight: 600;
+}
+.day-picker__time { width: 110px; }
 
 .form-field { margin-bottom: 12px; }
 .form-field__label {

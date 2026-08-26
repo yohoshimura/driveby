@@ -2,18 +2,12 @@ import React from 'react';
 import { useFormat } from '../../hooks/useFormat';
 import { useT } from '../../hooks/useT';
 import { taskDestinations } from '../../lib/task';
-
-const SCHEDULE_KEY = {
-  manual: 'task.schedule.manual',
-  hourly: 'task.schedule.hourly',
-  daily: 'task.schedule.daily',
-  weekly: 'task.schedule.weekly',
-  monthly: 'task.schedule.monthly',
-};
+import { useScheduleLabel } from '../../hooks/useScheduleLabel';
 
 export default function TaskList({ tasks }) {
   const t = useT();
   const { formatTime } = useFormat();
+  const scheduleLabelFor = useScheduleLabel();
   if (!tasks || tasks.length === 0) {
     return <div className="chart-empty">{t('chart.empty.tasks')}</div>;
   }
@@ -22,7 +16,7 @@ export default function TaskList({ tasks }) {
       <ul className="task-list-stat__items" role="list">
         {tasks.map((task, i) => {
           const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
-          const scheduleLabel = t(SCHEDULE_KEY[task.schedule] || 'task.schedule.manual');
+          const scheduleLabel = scheduleLabelFor(task);
           const paths = `${task.source} → ${taskDestinations(task).join(', ')}`;
           return (
             <li

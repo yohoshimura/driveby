@@ -12,7 +12,7 @@ import { useT } from '../hooks/useT';
 export default function Home() {
   const {
     tasks, settings,
-    startBackup, cancelBackup, addTask, editTask, deleteTask, showToast,
+    startBackup, cancelBackup, addTask, editTask, deleteTask, showToast, destinationStatus,
   } = useApp();
   const { activeBackups } = useProgress();
   const t = useT();
@@ -83,6 +83,7 @@ export default function Home() {
               task={task}
               index={i}
               backup={activeBackups[task.id]}
+              missing={destinationStatus[task.id]}
               onRun={startBackup}
               onCancel={cancelBackup}
               onModify={(t) => { setShowForm(false); setEditingId(t.id); }}

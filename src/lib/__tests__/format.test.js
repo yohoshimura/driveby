@@ -49,3 +49,27 @@ describe('makeFormatters (en)', () => {
     expect(en.formatTime(null)).toBe('');
   });
 });
+
+describe('weekday and clock formatting', () => {
+  test('1 February 2026 is a Sunday, which the day names are anchored on', () => {
+    expect(new Date(2026, 1, 1).getDay()).toBe(0);
+  });
+
+  test('names the days in order, whatever order they were given in', () => {
+    const { formatWeekdays } = makeFormatters('en');
+    expect(formatWeekdays([4, 1])).toBe('Mon, Thu');
+    expect(formatWeekdays([0])).toBe('Sun');
+    expect(formatWeekdays([])).toBe('');
+  });
+
+  test('follows the app language, not the OS locale', () => {
+    const { formatWeekdays } = makeFormatters('fr');
+    expect(formatWeekdays([1]).toLowerCase()).toContain('lun');
+  });
+
+  test('renders a stored time, and nothing at all for a broken one', () => {
+    const { formatClock } = makeFormatters('fr');
+    expect(formatClock('22:00')).toBe('22:00');
+    expect(formatClock('nope')).toBe('');
+  });
+});

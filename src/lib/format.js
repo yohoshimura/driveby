@@ -3,6 +3,8 @@
 // app's selected language — never the OS locale, which is what
 // `toLocaleString(undefined, …)` used to leak.
 
+import { normalizeDays, parseTime } from './schedule';
+
 const BYTE_UNITS = {
   en: ['B', 'KB', 'MB', 'GB', 'TB'],
   // French storage sizes are octets.
@@ -23,6 +25,8 @@ export function makeFormatters(lang) {
   });
   const dateTime = new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' });
   const dayMonth = new Intl.DateTimeFormat(locale, { day: '2-digit', month: '2-digit' });
+  const weekdayShort = new Intl.DateTimeFormat(locale, { weekday: 'short' });
+  const clock = new Intl.DateTimeFormat(locale, { hour: 'numeric', minute: '2-digit' });
 
   const formatBytes = (bytes) => {
     if (!bytes || bytes < 0) return `0 ${units[0]}`;
@@ -60,5 +64,33 @@ export function makeFormatters(lang) {
 
   const formatNumber = (n) => (n == null ? '—' : integer.format(n));
 
-  return { formatBytes, formatDuration, formatTime, formatDayLabel, formatNumber };
+  // 1 February 2026 is a Sunday, which is what turns a stored 0 = Sunday
+  // index into a date Intl can name. Asserted in the tests, since every
+  // day name below leans on it.
+  const SUNDAY = new Date(2026, 1, 1);
+
+  /// "Mon, Thu" for [1, 4], in the app's language.
+  const formatWeekdays = (days) =>
+    normalizeDays(days)
+      .map((d) => weekdayShort.format(new Date(2026, 1, SUNDAY.getDate() + d)))
+      .join(', ');
+
+  /// A stored "HH:MM" as the locale writes it — which is 22:00 here and
+  /// 10:00 PM in a 12-hour one. Empty string for a time that does not parse,
+  /// so a half-typed schedule renders as nothing rather than as "Invalid
+  /// Date".
+  const formatClock = (time) => {
+    const at = parseTime(time);
+    return at ? clock.format(new Date(2026, 1, 1, at.hours, at.minutes)) : '';
+  };
+
+  return {
+    formatBytes,
+    formatDuration,
+    formatTime,
+    formatDayLabel,
+    formatNumber,
+    formatWeekdays,
+    formatClock,
+  };
 }

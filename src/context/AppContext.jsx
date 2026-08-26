@@ -46,6 +46,8 @@ export function AppProvider({ children }) {
   // { task, status: 'scanning' | 'ready', payload } while the pre-run
   // preview dialog is open, null when it is not.
   const [previewState, setPreviewState] = useState(null);
+  // { taskId: [absent destination paths] }, pushed by the scheduler.
+  const [destinationStatus, setDestinationStatus] = useState({});
   const { beginRestore, endRestore } = useProgress();
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
@@ -211,10 +213,28 @@ export function AppProvider({ children }) {
           return next;
         });
       });
+      // The scheduler stats every destination each minute and only speaks
+      // up when the answer changes, so each payload is the whole picture
+      // and replaces what we hold. A task dropping out of the list is how
+      // we learn its drive is back.
+      const offDestinations = await bridge.onDestinationsStatus((list) => {
+        const next = {};
+        for (const entry of list || []) next[entry.taskId] = entry.missing;
+        setDestinationStatus(next);
+      });
+      // Fired once per absence, not once per missed occurrence: the drive
+      // in the drawer must not become a daily notification.
+      const offMissing = await bridge.onDestinationMissing((data) => {
+        const message = tr('backup.toast.destination_missing', { name: data?.taskName });
+        showToast(message, 'error');
+        if (settingsRef.current.showNotifications) {
+          bridge.notify(tr('backup.notification.title'), message);
+        }
+      });
       if (cancelled) {
-        offComplete?.(); offTaskUpdated?.();
+        offComplete?.(); offTaskUpdated?.(); offDestinations?.(); offMissing?.();
       } else {
-        unlisten.push(offComplete, offTaskUpdated);
+        unlisten.push(offComplete, offTaskUpdated, offDestinations, offMissing);
       }
     })();
     return () => {
@@ -412,12 +432,14 @@ export function AppProvider({ children }) {
   // times a second and re-render every consumer with it.
   const value = useMemo(() => ({
     tasks, history, settings, loaded, toast, confirmState, resolvedTheme, previewState,
+    destinationStatus,
     startBackup, cancelBackup, addTask, editTask, deleteTask,
     deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
     confirmPreview, cancelPreview,
     showToast, handleConfirm, confirm, tr,
   }), [
     tasks, history, settings, loaded, toast, confirmState, resolvedTheme, previewState,
+    destinationStatus,
     startBackup, cancelBackup, addTask, editTask, deleteTask,
     deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
     confirmPreview, cancelPreview,

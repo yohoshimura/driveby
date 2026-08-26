@@ -3,12 +3,27 @@ import Button from './common/Button';
 import FormField from './common/FormField';
 import { bridge } from '../lib/tauri';
 import { useT } from '../hooks/useT';
+import { useFormat } from '../hooks/useFormat';
 import { findOverlap, pathContains, taskDestinations } from '../lib/task';
+import {
+  DEFAULT_SCHEDULE_TIME,
+  WEEKDAY_INDEXES,
+  nextOccurrence,
+  normalizeDays,
+} from '../lib/schedule';
 
-const INITIAL = { name: '', source: '', destinations: [], schedule: 'manual' };
+const INITIAL = {
+  name: '',
+  source: '',
+  destinations: [],
+  schedule: 'manual',
+  scheduleDays: [],
+  scheduleTime: DEFAULT_SCHEDULE_TIME,
+};
 
 export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, initialTask, dataState }) {
   const t = useT();
+  const { formatTime, formatWeekdays } = useFormat();
   const isEdit = !!initialTask;
   const [task, setTask] = useState(() =>
     initialTask
@@ -17,6 +32,8 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           source: initialTask.source || '',
           destinations: taskDestinations(initialTask),
           schedule: initialTask.schedule || 'manual',
+          scheduleDays: normalizeDays(initialTask.scheduleDays),
+          scheduleTime: initialTask.scheduleTime || DEFAULT_SCHEDULE_TIME,
         }
       : INITIAL
   );
@@ -58,9 +75,30 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       destinations: prev.destinations.filter((_, i) => i !== index),
     }));
 
+  const toggleDay = (day) =>
+    setTask((prev) => ({
+      ...prev,
+      scheduleDays: prev.scheduleDays.includes(day)
+        ? prev.scheduleDays.filter((d) => d !== day)
+        : normalizeDays([...prev.scheduleDays, day]),
+    }));
+
+  // Null when the schedule cannot fire — no day picked, or a time the
+  // backend will not parse. The form refuses to save in that state, and the
+  // absent line is the first hint of why.
+  const nextRun = task.schedule === 'custom'
+    ? nextOccurrence(task.scheduleDays, task.scheduleTime)
+    : null;
+
   const submit = () => {
     if (!task.name.trim()) return showToast?.(t('form.error.name'), 'error');
     if (!task.source) return showToast?.(t('form.error.source'), 'error');
+    // A custom schedule that cannot fire would leave a task looking
+    // scheduled and never running. Refuse it here rather than let the
+    // scheduler quietly treat it as manual.
+    if (task.schedule === 'custom' && !nextRun) {
+      return showToast?.(t('form.error.schedule'), 'error');
+    }
     if (task.destinations.length === 0 && !defaultDestination) {
       return showToast?.(t('form.error.dest'), 'error');
     }
@@ -184,8 +222,48 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           <option value="daily">{t('task.schedule.daily')}</option>
           <option value="weekly">{t('task.schedule.weekly')}</option>
           <option value="monthly">{t('task.schedule.monthly')}</option>
+          <option value="custom">{t('task.schedule.custom')}</option>
         </select>
       </FormField>
+
+      {task.schedule === 'custom' && (
+        <FormField
+          label={t('form.label.schedule_days')}
+          hint={nextRun
+            ? t('form.hint.next_run', { when: formatTime(nextRun.toISOString()) })
+            : t('form.hint.no_next_run')}
+        >
+          <div className="day-picker">
+            <div role="group" aria-label={t('form.label.schedule_days')} className="day-picker__days">
+              {WEEKDAY_INDEXES.map((day) => {
+                const on = task.scheduleDays.includes(day);
+                const name = formatWeekdays([day]);
+                return (
+                  <button
+                    key={day}
+                    type="button"
+                    role="checkbox"
+                    aria-checked={on}
+                    aria-label={name}
+                    className={`day-picker__day ${on ? 'day-picker__day--on' : ''}`}
+                    onClick={() => toggleDay(day)}
+                  >
+                    {name}
+                  </button>
+                );
+              })}
+            </div>
+            <input
+              type="time"
+              className="field field--compact day-picker__time"
+              value={task.scheduleTime}
+              onChange={(e) => setTask({ ...task, scheduleTime: e.target.value })}
+              aria-label={t('form.label.schedule_time')}
+              name="driveby-schedule-time"
+            />
+          </div>
+        </FormField>
+      )}
 
       <div className="card__actions">
         <Button onClick={onCancel}>{t('common.cancel')}</Button>

@@ -39,6 +39,13 @@ pub struct Task {
     pub destinations: Option<Vec<String>>,
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Days of the week a `custom` schedule runs on, 0 = Sunday — the
+    /// numbering `Date#getDay` uses, because the form is what writes them.
+    #[serde(default, rename = "scheduleDays")]
+    pub schedule_days: Option<Vec<u8>>,
+    /// Local time of day a `custom` schedule runs at, "HH:MM".
+    #[serde(default, rename = "scheduleTime")]
+    pub schedule_time: Option<String>,
     #[serde(default, rename = "lastBackup")]
     pub last_backup: Option<String>,
 }
@@ -2070,6 +2077,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
@@ -2126,6 +2135,8 @@ mod tests {
                     .collect(),
             ),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         }
     }
@@ -2246,6 +2257,8 @@ mod tests {
             destination: Some(dests[0].to_string_lossy().to_string()),
             destinations: None,
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
 
@@ -2315,6 +2328,8 @@ mod tests {
             destination: None,
             destinations: None,
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
 
@@ -2374,6 +2389,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
@@ -2429,6 +2446,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
@@ -2489,6 +2508,8 @@ mod tests {
                 destination: None,
                 destinations: Some(vec![dest.to_string_lossy().to_string()]),
                 schedule: None,
+                schedule_days: None,
+                schedule_time: None,
                 last_backup: None,
             };
             let settings = Settings {
@@ -2537,6 +2558,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let settings = Settings {
@@ -2600,6 +2623,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let settings = Settings {
@@ -2656,6 +2681,8 @@ mod tests {
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         };
         let settings = Settings {

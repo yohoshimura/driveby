@@ -315,6 +315,8 @@ mod tests {
                     .collect(),
             ),
             schedule: None,
+            schedule_days: None,
+            schedule_time: None,
             last_backup: None,
         }
     }

@@ -1,14 +1,15 @@
 use crate::backup::{self, BackupState, Settings, Task};
+use crate::fsutil::long_path;
 use crate::persist;
-use chrono::{DateTime, Months, Utc};
+use chrono::{DateTime, Datelike, Local, Months, NaiveTime, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::async_runtime;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::time;
 use tracing::info;
 
@@ -29,6 +30,90 @@ fn interval_for(schedule: Option<&str>) -> Option<Interval> {
         Some("monthly") => Some(Interval::Monthly),
         _ => None,
     }
+}
+
+/// How a task decides it is time to run.
+///
+/// The two kinds answer different questions. An interval answers "how long
+/// since the last one", which is what `hourly`/`daily`/`weekly`/`monthly`
+/// have always meant here — a daily task backed up at 03:00 stays a 03:00
+/// task only until one run is late. A calendar schedule answers "when",
+/// which is the only way to say "in the evening, when I am not working".
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Schedule {
+    Interval(Interval),
+    Calendar { days: Vec<Weekday>, time: NaiveTime },
+}
+
+/// 0 = Sunday, the numbering `Date#getDay` uses — the task form writes
+/// these, so its convention is the one on disk.
+fn weekday_of(index: u8) -> Option<Weekday> {
+    Some(match index {
+        0 => Weekday::Sun,
+        1 => Weekday::Mon,
+        2 => Weekday::Tue,
+        3 => Weekday::Wed,
+        4 => Weekday::Thu,
+        5 => Weekday::Fri,
+        6 => Weekday::Sat,
+        _ => return None,
+    })
+}
+
+/// None means "this task never fires on its own" — `manual`, an unknown
+/// keyword, or a custom schedule with no days or an unreadable time. A
+/// half-configured custom schedule has to be inert rather than default to
+/// something: firing at midnight because the time did not parse would be a
+/// backup the user never asked for, at an hour they never chose.
+fn schedule_for(task: &Task) -> Option<Schedule> {
+    if task.schedule.as_deref() != Some("custom") {
+        return interval_for(task.schedule.as_deref()).map(Schedule::Interval);
+    }
+    let days: Vec<Weekday> = task
+        .schedule_days
+        .as_ref()?
+        .iter()
+        .filter_map(|d| weekday_of(*d))
+        .collect();
+    if days.is_empty() {
+        return None;
+    }
+    let time = NaiveTime::parse_from_str(task.schedule_time.as_deref()?, "%H:%M").ok()?;
+    Some(Schedule::Calendar { days, time })
+}
+
+/// The most recent moment a calendar schedule came round, at or before
+/// `now`, or None if it has not come round in the last week (which for a
+/// weekly cycle means it never has).
+///
+/// Generic over the timezone so the tests can pin one; production passes
+/// `Local`, because "22:00" means 22:00 on the clock on the wall, and a
+/// backup scheduled for the evening must not drift into the afternoon in
+/// summer.
+fn last_occurrence<Tz: TimeZone>(
+    now: DateTime<Tz>,
+    days: &[Weekday],
+    time: NaiveTime,
+) -> Option<DateTime<Utc>> {
+    let zone = now.timezone();
+    for back in 0..=7 {
+        let date = now.date_naive() - chrono::Duration::days(back);
+        if !days.contains(&date.weekday()) {
+            continue;
+        }
+        // `earliest()` decides both awkward cases the way we want. When the
+        // clocks go back, 02:30 happens twice and the earlier one is the
+        // one that has certainly already passed. When they go forward, the
+        // time may not exist at all that day — no occurrence, so the day
+        // contributes nothing rather than silently sliding an hour.
+        let Some(local) = zone.from_local_datetime(&date.and_time(time)).earliest() else {
+            continue;
+        };
+        if local <= now {
+            return Some(local.with_timezone(&Utc));
+        }
+    }
+    None
 }
 
 /// When a run anchored at `anchor` next comes due. Monthly clamps to the
@@ -56,24 +141,47 @@ fn data_path(app: &AppHandle, name: &str) -> Option<PathBuf> {
 /// reference point to "now" on every single tick. `now - now` is never >=
 /// interval, so a scheduled task that had never been backed up by hand
 /// never fired on its own — ever.
-fn is_due(
-    now: DateTime<Utc>,
+///
+/// Takes `now` in whatever zone the caller cares about — production passes
+/// the local one, because a calendar schedule is written in wall-clock time
+/// and a test that depended on the machine's timezone would be a test that
+/// passes here and fails on the runner.
+fn is_due<Tz: TimeZone>(
+    now: DateTime<Tz>,
     last: Option<DateTime<Utc>>,
     clock: TaskClock,
-    interval: Interval,
+    schedule: &Schedule,
 ) -> bool {
-    let on_schedule = now >= next_due(last.unwrap_or(clock.first_seen), interval);
-    // A run that fails never advances `last` — `update_last_backup` only
-    // writes on success, so that partial failures don't reset the schedule
-    // clock. Without a second anchor the schedule alone therefore held the
-    // task due on every 60-second tick once it had crossed its interval, so
-    // a task whose drive was unplugged retried once a minute forever and
-    // filled the history with one failure row per minute. Attempts are
-    // spaced by the same interval as successful runs.
-    let retry_ready = clock
-        .last_attempt
-        .is_none_or(|a| now >= next_due(a, interval));
-    on_schedule && retry_ready
+    match schedule {
+        Schedule::Interval(interval) => {
+            let now = now.with_timezone(&Utc);
+            let on_schedule = now >= next_due(last.unwrap_or(clock.first_seen), *interval);
+            // A run that fails never advances `last` — `update_last_backup`
+            // only writes on success, so that partial failures don't reset
+            // the schedule clock. Without a second anchor the schedule alone
+            // therefore held the task due on every 60-second tick once it had
+            // crossed its interval, so a task whose drive was unplugged
+            // retried once a minute forever and filled the history with one
+            // failure row per minute. Attempts are spaced by the same
+            // interval as successful runs.
+            let retry_ready = clock
+                .last_attempt
+                .is_none_or(|a| now >= next_due(a, *interval));
+            on_schedule && retry_ready
+        }
+        // A calendar schedule fires once per occurrence: due when the last
+        // occurrence is newer than both the last successful run and the last
+        // attempt. That "newer than the last run" is also the catch-up rule
+        // — the app closed at 22:00 and opened at 23:00 still runs, because
+        // 22:00 is an occurrence nothing has answered yet.
+        Schedule::Calendar { days, time } => {
+            let Some(occurrence) = last_occurrence(now, days, *time) else {
+                return false;
+            };
+            let anchor = last.unwrap_or(clock.first_seen);
+            occurrence > anchor && clock.last_attempt.is_none_or(|a| occurrence > a)
+        }
+    }
 }
 
 /// What the scheduler remembers about a task between ticks. `tasks.json`
@@ -88,6 +196,47 @@ struct TaskClock {
     first_seen: DateTime<Utc>,
     /// When we last started a run for it, successful or not.
     last_attempt: Option<DateTime<Utc>>,
+    /// Whether the user has already been told, for the absence going on
+    /// right now, that this task's destinations are not connected. Reset
+    /// when they come back, so the next absence is announced again — and
+    /// only once, rather than at every occurrence of a daily schedule.
+    #[serde(default)]
+    missing_notified: bool,
+}
+
+/// The destinations of one task that are not there right now.
+///
+/// Emitted as a set — every task with something missing — so the UI can
+/// replace its whole map on each event: a task dropping out of the list is
+/// how it learns the drive came back.
+#[derive(Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct MissingDestinations {
+    task_id: String,
+    task_name: String,
+    missing: Vec<String>,
+}
+
+/// Stat each destination, with a deadline on every one.
+///
+/// A dead network share can leave `metadata` blocking for the whole SMB
+/// timeout — tens of seconds — and the tick is sequential, so one unplugged
+/// NAS would stall every other task's schedule behind it. Two seconds is
+/// generous for a local volume and short enough that a missing one costs
+/// less than the tick interval.
+async fn probe_destinations(destinations: &[String]) -> Vec<String> {
+    let mut missing = Vec::new();
+    for destination in destinations {
+        let probe = time::timeout(
+            Duration::from_secs(2),
+            tokio::fs::metadata(long_path(Path::new(destination))),
+        )
+        .await;
+        if !matches!(probe, Ok(Ok(meta)) if meta.is_dir()) {
+            missing.push(destination.clone());
+        }
+    }
+    missing
 }
 
 pub fn spawn(app: AppHandle) {
@@ -106,8 +255,12 @@ pub fn spawn(app: AppHandle) {
             None => HashMap::new(),
         };
         let seen: Mutex<HashMap<String, TaskClock>> = Mutex::new(initial);
+        // What the UI was last told about absent destinations. Held here
+        // rather than re-derived, so the event only fires when the answer
+        // actually changes instead of once a minute for ever.
+        let mut reported: Vec<MissingDestinations> = Vec::new();
         loop {
-            if let Err(e) = tick(&app, &seen).await {
+            if let Err(e) = tick(&app, &seen, &mut reported).await {
                 tracing::warn!("scheduler tick failed: {}", e);
             }
             time::sleep(Duration::from_secs(60)).await;
@@ -115,7 +268,11 @@ pub fn spawn(app: AppHandle) {
     });
 }
 
-async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyhow::Result<()> {
+async fn tick(
+    app: &AppHandle,
+    seen: &Mutex<HashMap<String, TaskClock>>,
+    reported: &mut Vec<MissingDestinations>,
+) -> anyhow::Result<()> {
     let Some(tasks_path) = data_path(app, "tasks.json") else {
         return Ok(());
     };
@@ -139,8 +296,31 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
     let live_ids: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
     // Batch clock mutations into at most one scheduler.json write per tick.
     let mut dirty = false;
+    // Rebuilt from scratch each tick and compared with what the UI was last
+    // told, so the event fires on change rather than once a minute.
+    let mut absent: Vec<MissingDestinations> = Vec::new();
+
     for task in tasks {
-        let Some(interval) = interval_for(task.schedule.as_deref()) else {
+        let destinations = task.destinations();
+        let missing = probe_destinations(&destinations).await;
+        if !missing.is_empty() {
+            absent.push(MissingDestinations {
+                task_id: task.id.clone(),
+                task_name: task.name.clone(),
+                missing: missing.clone(),
+            });
+        } else {
+            // Everything is back: arm the notification for the next absence.
+            let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(clock) = s.get_mut(&task.id) {
+                if clock.missing_notified {
+                    clock.missing_notified = false;
+                    dirty = true;
+                }
+            }
+        }
+
+        let Some(schedule) = schedule_for(&task) else {
             continue;
         };
         if state.is_active(&task.id) {
@@ -169,6 +349,7 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
                     let fresh = TaskClock {
                         first_seen: now,
                         last_attempt: None,
+                        missing_notified: false,
                     };
                     v.insert(fresh);
                     (fresh, true)
@@ -180,7 +361,8 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
             continue;
         }
 
-        if !is_due(now, last, clock, interval) {
+        // In the local zone: "22:00" is 22:00 on the clock on the wall.
+        if !is_due(now.with_timezone(&Local), last, clock, &schedule) {
             continue;
         }
 
@@ -195,6 +377,37 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
             }
         }
 
+        // Nowhere to write: don't start a run that would walk the whole
+        // source only to fail, and don't file a red history row for a drive
+        // sitting in a drawer. Tell the user instead — once per absence,
+        // not once per occurrence.
+        //
+        // The attempt above was recorded deliberately: it consumes this
+        // occurrence, so plugging the drive back in at lunchtime does not
+        // set a backup going while the user is still handling the disk. It
+        // goes at the next scheduled time, which is what they asked for.
+        if !destinations.is_empty() && missing.len() == destinations.len() {
+            let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let already_told = s.get(&task.id).is_some_and(|c| c.missing_notified);
+            if !already_told {
+                if let Some(clock) = s.get_mut(&task.id) {
+                    clock.missing_notified = true;
+                    dirty = true;
+                }
+                drop(s);
+                info!(task = %task.name, "destination not connected — backup skipped");
+                let _ = app.emit(
+                    "destination-missing",
+                    MissingDestinations {
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        missing: missing.clone(),
+                    },
+                );
+            }
+            continue;
+        }
+
         info!("scheduler: triggering backup for {}", task.name);
         let app_cloned = app.clone();
         let settings_cloned = settings.clone();
@@ -206,6 +419,11 @@ async fn tick(app: &AppHandle, seen: &Mutex<HashMap<String, TaskClock>>) -> anyh
             // run_backup now owns lastBackup persistence and emits task-updated.
             let _ = backup::run_backup(&app_cloned, &state, task, settings_cloned).await;
         });
+    }
+
+    if absent != *reported {
+        let _ = app.emit("destinations-status", &absent);
+        *reported = absent;
     }
 
     // Forget tasks the user has deleted, so the map tracks the task list
@@ -241,11 +459,12 @@ mod tests {
         TaskClock {
             first_seen: at(secs),
             last_attempt: None,
+            missing_notified: false,
         }
     }
 
-    fn day() -> Interval {
-        Interval::Fixed(chrono::Duration::days(1))
+    fn day() -> Schedule {
+        Schedule::Interval(Interval::Fixed(chrono::Duration::days(1)))
     }
 
     /// A task whose backup keeps failing never updates `lastBackup` — that
@@ -258,11 +477,12 @@ mod tests {
         let clock = TaskClock {
             first_seen: at(0),
             last_attempt: Some(at(24 * HOUR)),
+            missing_notified: false,
         };
         // The run at 24h failed, so `last` still says "never ran".
-        assert!(!is_due(at(24 * HOUR + 60), None, clock, day()));
-        assert!(!is_due(at(47 * HOUR), None, clock, day()));
-        assert!(is_due(at(48 * HOUR), None, clock, day()));
+        assert!(!is_due(at(24 * HOUR + 60), None, clock, &day()));
+        assert!(!is_due(at(47 * HOUR), None, clock, &day()));
+        assert!(is_due(at(48 * HOUR), None, clock, &day()));
     }
 
     /// The retry gate must not swallow the catch-up run: a task last backed
@@ -270,7 +490,7 @@ mod tests {
     #[test]
     fn a_stale_task_is_due_immediately_on_first_sighting() {
         let clock = clock_seen_at(72 * HOUR);
-        assert!(is_due(at(72 * HOUR), Some(at(0)), clock, day()));
+        assert!(is_due(at(72 * HOUR), Some(at(0)), clock, &day()));
     }
 
     /// The regression: a scheduled task that has never been backed up by
@@ -279,17 +499,17 @@ mod tests {
     /// "now" on every tick, so this case never became due.
     #[test]
     fn never_backed_up_task_becomes_due_one_interval_after_first_sighting() {
-        assert!(!is_due(at(12 * HOUR), None, clock_seen_at(0), day()));
-        assert!(is_due(at(24 * HOUR), None, clock_seen_at(0), day()));
-        assert!(is_due(at(48 * HOUR), None, clock_seen_at(0), day()));
+        assert!(!is_due(at(12 * HOUR), None, clock_seen_at(0), &day()));
+        assert!(is_due(at(24 * HOUR), None, clock_seen_at(0), &day()));
+        assert!(is_due(at(48 * HOUR), None, clock_seen_at(0), &day()));
     }
 
     #[test]
     fn last_backup_takes_precedence_over_first_sighting() {
         let last = Some(at(20 * HOUR));
         // 24h after first sighting but only 4h after the last run.
-        assert!(!is_due(at(24 * HOUR), last, clock_seen_at(0), day()));
-        assert!(is_due(at(44 * HOUR), last, clock_seen_at(0), day()));
+        assert!(!is_due(at(24 * HOUR), last, clock_seen_at(0), &day()));
+        assert!(is_due(at(44 * HOUR), last, clock_seen_at(0), &day()));
     }
 
     #[test]
@@ -313,9 +533,9 @@ mod tests {
 
     #[test]
     fn hourly_task_becomes_due_after_an_hour() {
-        let hourly = Interval::Fixed(chrono::Duration::hours(1));
-        assert!(!is_due(at(HOUR - 60), None, clock_seen_at(0), hourly));
-        assert!(is_due(at(HOUR), None, clock_seen_at(0), hourly));
+        let hourly = Schedule::Interval(Interval::Fixed(chrono::Duration::hours(1)));
+        assert!(!is_due(at(HOUR - 60), None, clock_seen_at(0), &hourly));
+        assert!(is_due(at(HOUR), None, clock_seen_at(0), &hourly));
     }
 
     /// "Monthly" means a calendar month, not 30 fixed days — anchored at
@@ -340,6 +560,214 @@ mod tests {
         assert_eq!(next_due(mar15, Interval::Monthly), apr15);
     }
 
+    // ── Calendar schedules ──────────────────────────────────────────
+    //
+    // Pinned to +02:00 rather than the machine's zone: `Local` on the CI
+    // runner is UTC and here it is Paris, and a schedule that means "22:00
+    // on the clock" is exactly the thing that would pass in one and fail in
+    // the other.
+
+    fn local(iso: &str) -> DateTime<chrono::FixedOffset> {
+        DateTime::parse_from_rfc3339(iso).unwrap()
+    }
+
+    fn utc(iso: &str) -> DateTime<Utc> {
+        local(iso).with_timezone(&Utc)
+    }
+
+    fn evening_on(days: &[Weekday]) -> Schedule {
+        Schedule::Calendar {
+            days: days.to_vec(),
+            time: NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+        }
+    }
+
+    fn seen_at(iso: &str) -> TaskClock {
+        TaskClock {
+            first_seen: utc(iso),
+            last_attempt: None,
+            missing_notified: false,
+        }
+    }
+
+    /// The dates these tests hang on, asserted rather than assumed.
+    #[test]
+    fn the_reference_dates_are_the_weekdays_the_tests_claim() {
+        assert_eq!(local("2026-08-27T12:00:00+02:00").weekday(), Weekday::Thu);
+        assert_eq!(local("2026-08-28T12:00:00+02:00").weekday(), Weekday::Fri);
+        assert_eq!(local("2026-09-03T12:00:00+02:00").weekday(), Weekday::Thu);
+    }
+
+    #[test]
+    fn a_calendar_schedule_fires_at_its_time_and_not_before() {
+        let schedule = evening_on(&[Weekday::Mon, Weekday::Thu]);
+        let clock = seen_at("2026-08-27T06:00:00+02:00");
+        assert!(!is_due(
+            local("2026-08-27T21:59:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+        assert!(is_due(
+            local("2026-08-27T22:00:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+    }
+
+    /// Once per occurrence, not once per tick: the scheduler wakes every
+    /// 60 seconds, and "it is past 22:00" is true for the rest of the day.
+    #[test]
+    fn a_calendar_schedule_runs_once_per_occurrence() {
+        let schedule = evening_on(&[Weekday::Thu]);
+        let clock = seen_at("2026-08-27T06:00:00+02:00");
+        let ran = Some(utc("2026-08-27T22:00:05+02:00"));
+        assert!(!is_due(
+            local("2026-08-27T23:30:00+02:00"),
+            ran,
+            clock,
+            &schedule
+        ));
+        assert!(is_due(
+            local("2026-09-03T22:00:00+02:00"),
+            ran,
+            clock,
+            &schedule
+        ));
+    }
+
+    /// The app was closed at 22:00 and opened at 23:10. The occurrence has
+    /// not been answered, so it runs now — a backup tool that skipped the
+    /// day because the machine was off at the exact minute would be missing
+    /// the point.
+    #[test]
+    fn a_missed_occurrence_is_caught_up_on_the_same_day() {
+        let schedule = evening_on(&[Weekday::Thu]);
+        let clock = seen_at("2026-08-01T06:00:00+02:00");
+        let ran = Some(utc("2026-08-20T22:00:00+02:00"));
+        assert!(is_due(
+            local("2026-08-27T23:10:00+02:00"),
+            ran,
+            clock,
+            &schedule
+        ));
+    }
+
+    /// A run that failed leaves `lastBackup` untouched, so the attempt is
+    /// the only thing stopping a retry on the very next tick — the 1.5
+    /// behaviour, carried over to calendar schedules.
+    #[test]
+    fn a_failed_calendar_run_waits_for_the_next_occurrence() {
+        let schedule = evening_on(&[Weekday::Thu]);
+        let clock = TaskClock {
+            first_seen: utc("2026-08-01T00:00:00+02:00"),
+            last_attempt: Some(utc("2026-08-27T22:00:05+02:00")),
+            missing_notified: false,
+        };
+        assert!(!is_due(
+            local("2026-08-27T22:01:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+        assert!(!is_due(
+            local("2026-08-28T09:00:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+        assert!(is_due(
+            local("2026-09-03T22:00:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+    }
+
+    /// A task created at 23:00 must not immediately fire for the 22:00 slot
+    /// it was not around for.
+    #[test]
+    fn an_occurrence_from_before_the_task_existed_does_not_fire() {
+        let schedule = evening_on(&[Weekday::Thu, Weekday::Fri]);
+        let clock = seen_at("2026-08-27T23:00:00+02:00");
+        assert!(!is_due(
+            local("2026-08-27T23:05:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+        assert!(is_due(
+            local("2026-08-28T22:00:00+02:00"),
+            None,
+            clock,
+            &schedule
+        ));
+    }
+
+    #[test]
+    fn last_occurrence_looks_back_a_week_at_most() {
+        let ten_pm = NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+        // Thursday 21:00: today's slot has not arrived, so the answer is
+        // last Thursday's.
+        assert_eq!(
+            last_occurrence(
+                local("2026-08-27T21:00:00+02:00"),
+                &[Weekday::Thu],
+                ten_pm
+            ),
+            Some(utc("2026-08-20T22:00:00+02:00"))
+        );
+        assert_eq!(
+            last_occurrence(local("2026-08-27T21:00:00+02:00"), &[], ten_pm),
+            None
+        );
+    }
+
+    fn custom_task(days: Option<Vec<u8>>, time: Option<&str>) -> Task {
+        Task {
+            id: "t".into(),
+            name: "t".into(),
+            source: "C:/src".into(),
+            destination: None,
+            destinations: Some(vec!["D:/dst".into()]),
+            schedule: Some("custom".into()),
+            schedule_days: days,
+            schedule_time: time.map(|t| t.into()),
+            last_backup: None,
+        }
+    }
+
+    /// A half-configured custom schedule is inert. Defaulting the time to
+    /// midnight would be a backup at an hour nobody chose; defaulting the
+    /// days to all of them would be one every day.
+    #[test]
+    fn a_custom_schedule_needs_both_days_and_a_readable_time() {
+        assert_eq!(
+            schedule_for(&custom_task(Some(vec![1, 4]), Some("22:00"))),
+            Some(evening_on(&[Weekday::Mon, Weekday::Thu]))
+        );
+        assert_eq!(schedule_for(&custom_task(Some(vec![]), Some("22:00"))), None);
+        assert_eq!(schedule_for(&custom_task(None, Some("22:00"))), None);
+        assert_eq!(schedule_for(&custom_task(Some(vec![1]), None)), None);
+        assert_eq!(schedule_for(&custom_task(Some(vec![1]), Some("late"))), None);
+        // Out-of-range day numbers are dropped, not rounded into a weekday.
+        assert_eq!(schedule_for(&custom_task(Some(vec![9]), Some("22:00"))), None);
+    }
+
+    /// The four keyword schedules keep their meaning, and everything else
+    /// still means "manual".
+    #[test]
+    fn keyword_schedules_are_unchanged() {
+        let mut task = custom_task(None, None);
+        task.schedule = Some("daily".into());
+        assert_eq!(schedule_for(&task), Some(day()));
+        task.schedule = Some("manual".into());
+        assert_eq!(schedule_for(&task), None);
+        task.schedule = None;
+        assert_eq!(schedule_for(&task), None);
+    }
+
     /// The clock is persisted to scheduler.json between app runs, so the
     /// JSON shape is a contract: camelCase keys, RFC3339 timestamps.
     #[test]
@@ -347,6 +775,7 @@ mod tests {
         let clock = TaskClock {
             first_seen: at(1_000_000),
             last_attempt: Some(at(2_000_000)),
+            missing_notified: true,
         };
         let json = serde_json::to_string(&clock).unwrap();
         assert!(json.contains("firstSeen"), "camelCase contract: {json}");
@@ -354,5 +783,16 @@ mod tests {
         let back: TaskClock = serde_json::from_str(&json).unwrap();
         assert_eq!(back.first_seen, clock.first_seen);
         assert_eq!(back.last_attempt, clock.last_attempt);
+        assert!(back.missing_notified);
+    }
+
+    /// A scheduler.json written before 1.7.2 has no `missingNotified`. It
+    /// must still load — losing the clocks would re-anchor every never-run
+    /// task and forget every pending retry.
+    #[test]
+    fn a_pre_1_7_2_clock_still_loads() {
+        let json = r#"{"firstSeen":"2026-08-01T10:00:00Z","lastAttempt":null}"#;
+        let clock: TaskClock = serde_json::from_str(json).unwrap();
+        assert!(!clock.missing_notified);
     }
 }

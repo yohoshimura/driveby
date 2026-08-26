@@ -3,20 +3,13 @@ import Button from './common/Button';
 import { useFormat } from '../hooks/useFormat';
 import { useT } from '../hooks/useT';
 import { taskDestinations } from '../lib/task';
+import { useScheduleLabel } from '../hooks/useScheduleLabel';
 
-const SCHEDULE_KEY = {
-  manual: 'task.schedule.manual',
-  hourly: 'task.schedule.hourly',
-  daily: 'task.schedule.daily',
-  weekly: 'task.schedule.weekly',
-  monthly: 'task.schedule.monthly',
-};
-
-export default function TaskCard({ task, backup, onRun, onCancel, onModify, onDelete, index = 0 }) {
+export default function TaskCard({ task, backup, missing, onRun, onCancel, onModify, onDelete, index = 0 }) {
   const t = useT();
   const { formatTime } = useFormat();
   const isRunning = !!backup;
-  const scheduleLabel = t(SCHEDULE_KEY[task.schedule] || 'task.schedule.manual');
+  const scheduleLabel = useScheduleLabel()(task);
   const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
   const paths = `${task.source} → ${taskDestinations(task).join(', ')}`;
   // Destinations are written one after another, so the bar restarts at zero
@@ -36,6 +29,16 @@ export default function TaskCard({ task, backup, onRun, onCancel, onModify, onDe
               total: backup.destCount,
             })}`}
         </div>
+
+        {/* Whether a drive is there is checked once a minute by the
+            scheduler, so this stays honest without the card polling for
+            it. The paths themselves go in the tooltip: on a task with
+            three destinations, which one is missing is the question. */}
+        {missing?.length > 0 && (
+          <div className="task__missing" title={missing.join('\n')}>
+            {t('task.destination_missing', { n: missing.length, count: missing.length })}
+          </div>
+        )}
 
         {isRunning && (
           <div className="task__progress">
