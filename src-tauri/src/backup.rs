@@ -1283,11 +1283,19 @@ fn fold_outcomes(
 
     let total_bytes = destinations.iter().filter_map(|d| d.total_bytes).sum();
     let total_files = destinations.iter().filter_map(|d| d.total_files).sum();
-    let skipped = destinations.iter().filter_map(|d| d.skipped).sum();
     let cleaned = destinations.iter().filter_map(|d| d.cleaned).sum();
     let unchanged = destinations.iter().filter_map(|d| d.unchanged).sum();
     let failed = destinations.iter().filter_map(|d| d.failed).sum();
-    let unreadable = destinations.iter().filter_map(|d| d.unreadable).sum();
+    // Not sums. These two count what the *source* walk could not read, and
+    // the walk happens once for the whole run — every destination reports
+    // the same number back. Adding them up would tell the user that three
+    // destinations means three times as many unreadable files.
+    let skipped = destinations.iter().filter_map(|d| d.skipped).max().unwrap_or(0);
+    let unreadable = destinations
+        .iter()
+        .filter_map(|d| d.unreadable)
+        .max()
+        .unwrap_or(0);
     // Everything above borrows `destinations`; the payload owns it, so the
     // borrows have to be finished before the move.
     drop(succeeded);
@@ -2173,6 +2181,9 @@ mod tests {
         // move six files, and a row claiming two would describe a third of
         // the work.
         assert_eq!(payload.total_files, Some(6));
+        // The walk's own counts are not, though — it ran once.
+        assert_eq!(payload.unreadable, Some(0));
+        assert_eq!(payload.skipped, Some(0));
         assert_eq!(payload.path.as_deref(), Some(dests[0].to_string_lossy().as_ref()));
     }
 
@@ -2293,6 +2304,41 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    /// Per-destination work adds up. The source walk's counts must not: it
+    /// runs once for the whole run and every destination reports the same
+    /// number back, so summing would tell the user that three destinations
+    /// means three times as many unreadable source files.
+    #[test]
+    fn folding_sums_the_work_but_not_the_walk() {
+        let one = || DestinationOutcome {
+            path: "D:/dst".into(),
+            status: DestinationStatus::Success,
+            error: None,
+            total_bytes: Some(100),
+            total_files: Some(4),
+            duration_ms: Some(1),
+            skipped: Some(2),
+            cleaned: Some(1),
+            unchanged: Some(3),
+            failed: Some(0),
+            verified: Some(true),
+            unreadable: Some(5),
+        };
+        let task = task_with("fold", Path::new("C:/src"), &[]);
+
+        let payload = fold_outcomes("id", &task, Instant::now(), vec![one(), one(), one()]);
+
+        assert!(payload.success);
+        assert!(!payload.partial);
+        assert_eq!(payload.total_bytes, Some(300));
+        assert_eq!(payload.total_files, Some(12));
+        assert_eq!(payload.cleaned, Some(3));
+        assert_eq!(payload.unchanged, Some(9));
+        assert_eq!(payload.unreadable, Some(5), "the walk ran once");
+        assert_eq!(payload.skipped, Some(2), "the walk ran once");
+        assert_eq!(payload.verified, Some(true));
     }
 
     /// The conversion from what the user typed to what the bucket counts.
