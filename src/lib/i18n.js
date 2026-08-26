@@ -74,6 +74,7 @@ const MESSAGES = {
     'task.confirm.backup.title': 'Back up “{name}”?',
     'task.confirm.backup.body': 'From: {source}\nTo: {destination}',
     'task.confirm.backup.action': 'Start Backup',
+    'task.running.destination': 'destination {index} of {total}',
 
     'form.title.new': 'New Task',
     'form.title.edit': 'Modify Task',
@@ -92,12 +93,20 @@ const MESSAGES = {
     'form.error.dest': 'Destination required',
     'form.dialog.select_source': 'Select source folder',
     'form.dialog.select_destination': 'Select destination',
+    'form.hint.destinations': 'Each destination receives its own full copy, one after another',
+    'form.action.add_destination': 'Add a destination',
+    'form.action.remove_destination': 'Remove',
+    'form.aria.destination': 'Destination {n}',
+    'form.aria.remove_destination': 'Remove destination {path}',
+    'form.error.dest_overlap': 'Destinations cannot be inside one another',
+    'form.error.dest_in_source': 'A destination cannot be inside the source folder',
 
     'backup.toast.complete': 'Backup complete',
     'backup.toast.cancelled': 'Backup cancelled',
     'backup.toast.failed': 'Backup failed: {error}',
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Backup of “{name}” complete',
+    'backup.toast.partial': 'Backed up to {done} of {total} destinations',
 
     'restore.dialog.select': 'Select restore destination',
     'restore.dialog.title': 'Restore this backup?',
@@ -121,6 +130,7 @@ const MESSAGES = {
     'history.filter.all': 'All',
     'history.filter.success': 'Success',
     'history.filter.errors': 'Errors',
+    'history.filter.partial': 'Partial',
     'history.filter.cancelled': 'Cancelled',
     'history.col.date': 'Date',
     'history.col.task': 'Task',
@@ -130,8 +140,13 @@ const MESSAGES = {
     'history.col.duration': 'Duration',
     'history.col.actions': 'Actions',
     'history.status.success': 'Success',
+    'history.status.partial': 'Partial',
     'history.status.cancelled': 'Cancelled',
     'history.status.error': 'Error',
+    'history.dest.success': 'Backed up',
+    'history.dest.error': 'Failed',
+    'history.dest.unreachable': 'Not connected',
+    'history.dest.cancelled': 'Cancelled',
     'history.unreadable.one': '1 source item could not be read — its copy was left untouched in the destination',
     'history.unreadable.other': '{n} source items could not be read — their copies were left untouched in the destination',
     'history.confirm.clear.title': 'Clear all history?',
@@ -268,6 +283,7 @@ const MESSAGES = {
     'task.confirm.backup.title': 'Sauvegarder « {name} » ?',
     'task.confirm.backup.body': 'Depuis : {source}\nVers : {destination}',
     'task.confirm.backup.action': 'Lancer la sauvegarde',
+    'task.running.destination': 'destination {index} sur {total}',
 
     'form.title.new': 'Nouvelle tâche',
     'form.title.edit': 'Modifier la tâche',
@@ -286,12 +302,20 @@ const MESSAGES = {
     'form.error.dest': 'La destination est requise',
     'form.dialog.select_source': 'Sélectionner le dossier source',
     'form.dialog.select_destination': 'Sélectionner la destination',
+    'form.hint.destinations': 'Chaque destination reçoit sa propre copie complète, l’une après l’autre',
+    'form.action.add_destination': 'Ajouter une destination',
+    'form.action.remove_destination': 'Retirer',
+    'form.aria.destination': 'Destination {n}',
+    'form.aria.remove_destination': 'Retirer la destination {path}',
+    'form.error.dest_overlap': 'Les destinations ne peuvent pas être imbriquées',
+    'form.error.dest_in_source': 'Une destination ne peut pas se trouver dans le dossier source',
 
     'backup.toast.complete': 'Sauvegarde terminée',
     'backup.toast.cancelled': 'Sauvegarde annulée',
     'backup.toast.failed': 'Échec de la sauvegarde : {error}',
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Sauvegarde de « {name} » terminée',
+    'backup.toast.partial': 'Sauvegardé vers {done} destinations sur {total}',
 
     'restore.dialog.select': 'Sélectionner la destination de restauration',
     'restore.dialog.title': 'Restaurer cette sauvegarde ?',
@@ -315,6 +339,7 @@ const MESSAGES = {
     'history.filter.all': 'Tous',
     'history.filter.success': 'Succès',
     'history.filter.errors': 'Erreurs',
+    'history.filter.partial': 'Partiels',
     'history.filter.cancelled': 'Annulés',
     'history.col.date': 'Date',
     'history.col.task': 'Tâche',
@@ -324,8 +349,13 @@ const MESSAGES = {
     'history.col.duration': 'Durée',
     'history.col.actions': 'Actions',
     'history.status.success': 'Succès',
+    'history.status.partial': 'Partiel',
     'history.status.cancelled': 'Annulé',
     'history.status.error': 'Erreur',
+    'history.dest.success': 'Sauvegardée',
+    'history.dest.error': 'Échec',
+    'history.dest.unreachable': 'Non connectée',
+    'history.dest.cancelled': 'Annulée',
     'history.unreadable.one': "1 élément source illisible — sa copie a été laissée intacte dans la destination",
     'history.unreadable.other': "{n} éléments source illisibles — leurs copies ont été laissées intactes dans la destination",
     'history.confirm.clear.title': 'Effacer tout l’historique ?',
@@ -431,4 +461,12 @@ export function translate(lang, key, params) {
     }
   }
   return s;
+}
+
+/// The keys a locale defines. Exported for the parity test, which is what
+/// stops a locale from silently drifting behind `en` — `translate` falls
+/// back to English key by key, so a missing French string shows up as an
+/// English word in a French window rather than as a crash.
+export function messageKeys(lang) {
+  return Object.keys(MESSAGES[lang] ?? {});
 }

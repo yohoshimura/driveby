@@ -3,8 +3,9 @@ import Button from './common/Button';
 import FormField from './common/FormField';
 import { bridge } from '../lib/tauri';
 import { useT } from '../hooks/useT';
+import { findOverlap, pathContains, taskDestinations } from '../lib/task';
 
-const INITIAL = { name: '', source: '', destination: '', schedule: 'manual' };
+const INITIAL = { name: '', source: '', destinations: [], schedule: 'manual' };
 
 export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, initialTask, dataState }) {
   const t = useT();
@@ -14,29 +15,74 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       ? {
           name: initialTask.name || '',
           source: initialTask.source || '',
-          destination: initialTask.destination || '',
+          destinations: taskDestinations(initialTask),
           schedule: initialTask.schedule || 'manual',
         }
       : INITIAL
   );
 
-  const pick = async (type) => {
-    const title = type === 'source' ? t('form.dialog.select_source') : t('form.dialog.select_destination');
-    const p = await bridge.selectDirectory(title);
-    if (p) setTask((prev) => ({ ...prev, [type]: p }));
+  const pickSource = async () => {
+    const p = await bridge.selectDirectory(t('form.dialog.select_source'));
+    if (p) setTask((prev) => ({ ...prev, source: p }));
   };
+
+  /// Pick a folder into slot `index`, or append it when `index` is null.
+  ///
+  /// The overlap rules are enforced here, at the moment of picking, rather
+  /// than only at submit: the message can then name the folder that is the
+  /// problem. The backend refuses the same pairs on its own — it has to,
+  /// since a destination nested inside another is pruned away by its host.
+  const pickDestination = async (index) => {
+    const picked = await bridge.selectDirectory(t('form.dialog.select_destination'));
+    if (!picked) return;
+    const others = task.destinations.filter((_, i) => i !== index);
+    if (others.some((d) => pathContains(d, picked) || pathContains(picked, d))) {
+      showToast?.(t('form.error.dest_overlap'), 'error');
+      return;
+    }
+    if (task.source && (pathContains(task.source, picked) || pathContains(picked, task.source))) {
+      showToast?.(t('form.error.dest_in_source'), 'error');
+      return;
+    }
+    setTask((prev) => {
+      const destinations = [...prev.destinations];
+      if (index === null || index >= destinations.length) destinations.push(picked);
+      else destinations[index] = picked;
+      return { ...prev, destinations };
+    });
+  };
+
+  const removeDestination = (index) =>
+    setTask((prev) => ({
+      ...prev,
+      destinations: prev.destinations.filter((_, i) => i !== index),
+    }));
 
   const submit = () => {
     if (!task.name.trim()) return showToast?.(t('form.error.name'), 'error');
     if (!task.source) return showToast?.(t('form.error.source'), 'error');
-    if (!task.destination && !defaultDestination) {
+    if (task.destinations.length === 0 && !defaultDestination) {
       return showToast?.(t('form.error.dest'), 'error');
     }
+    // Re-checked at submit as well as at picking: the source can be chosen
+    // after the destinations, and an edited task can arrive here carrying a
+    // pair an older version accepted.
+    if (findOverlap(task.destinations)) return showToast?.(t('form.error.dest_overlap'), 'error');
+    if (task.destinations.some((d) => pathContains(task.source, d) || pathContains(d, task.source))) {
+      return showToast?.(t('form.error.dest_in_source'), 'error');
+    }
+    // Resolve the default here rather than leaving the list empty: an edit
+    // saved with nothing picked used to store a blank destination, and the
+    // task then failed at the next run instead of quietly using the default
+    // the field was showing all along.
+    const resolved = task.destinations.length > 0
+      ? task
+      : { ...task, destinations: defaultDestination ? [defaultDestination] : [] };
     if (isEdit) {
-      onSave(task);
+      onSave(resolved);
       return;
     }
-    const ok = onAdd(task);
+    const ok = onAdd(resolved);
     if (ok) setTask(INITIAL);
   };
 
@@ -75,21 +121,55 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
             autoComplete="off"
             name="driveby-task-source"
           />
-          <Button size="small" onClick={() => pick('source')}>{t('common.choose')}</Button>
+          <Button size="small" onClick={pickSource}>{t('common.choose')}</Button>
         </div>
       </FormField>
 
-      <FormField label={destinationLabel}>
-        <div className="field-row">
-          <input
-            className="field field--readonly"
-            readOnly
-            value={task.destination || defaultDestination}
-            placeholder={defaultDestination || t('form.placeholder.choose')}
-            autoComplete="off"
-            name="driveby-task-destination"
-          />
-          <Button size="small" onClick={() => pick('destination')}>{t('common.choose')}</Button>
+      <FormField label={destinationLabel} hint={t('form.hint.destinations')}>
+        <div className="dest-list">
+          {task.destinations.length === 0 ? (
+            <div className="field-row">
+              <input
+                className="field field--readonly"
+                readOnly
+                value=""
+                placeholder={defaultDestination || t('form.placeholder.choose')}
+                aria-label={destinationLabel}
+                autoComplete="off"
+                name="driveby-task-destination"
+              />
+              <Button size="small" onClick={() => pickDestination(null)}>{t('common.choose')}</Button>
+            </div>
+          ) : (
+            task.destinations.map((dest, i) => (
+              <div className="field-row" key={`${i}-${dest}`}>
+                <input
+                  className="field field--readonly"
+                  readOnly
+                  value={dest}
+                  title={dest}
+                  aria-label={t('form.aria.destination', { n: i + 1 })}
+                  autoComplete="off"
+                  name={`driveby-task-destination-${i}`}
+                />
+                <Button size="small" onClick={() => pickDestination(i)}>{t('common.choose')}</Button>
+                <Button
+                  size="small"
+                  variant="borderless"
+                  destructive
+                  onClick={() => removeDestination(i)}
+                  ariaLabel={t('form.aria.remove_destination', { path: dest })}
+                >
+                  {t('form.action.remove_destination')}
+                </Button>
+              </div>
+            ))
+          )}
+          {task.destinations.length > 0 && (
+            <Button size="small" variant="borderless" onClick={() => pickDestination(null)}>
+              {t('form.action.add_destination')}
+            </Button>
+          )}
         </div>
       </FormField>
 

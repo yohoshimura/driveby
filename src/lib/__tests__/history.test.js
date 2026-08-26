@@ -4,6 +4,7 @@ import {
   trimHistory,
   DEFAULT_HISTORY_RETENTION,
   HISTORY_HARD_CAP,
+  destinationsOf,
 } from '../history';
 
 // Local-time constructors on both sides, so the calendar assertions hold
@@ -111,5 +112,42 @@ describe('trimHistory — invariants', () => {
   test('tolerates a non-array', () => {
     expect(trimHistory(null, '1m')).toEqual([]);
     expect(trimHistory(undefined, '1m')).toEqual([]);
+  });
+});
+
+describe('destinationsOf', () => {
+  test('returns the per-destination list a 1.7.2 row carries', () => {
+    const entry = {
+      status: 'partial',
+      path: 'D:/backup',
+      destinations: [
+        { path: 'D:/backup', status: 'success', totalBytes: 10 },
+        { path: 'Z:/backup', status: 'unreachable', error: 'Destination not found' },
+      ],
+    };
+    expect(destinationsOf(entry)).toHaveLength(2);
+    expect(destinationsOf(entry)[1].status).toBe('unreachable');
+  });
+
+  test('lifts a pre-1.7.2 row into the same shape', () => {
+    // Rows written before multiple destinations existed have a single
+    // `path`, and the row's own status describes that one destination.
+    const entry = { status: 'success', path: 'D:/backup', totalBytes: 42, totalFiles: 3 };
+    expect(destinationsOf(entry)).toEqual([
+      { path: 'D:/backup', status: 'success', totalBytes: 42, totalFiles: 3, error: undefined },
+    ]);
+  });
+
+  test('a cancelled legacy row stays cancelled, not failed', () => {
+    expect(destinationsOf({ status: 'cancelled', path: 'D:/backup' })[0].status).toBe('cancelled');
+  });
+
+  test('a run that never opened a destination has none to show', () => {
+    expect(destinationsOf({ status: 'error', error: 'Source folder not found' })).toEqual([]);
+    expect(destinationsOf(null)).toEqual([]);
+  });
+
+  test('an empty destinations array falls back to the legacy path', () => {
+    expect(destinationsOf({ status: 'success', path: 'D:/b', destinations: [] })).toHaveLength(1);
   });
 });

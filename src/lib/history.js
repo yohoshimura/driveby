@@ -66,3 +66,24 @@ export function trimHistory(list, retention, now = Date.now()) {
   if (kept.length > HISTORY_HARD_CAP) return kept.slice(0, HISTORY_HARD_CAP);
   return kept.length === list.length ? list : kept;
 }
+
+/// The destinations one history row covers, in a single shape the table can
+/// render.
+///
+/// A row written before 1.7.2 has one `path` and no `destinations` array —
+/// the row's own status *is* that destination's status, so it is lifted
+/// into the same shape rather than special-cased at every call site. A run
+/// that failed before opening any destination (missing source, no
+/// destination set) has none to show, and gets an empty list.
+export function destinationsOf(entry) {
+  const listed = entry?.destinations;
+  if (Array.isArray(listed) && listed.length > 0) return listed;
+  if (!entry?.path) return [];
+  return [{
+    path: entry.path,
+    status: entry.status || 'success',
+    totalBytes: entry.totalBytes,
+    totalFiles: entry.totalFiles,
+    error: entry.error,
+  }];
+}

@@ -15,7 +15,10 @@ export default function GroupedBarChart({ tasks, history }) {
     return (tasks || []).map((t) => {
       const runs = history.filter((h) => h.taskId === t.id);
       const success = runs.filter((h) => h.status === 'success').length;
-      const error = runs.filter((h) => h.status === 'error').length;
+      // A partial run counts with the errors: something the user asked for
+      // did not get backed up, which is exactly what the bar is there to
+      // make visible.
+      const error = runs.filter((h) => h.status === 'error' || h.status === 'partial').length;
       return { id: t.id, name: t.name, success, error };
     });
   }, [tasks, history]);

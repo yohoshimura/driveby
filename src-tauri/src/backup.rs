@@ -1,5 +1,6 @@
 use crate::fsutil::{
-    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, scratch_path, ATTR_KEEP,
+    apply_attrs, clear_readonly, long_path, path_contains, read_attrs, reject_overlap,
+    scratch_path, ATTR_KEEP,
 };
 use crate::glob;
 use crate::persist;
@@ -26,11 +27,44 @@ pub struct Task {
     pub id: String,
     pub name: String,
     pub source: String,
-    pub destination: String,
+    /// The shape every tasks.json written before 1.7.2 holds: exactly one
+    /// destination. The frontend rewrites the file into `destinations` on
+    /// first load, but this side has to keep reading it — the scheduler
+    /// deserialises the same struct and can tick before that migration has
+    /// run, and a user who downgrades writes the old shape back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destinations: Option<Vec<String>>,
     #[serde(default)]
     pub schedule: Option<String>,
     #[serde(default, rename = "lastBackup")]
     pub last_backup: Option<String>,
+}
+
+impl Task {
+    /// Every destination this task writes to, in the order the user listed
+    /// them, blanks dropped and exact repeats collapsed.
+    ///
+    /// Only exact repeats: two spellings of the same folder (a trailing
+    /// separator, a different case) are left in, because deciding they are
+    /// the same folder means touching the filesystem — that is
+    /// `reject_destination_overlaps`' job, and it has to run anyway.
+    pub fn destinations(&self) -> Vec<String> {
+        let listed = match &self.destinations {
+            Some(list) if !list.is_empty() => list.clone(),
+            // `into_iter` on the Option yields nothing when it is None, so a
+            // task carrying neither field simply has no destinations.
+            _ => self.destination.clone().into_iter().collect(),
+        };
+        let mut seen = HashSet::new();
+        listed
+            .into_iter()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .filter(|d| seen.insert(d.clone()))
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -145,6 +179,74 @@ struct ProgressPayload {
     speed_bps: u64,
     eta_seconds: Option<u64>,
     phase: &'static str,
+    /// Which destination these numbers belong to. Destinations are written
+    /// one after another under a single task id, so without this the UI
+    /// would see the progress bar restart at zero with nothing to explain
+    /// why.
+    destination: String,
+    dest_index: u32,
+    dest_count: u32,
+}
+
+/// How one destination of a run ended.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DestinationStatus {
+    Success,
+    Error,
+    Cancelled,
+    /// The folder was not there to write to — an unplugged drive, a network
+    /// share that is down. Kept apart from `Error` because it is the one
+    /// failure the user can fix by plugging something in, and the one we
+    /// deliberately do not turn into a red history row every 24 hours.
+    Unreachable,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DestinationOutcome {
+    pub path: String,
+    pub status: DestinationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleaned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchanged: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<u64>,
+}
+
+impl DestinationOutcome {
+    /// A destination that never ran: no counts, just why.
+    fn stillborn(path: &Path, status: DestinationStatus, error: Option<String>) -> Self {
+        Self {
+            path: path.to_string_lossy().to_string(),
+            status,
+            error,
+            total_bytes: None,
+            total_files: None,
+            duration_ms: None,
+            skipped: None,
+            cleaned: None,
+            unchanged: None,
+            failed: None,
+            verified: None,
+            unreadable: None,
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -153,7 +255,15 @@ pub struct CompletePayload {
     pub backup_id: String,
     pub task_id: String,
     pub success: bool,
+    /// At least one destination was written and at least one was not.
+    /// `success` stays false with it: the copy the user asked for is not
+    /// everywhere it was supposed to be, and `lastBackup` must not move.
+    pub partial: bool,
     pub cancelled: bool,
+    /// One entry per destination the run considered, in task order. The
+    /// scalar fields below are this list folded up — `path` is the first
+    /// destination that succeeded, the counts are sums.
+    pub destinations: Vec<DestinationOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,7 +299,7 @@ struct FileEntry {
     mtime: SystemTime,
 }
 
-/// Cooperative-cancellation sentinel string used by the inner `execute()`
+/// Cooperative-cancellation sentinel string used by the inner `execute_one()`
 /// pipeline to short-circuit on `CancellationToken::is_cancelled()`. The
 /// outer `run_backup()` no longer string-matches this — it consults the
 /// token directly — but having a single named constant keeps the in-function
@@ -222,11 +332,11 @@ pub async fn run_backup<R: Runtime>(
         }
     };
 
-    let result = execute(app, &backup_id, &task, &settings, &token).await;
+    let result = execute_all(app, &backup_id, &task, &settings, &token).await;
 
     // Snapshot cancellation state from the token *before* unregister, so we
     // don't depend on stringly-typed error matching (`err.to_string().contains
-    // ("ABORTED")`). The token is the source of truth: a successful execute()
+    // ("ABORTED")`). The token is the source of truth: a successful run
     // always returns Ok, a cancelled one always has the token tripped, and
     // any other failure leaves the token alone.
     let cancelled = token.is_cancelled();
@@ -234,7 +344,7 @@ pub async fn run_backup<R: Runtime>(
 
     let payload = match result {
         // A cancellation landing after the last checkpoint still lets
-        // execute() return Ok. Taking that at face value would report a
+        // execute_one() return Ok. Taking that at face value would report a
         // clean success and stamp lastBackup on a run the user stopped, so
         // the token decides here too — mirroring restore::conclude (#R4).
         Ok(p) => CompletePayload {
@@ -242,11 +352,16 @@ pub async fn run_backup<R: Runtime>(
             cancelled,
             ..p
         },
+        // Nothing ran at all: a missing source, no destination set, or two
+        // destinations nested in one another. There is no per-destination
+        // detail to report because no destination was ever opened.
         Err(err) => CompletePayload {
             backup_id: backup_id.clone(),
             task_id: task.id.clone(),
             success: false,
+            partial: false,
             cancelled,
+            destinations: Vec::new(),
             error: if cancelled {
                 None
             } else {
@@ -332,6 +447,11 @@ struct RunCtx<'a, R: Runtime> {
     started: Instant,
     total_bytes: u64,
     total_files: u64,
+    /// Position of `target` in the task's destination list, and how many
+    /// there are. Carried into every progress event so the UI can say
+    /// "2 of 3" rather than show a bar that mysteriously starts over.
+    dest_index: u32,
+    dest_count: u32,
 }
 
 impl<R: Runtime> RunCtx<'_, R> {
@@ -367,6 +487,9 @@ impl<R: Runtime> RunCtx<'_, R> {
                 speed_bps: 0,
                 eta_seconds,
                 phase,
+                destination: self.target.to_string_lossy().to_string(),
+                dest_index: self.dest_index,
+                dest_count: self.dest_count,
             },
         );
     }
@@ -416,6 +539,9 @@ impl<R: Runtime> RunCtx<'_, R> {
                 speed_bps: speed,
                 eta_seconds: eta,
                 phase,
+                destination: self.target.to_string_lossy().to_string(),
+                dest_index: self.dest_index,
+                dest_count: self.dest_count,
             },
         );
     }
@@ -452,7 +578,7 @@ impl LiveProgress {
 
 /// Running totals threaded through the phases and folded into the final
 /// payload. One accumulator rather than a dozen `let mut` bindings living
-/// for the whole length of `execute()`.
+/// for the whole length of one destination.
 #[derive(Default)]
 struct PhaseStats {
     copied_bytes: u64,
@@ -466,13 +592,11 @@ struct PhaseStats {
     errors: Vec<String>,
 }
 
-/// Validate the pair of paths before touching anything. Returns them as
-/// owned PathBufs so the caller doesn't re-parse the task strings.
-async fn preflight(task: &Task) -> Result<(PathBuf, PathBuf)> {
+/// Validate the source, once for the whole run. Fatal on failure: with no
+/// readable source there is nothing to write to any destination.
+async fn preflight_source(task: &Task) -> Result<PathBuf> {
     let source = PathBuf::from(&task.source);
-    let destination = PathBuf::from(&task.destination);
-
-    if !source.is_absolute() || !destination.is_absolute() {
+    if !source.is_absolute() {
         return Err(anyhow!("Paths must be absolute"));
     }
     let src_meta = fs::metadata(long_path(&source))
@@ -481,16 +605,53 @@ async fn preflight(task: &Task) -> Result<(PathBuf, PathBuf)> {
     if !src_meta.is_dir() {
         return Err(anyhow!("Source is not a directory"));
     }
-    let dest_meta = fs::metadata(long_path(&destination))
+    Ok(source)
+}
+
+/// Validate one destination. Deliberately *not* fatal to the run: a task
+/// can name three drives with only two plugged in, and those two should
+/// still get their backup. The caller turns an error here into an
+/// `Unreachable` outcome for this destination alone.
+async fn preflight_destination(destination: &Path) -> Result<()> {
+    if !destination.is_absolute() {
+        return Err(anyhow!("Paths must be absolute"));
+    }
+    let dest_meta = fs::metadata(long_path(destination))
         .await
         .map_err(|_| anyhow!("Destination not found"))?;
     if !dest_meta.is_dir() {
         return Err(anyhow!("Destination is not a directory"));
     }
-    // Reject self-syncs and any nested overlap (#3). Shared with restore(),
-    // which needs the same guard for an even sharper reason.
-    reject_overlap(&source, &destination)?;
-    Ok((source, destination))
+    Ok(())
+}
+
+/// Reject every nesting the run cannot survive, before a single byte moves.
+///
+/// Source against destination is the long-standing guard (#3), shared with
+/// restore. Destination against destination arrives with multiple
+/// destinations and is just as destructive: each destination is mirror-
+/// pruned against the *source*, so a destination nested inside another is
+/// absent from its host's keep set and the host's prune pass deletes the
+/// whole subtree — one backup erasing another.
+///
+/// Fatal for the entire run rather than per destination, because the damage
+/// would be done by the destination that looks perfectly healthy.
+fn reject_destination_overlaps(source: &Path, destinations: &[PathBuf]) -> Result<()> {
+    for (i, dest) in destinations.iter().enumerate() {
+        reject_overlap(source, dest)?;
+        for other in &destinations[i + 1..] {
+            // path_contains is reflexive, so this also catches the same
+            // folder listed twice under two spellings.
+            if path_contains(dest, other) || path_contains(other, dest) {
+                return Err(anyhow!(
+                    "Destinations cannot overlap: {} and {}",
+                    dest.display(),
+                    other.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of one file's trip through the copy loop, folded into
@@ -882,15 +1043,36 @@ async fn verify_phase<R: Runtime>(
     Ok(true)
 }
 
-async fn execute<R: Runtime>(
+/// Run the task against each of its destinations, one after another.
+///
+/// Sequential, not concurrent. Two destinations in flight would read the
+/// source twice at once — a seek storm on a spinning disk — and could not
+/// share one read stream anyway, because whether a given file needs copying
+/// is a question each destination answers for itself.
+///
+/// The source walk *is* shared: it depends only on the source and the
+/// exclude patterns, so walking once per destination would repeat the same
+/// traversal for nothing. It also means the three copies are made from one
+/// snapshot of the tree rather than three snapshots taken minutes apart,
+/// which is rather the point of writing to three places.
+async fn execute_all<R: Runtime>(
     app: &AppHandle<R>,
     backup_id: &str,
     task: &Task,
     settings: &Settings,
     token: &CancellationToken,
 ) -> Result<CompletePayload> {
-    let (source, destination) = preflight(task).await?;
+    let started = Instant::now();
+    let source = preflight_source(task).await?;
+    let destinations: Vec<PathBuf> = task.destinations().iter().map(PathBuf::from).collect();
+    if destinations.is_empty() {
+        return Err(anyhow!("No destination set for this task"));
+    }
+    reject_destination_overlaps(&source, &destinations)?;
 
+    // One `backup-started` per run, not per destination: the UI opens a
+    // single progress slot keyed by task id, and which destination is being
+    // written rides along on the progress events.
     let _ = app.emit(
         "backup-started",
         StartedPayload {
@@ -909,23 +1091,95 @@ async fn execute<R: Runtime>(
         );
     }
 
+    let dest_count = destinations.len() as u32;
+    let mut outcomes: Vec<DestinationOutcome> = Vec::with_capacity(destinations.len());
+    for (index, destination) in destinations.iter().enumerate() {
+        // Stopping mid-run leaves the destinations we never reached marked
+        // cancelled rather than silently absent from the report.
+        if token.is_cancelled() {
+            outcomes.push(DestinationOutcome::stillborn(
+                destination,
+                DestinationStatus::Cancelled,
+                None,
+            ));
+            continue;
+        }
+        if let Err(e) = preflight_destination(destination).await {
+            warn!(dest = %destination.display(), "skipping destination: {}", e);
+            outcomes.push(DestinationOutcome::stillborn(
+                destination,
+                DestinationStatus::Unreachable,
+                Some(e.to_string()),
+            ));
+            continue;
+        }
+        let outcome = execute_one(
+            app,
+            backup_id,
+            task,
+            destination,
+            index as u32,
+            dest_count,
+            &mut walked,
+            &patterns,
+            settings,
+            token,
+        )
+        .await;
+        outcomes.push(outcome.unwrap_or_else(|e| {
+            let cancelled = token.is_cancelled();
+            DestinationOutcome::stillborn(
+                destination,
+                if cancelled {
+                    DestinationStatus::Cancelled
+                } else {
+                    DestinationStatus::Error
+                },
+                if cancelled {
+                    None
+                } else {
+                    Some(e.to_string())
+                },
+            )
+        }));
+    }
+
+    Ok(fold_outcomes(backup_id, task, started, outcomes))
+}
+
+/// Mirror the walked source into one destination.
+#[allow(clippy::too_many_arguments)]
+async fn execute_one<R: Runtime>(
+    app: &AppHandle<R>,
+    backup_id: &str,
+    task: &Task,
+    destination: &Path,
+    dest_index: u32,
+    dest_count: u32,
+    walked: &mut WalkResult,
+    patterns: &glob::PatternSet,
+    settings: &Settings,
+    token: &CancellationToken,
+) -> Result<DestinationOutcome> {
     let ctx = RunCtx {
         app,
         backup_id,
         task_id: &task.id,
-        target: &destination,
+        target: destination,
         settings,
         token,
         started: Instant::now(),
         total_bytes: walked.total_bytes,
         total_files: walked.files.len() as u64,
+        dest_index,
+        dest_count,
     };
     let mut stats = PhaseStats::default();
 
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
     #[cfg(windows)]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
-    prune_phase(&ctx, &walked.files, &walked, &patterns, &mut stats).await?;
+    prune_phase(&ctx, &walked.files, walked, patterns, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
     mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
 
@@ -939,17 +1193,18 @@ async fn execute<R: Runtime>(
         warn!("file error: {}", e);
     }
 
-    Ok(CompletePayload {
-        backup_id: backup_id.to_string(),
-        task_id: task.id.clone(),
-        success: stats.failed == 0,
-        cancelled: false,
+    Ok(DestinationOutcome {
+        path: destination.to_string_lossy().to_string(),
+        status: if stats.failed == 0 {
+            DestinationStatus::Success
+        } else {
+            DestinationStatus::Error
+        },
         error: if stats.failed > 0 {
             Some(format!("{} file(s) failed", stats.failed))
         } else {
             None
         },
-        path: Some(destination.to_string_lossy().to_string()),
         total_bytes: Some(ctx.total_bytes),
         total_files: Some(ctx.total_files),
         duration_ms: Some(ctx.started.elapsed().as_millis() as u64),
@@ -960,6 +1215,80 @@ async fn execute<R: Runtime>(
         verified: Some(verified),
         unreadable: Some(walked.unreadable.len() as u64),
     })
+}
+
+/// Fold the per-destination outcomes into the run-level payload the toast,
+/// the notification and the history row all read.
+///
+/// The scalar counts are sums across the destinations that actually ran:
+/// three copies of a 4 GB source really did move 12 GB, and a history row
+/// claiming 4 GB would be describing a third of the work.
+fn fold_outcomes(
+    backup_id: &str,
+    task: &Task,
+    started: Instant,
+    destinations: Vec<DestinationOutcome>,
+) -> CompletePayload {
+    let succeeded: Vec<&DestinationOutcome> = destinations
+        .iter()
+        .filter(|d| d.status == DestinationStatus::Success)
+        .collect();
+    let success = succeeded.len() == destinations.len() && !succeeded.is_empty();
+    let partial = !succeeded.is_empty() && succeeded.len() < destinations.len();
+    let first_path = succeeded.first().map(|d| d.path.clone());
+    let verified = !succeeded.is_empty() && succeeded.iter().all(|d| d.verified == Some(true));
+
+    // A cancelled destination is not an error to report — the user asked
+    // for it. Only genuine failures and absent drives make it into the
+    // message, so a stopped run doesn't display a list of paths.
+    let faults: Vec<String> = destinations
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.status,
+                DestinationStatus::Error | DestinationStatus::Unreachable
+            )
+        })
+        .map(|d| match &d.error {
+            Some(e) => format!("{}: {}", d.path, e),
+            None => d.path.clone(),
+        })
+        .collect();
+
+    let total_bytes = destinations.iter().filter_map(|d| d.total_bytes).sum();
+    let total_files = destinations.iter().filter_map(|d| d.total_files).sum();
+    let skipped = destinations.iter().filter_map(|d| d.skipped).sum();
+    let cleaned = destinations.iter().filter_map(|d| d.cleaned).sum();
+    let unchanged = destinations.iter().filter_map(|d| d.unchanged).sum();
+    let failed = destinations.iter().filter_map(|d| d.failed).sum();
+    let unreadable = destinations.iter().filter_map(|d| d.unreadable).sum();
+    // Everything above borrows `destinations`; the payload owns it, so the
+    // borrows have to be finished before the move.
+    drop(succeeded);
+
+    CompletePayload {
+        backup_id: backup_id.to_string(),
+        task_id: task.id.clone(),
+        success,
+        partial,
+        cancelled: false,
+        error: if faults.is_empty() {
+            None
+        } else {
+            Some(faults.join("; "))
+        },
+        path: first_path,
+        total_bytes: Some(total_bytes),
+        total_files: Some(total_files),
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        skipped: Some(skipped),
+        cleaned: Some(cleaned),
+        unchanged: Some(unchanged),
+        failed: Some(failed),
+        verified: Some(verified),
+        unreadable: Some(unreadable),
+        destinations,
+    }
 }
 
 /// Walk `root` and remove any file whose relative path is not present in
@@ -1568,6 +1897,36 @@ mod tests {
         assert!(!same_mtime(base, plus_3));
     }
 
+    /// Drive a single destination the way `execute_all` does, for the tests
+    /// that care about what happens *inside* one destination rather than
+    /// across several. `execute_all` turns a destination's failure into an
+    /// outcome and keeps going — which is the point of it — so it is the
+    /// wrong entry point for asserting that a copy failed.
+    async fn run_one_destination<R: Runtime>(
+        app: &AppHandle<R>,
+        backup_id: &str,
+        task: &Task,
+        dest: &Path,
+        settings: &Settings,
+        token: &CancellationToken,
+    ) -> Result<DestinationOutcome> {
+        let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
+        let mut walked = walk(Path::new(&task.source), &patterns).await?;
+        execute_one(
+            app,
+            backup_id,
+            task,
+            dest,
+            0,
+            1,
+            &mut walked,
+            &patterns,
+            settings,
+            token,
+        )
+        .await
+    }
+
     /// Cancelling trips the token but must leave the task registered. The
     /// run is still draining its in-flight copies; freeing the slot here let
     /// a second run start against the same destination, and the two deleted
@@ -1627,12 +1986,13 @@ mod tests {
             id: "e2e".into(),
             name: "e2e".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
-        let payload = execute(
+        let payload = execute_all(
             app.handle(),
             "backup-e2e",
             &task,
@@ -1655,6 +2015,238 @@ mod tests {
         assert!(!dest.join("stale.txt").exists());
     }
 
+    /// Test fixture: a source tree with two files, and `count` empty
+    /// destination folders beside it.
+    fn tree_with_destinations(root: &Path, count: usize) -> (PathBuf, Vec<PathBuf>) {
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(source.join("sub").join("b.txt"), b"beta").unwrap();
+        let dests = (0..count)
+            .map(|i| {
+                let d = root.join(format!("dest{i}"));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        (source, dests)
+    }
+
+    fn task_with(id: &str, source: &Path, dests: &[PathBuf]) -> Task {
+        Task {
+            id: id.into(),
+            name: id.into(),
+            source: source.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(
+                dests
+                    .iter()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .collect(),
+            ),
+            schedule: None,
+            last_backup: None,
+        }
+    }
+
+    /// The whole point of the feature: one source, several destinations,
+    /// each of them a complete mirror.
+    #[tokio::test]
+    async fn every_destination_receives_the_whole_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 3);
+        let task = task_with("multi", &source, &dests);
+
+        let payload = execute_all(
+            tauri::test::mock_app().handle(),
+            "backup-multi",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the run should succeed");
+
+        assert!(payload.success);
+        assert!(!payload.partial);
+        assert_eq!(payload.destinations.len(), 3);
+        for d in &payload.destinations {
+            assert_eq!(d.status, DestinationStatus::Success);
+        }
+        for dest in &dests {
+            assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+            assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"beta");
+        }
+        // The counts are sums: three copies of a two-file tree really did
+        // move six files, and a row claiming two would describe a third of
+        // the work.
+        assert_eq!(payload.total_files, Some(6));
+        assert_eq!(payload.path.as_deref(), Some(dests[0].to_string_lossy().as_ref()));
+    }
+
+    /// An unplugged drive among several must not cost the others their
+    /// backup — and must not be reported as a plain failure either.
+    #[tokio::test]
+    async fn an_absent_destination_leaves_the_others_backed_up() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let absent = root.path().join("unplugged-drive");
+        let mut task = task_with("partial", &source, &dests);
+        task.destinations
+            .as_mut()
+            .unwrap()
+            .push(absent.to_string_lossy().to_string());
+
+        let payload = execute_all(
+            tauri::test::mock_app().handle(),
+            "backup-partial",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the reachable destination should still run");
+
+        assert!(!payload.success, "not every destination was written");
+        assert!(payload.partial, "one destination was");
+        assert_eq!(payload.destinations[0].status, DestinationStatus::Success);
+        assert_eq!(
+            payload.destinations[1].status,
+            DestinationStatus::Unreachable
+        );
+        assert_eq!(std::fs::read(dests[0].join("a.txt")).unwrap(), b"alpha");
+        assert!(!absent.exists(), "an absent destination is never created");
+    }
+
+    /// A destination nested inside another is not in its host's keep set,
+    /// so the host's prune pass would delete the whole thing — one backup
+    /// erasing another. The run must be refused before anything is written,
+    /// including into the destination that looks perfectly healthy.
+    #[tokio::test]
+    async fn nested_destinations_are_refused_before_anything_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let inner = dests[0].join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut task = task_with("nested", &source, &dests);
+        task.destinations
+            .as_mut()
+            .unwrap()
+            .push(inner.to_string_lossy().to_string());
+
+        let result = execute_all(
+            tauri::test::mock_app().handle(),
+            "backup-nested",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "overlapping destinations must be refused");
+        assert!(
+            !dests[0].join("a.txt").exists(),
+            "nothing may be written when the configuration is unsafe"
+        );
+    }
+
+    /// A tasks.json written before 1.7.2 has a single `destination` string
+    /// and no array. The scheduler deserialises the same struct and can tick
+    /// before the frontend has migrated the file, so this shape has to keep
+    /// working on its own.
+    #[tokio::test]
+    async fn a_pre_1_7_2_task_backs_up_to_its_single_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let task = Task {
+            id: "legacy".into(),
+            name: "legacy".into(),
+            source: source.to_string_lossy().to_string(),
+            destination: Some(dests[0].to_string_lossy().to_string()),
+            destinations: None,
+            schedule: None,
+            last_backup: None,
+        };
+
+        let payload = execute_all(
+            tauri::test::mock_app().handle(),
+            "backup-legacy",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a legacy task still runs");
+
+        assert!(payload.success);
+        assert_eq!(payload.destinations.len(), 1);
+        assert_eq!(std::fs::read(dests[0].join("a.txt")).unwrap(), b"alpha");
+    }
+
+    #[tokio::test]
+    async fn a_task_with_no_destination_at_all_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, _) = tree_with_destinations(root.path(), 0);
+        let task = task_with("empty", &source, &[]);
+
+        let result = execute_all(
+            tauri::test::mock_app().handle(),
+            "backup-empty",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_destinations_normalises_both_shapes() {
+        let base = Task {
+            id: "t".into(),
+            name: "t".into(),
+            source: "C:/src".into(),
+            destination: None,
+            destinations: None,
+            schedule: None,
+            last_backup: None,
+        };
+
+        // The plural field wins over a leftover singular one.
+        let both = Task {
+            destination: Some("D:/old".into()),
+            destinations: Some(vec!["E:/new".into()]),
+            ..base.clone()
+        };
+        assert_eq!(both.destinations(), vec!["E:/new".to_string()]);
+
+        // Blanks and exact repeats go; order is the user's.
+        let messy = Task {
+            destinations: Some(vec![
+                "E:/b".into(),
+                "  ".into(),
+                " D:/a ".into(),
+                "E:/b".into(),
+            ]),
+            ..base.clone()
+        };
+        assert_eq!(
+            messy.destinations(),
+            vec!["E:/b".to_string(), "D:/a".to_string()]
+        );
+
+        // An empty array is not a destination list — fall back to the
+        // legacy field rather than reporting none.
+        let empty_array = Task {
+            destination: Some("D:/only".into()),
+            destinations: Some(vec![]),
+            ..base.clone()
+        };
+        assert_eq!(empty_array.destinations(), vec!["D:/only".to_string()]);
+        assert!(base.destinations().is_empty());
+    }
+
     /// A folder the user re-cased at source keeps the destination's stale
     /// spelling forever: 1.5 stopped prune from *deleting* files through the
     /// drifted directory, and 1.6 actually re-spells the directory entry.
@@ -1674,12 +2266,13 @@ mod tests {
             id: "recase".into(),
             name: "recase".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
-        let payload = execute(
+        let payload = execute_all(
             app.handle(),
             "backup-recase",
             &task,
@@ -1728,12 +2321,13 @@ mod tests {
             id: "recase-nested".into(),
             name: "recase-nested".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
         let token = CancellationToken::new();
-        let payload = execute(
+        let payload = execute_all(
             app.handle(),
             "backup-recase-nested",
             &task,
@@ -1787,7 +2381,8 @@ mod tests {
                 id: name.into(),
                 name: name.into(),
                 source: source.to_string_lossy().to_string(),
-                destination: dest.to_string_lossy().to_string(),
+                destination: None,
+                destinations: Some(vec![dest.to_string_lossy().to_string()]),
                 schedule: None,
                 last_backup: None,
             };
@@ -1796,7 +2391,7 @@ mod tests {
                 ..Default::default()
             };
             let token = CancellationToken::new();
-            let payload = execute(app.handle(), name, &task, &settings, &token)
+            let payload = execute_all(app.handle(), name, &task, &settings, &token)
                 .await
                 .unwrap();
             assert!(payload.success);
@@ -1834,7 +2429,8 @@ mod tests {
             id: "cancel-par".into(),
             name: "cancel-par".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
@@ -1845,7 +2441,9 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = execute(app.handle(), "cancel-par", &task, &settings, &token).await;
+        let result =
+            run_one_destination(app.handle(), "cancel-par", &task, &dest, &settings, &token)
+                .await;
         assert!(result.is_err(), "a cancelled run must not report success");
         let leftover: Vec<String> = std::fs::read_dir(&dest)
             .unwrap()
@@ -1894,7 +2492,8 @@ mod tests {
             id: "locked-src".into(),
             name: "locked-src".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
@@ -1904,7 +2503,8 @@ mod tests {
         };
         let token = CancellationToken::new();
 
-        let _ = execute(app.handle(), "locked-src", &task, &settings, &token).await;
+        let _ =
+            run_one_destination(app.handle(), "locked-src", &task, &dest, &settings, &token).await;
 
         assert_eq!(
             std::fs::read(dest.join("vm.bin")).unwrap(),
@@ -1948,7 +2548,8 @@ mod tests {
             id: "abort".into(),
             name: "abort".into(),
             source: source.to_string_lossy().to_string(),
-            destination: dest.to_string_lossy().to_string(),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
             last_backup: None,
         };
@@ -1959,7 +2560,8 @@ mod tests {
         };
         let token = CancellationToken::new();
 
-        let result = execute(app.handle(), "abort", &task, &settings, &token).await;
+        let result =
+            run_one_destination(app.handle(), "abort", &task, &dest, &settings, &token).await;
         assert!(result.is_err(), "the run must abort on the locked file");
         assert!(
             !token.is_cancelled(),

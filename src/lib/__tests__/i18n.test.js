@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { translate } from '../i18n';
+import { messageKeys, SUPPORTED_LANGUAGES, translate } from '../i18n';
 
 describe('translate plurals', () => {
   test('a count of one picks the .one form', () => {
@@ -25,5 +25,28 @@ describe('translate fallback chain', () => {
 
   test('interpolates params', () => {
     expect(translate('en', 'sidebar.brand.version', { version: '1.6.0' })).toBe('Version 1.6.0');
+  });
+});
+
+describe('locale parity', () => {
+  // Every string the UI can reach has to exist in both locales. Without
+  // this, a key added to `en` alone renders as English inside a French
+  // window: translate() falls back key by key, so nothing ever fails and
+  // the gap is only ever noticed by a reader.
+  const en = new Set(messageKeys('en'));
+  const fr = new Set(messageKeys('fr'));
+
+  test('every English key has a French translation', () => {
+    expect([...en].filter((k) => !fr.has(k))).toEqual([]);
+  });
+
+  test('no French key is left over from a removed English one', () => {
+    expect([...fr].filter((k) => !en.has(k))).toEqual([]);
+  });
+
+  test('every supported language carries messages', () => {
+    for (const lang of SUPPORTED_LANGUAGES) {
+      expect(messageKeys(lang).length).toBeGreaterThan(0);
+    }
   });
 });

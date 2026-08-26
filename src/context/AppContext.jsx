@@ -13,6 +13,7 @@ import { useSystemTheme } from '../hooks/useSystemTheme';
 import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
 import { DEFAULT_HISTORY_RETENTION, trimHistory } from '../lib/history';
+import { migrateTasks, taskDestinations } from '../lib/task';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
 
 const AppContext = createContext(null);
@@ -86,7 +87,14 @@ export function AppProvider({ children }) {
         const { historyLimit: _dropped, ...stored } = s || {};
         const merged = { ...DEFAULT_SETTINGS, ...stored };
         setSettings(merged);
-        setTasks(Array.isArray(t) ? t : []);
+        // A tasks.json written before 1.7.2 holds one `destination` per
+        // task. Rewrite it into the plural shape on first load — and only
+        // then: migrateTasks hands back the same array when there was
+        // nothing to do, so an ordinary launch doesn't rewrite the file.
+        const storedTasks = Array.isArray(t) ? t : [];
+        const live = migrateTasks(storedTasks);
+        if (live !== storedTasks) tasksDirty.current = true;
+        setTasks(live);
         // Trim at load too, so a history.json written before the window
         // existed — or under a longer one — shrinks on the next save.
         setHistory(trimHistory(h, merged.historyRetention));
@@ -141,8 +149,15 @@ export function AppProvider({ children }) {
                 taskId: data.taskId,
                 taskName: existingTask?.name || tr('common.backup'),
                 timestamp: new Date().toISOString(),
-                status: data.success ? 'success' : data.cancelled ? 'cancelled' : 'error',
+                status: data.success
+                  ? 'success'
+                  : data.cancelled
+                    ? 'cancelled'
+                    : data.partial
+                      ? 'partial'
+                      : 'error',
                 path: data.path,
+                destinations: data.destinations,
                 totalBytes: data.totalBytes,
                 totalFiles: data.totalFiles,
                 durationMs: data.durationMs,
@@ -168,6 +183,18 @@ export function AppProvider({ children }) {
           }
         } else if (data.cancelled) {
           showToast(tr('backup.toast.cancelled'));
+        } else if (data.partial) {
+          // Some destinations were written and some were not. Said plainly,
+          // with the count, because "failed" would be wrong and "complete"
+          // would be a lie.
+          const all = data.destinations || [];
+          showToast(
+            tr('backup.toast.partial', {
+              done: all.filter((d) => d.status === 'success').length,
+              total: all.length,
+            }),
+            'error',
+          );
         } else {
           showToast(tr('backup.toast.failed', { error: data.error }), 'error');
         }
@@ -228,7 +255,10 @@ export function AppProvider({ children }) {
     if (settings.confirmBeforeBackup) {
       const ok = await confirm({
         title: tr('task.confirm.backup.title', { name: task.name }),
-        body: tr('task.confirm.backup.body', { source: task.source, destination: task.destination }),
+        body: tr('task.confirm.backup.body', {
+          source: task.source,
+          destination: taskDestinations(task).join('\n'),
+        }),
         confirmLabel: tr('task.confirm.backup.action'),
       });
       if (!ok) return;
@@ -245,11 +275,14 @@ export function AppProvider({ children }) {
   }, []);
 
   const addTask = useCallback((taskDraft) => {
-    const dest = taskDraft.destination || settings.defaultDestination;
-    if (!taskDraft.name || !taskDraft.source || !dest) return false;
+    const listed = taskDestinations(taskDraft);
+    const destinations = listed.length > 0
+      ? listed
+      : taskDestinations({ destination: settings.defaultDestination });
+    if (!taskDraft.name || !taskDraft.source || destinations.length === 0) return false;
     // Built outside the updater: StrictMode calls the updater twice, and
     // minting the id inside it produced two different tasks.
-    const created = { id: uuidv4(), ...taskDraft, destination: dest, lastBackup: null };
+    const created = { id: uuidv4(), ...taskDraft, destinations, lastBackup: null };
     tasksDirty.current = true;
     setTasks((prev) => [...prev, created]);
     return true;

@@ -2,6 +2,7 @@ import React from 'react';
 import Button from './common/Button';
 import { useFormat } from '../hooks/useFormat';
 import { useT } from '../hooks/useT';
+import { taskDestinations } from '../lib/task';
 
 const SCHEDULE_KEY = {
   manual: 'task.schedule.manual',
@@ -17,15 +18,23 @@ export default function TaskCard({ task, backup, onRun, onCancel, onModify, onDe
   const isRunning = !!backup;
   const scheduleLabel = t(SCHEDULE_KEY[task.schedule] || 'task.schedule.manual');
   const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
+  const paths = `${task.source} → ${taskDestinations(task).join(', ')}`;
+  // Destinations are written one after another, so the bar restarts at zero
+  // for each of them. The counter is what explains that; it goes on the meta
+  // line because the running card deliberately has nothing under the bar.
+  const stepping = isRunning && backup.destCount > 1;
   return (
     <article className="task" style={{ '--stagger': `${Math.min(index, 8) * 40}ms` }}>
       <div className="task__body">
         <div className="task__name">{task.name}</div>
-        <div className="task__paths" title={`${task.source} → ${task.destination}`}>
-          {task.source} → {task.destination}
-        </div>
+        <div className="task__paths" title={paths}>{paths}</div>
         <div className="task__meta">
           {t('task.last_run', { time: lastRun, schedule: scheduleLabel })}
+          {stepping
+            && ` · ${t('task.running.destination', {
+              index: backup.destIndex + 1,
+              total: backup.destCount,
+            })}`}
         </div>
 
         {isRunning && (

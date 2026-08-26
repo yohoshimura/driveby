@@ -1,6 +1,7 @@
 import React from 'react';
 import { useFormat } from '../../hooks/useFormat';
 import { useT } from '../../hooks/useT';
+import { taskDestinations } from '../../lib/task';
 
 const SCHEDULE_KEY = {
   manual: 'task.schedule.manual',
@@ -22,6 +23,7 @@ export default function TaskList({ tasks }) {
         {tasks.map((task, i) => {
           const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
           const scheduleLabel = t(SCHEDULE_KEY[task.schedule] || 'task.schedule.manual');
+          const paths = `${task.source} → ${taskDestinations(task).join(', ')}`;
           return (
             <li
               key={task.id}
@@ -29,9 +31,7 @@ export default function TaskList({ tasks }) {
               style={{ '--stagger': `${Math.min(i, 8) * 35}ms` }}
             >
               <div className="task-list-stat__name">{task.name}</div>
-              <div className="task-list-stat__meta" title={`${task.source} → ${task.destination}`}>
-                {task.source} → {task.destination}
-              </div>
+              <div className="task-list-stat__meta" title={paths}>{paths}</div>
               <div className="task-list-stat__sub">
                 {t('task.last_run', { time: lastRun, schedule: scheduleLabel })}
               </div>

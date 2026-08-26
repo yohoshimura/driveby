@@ -827,6 +827,9 @@ input, textarea { user-select: text; }
 .field--narrow { width: 80px; }
 
 .field-row { display: flex; gap: 8px; align-items: center; }
+/* Stacked destination rows in the task form, plus the button that adds one. */
+.dest-list { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.dest-list .field-row { width: 100%; }
 
 .form-field { margin-bottom: 12px; }
 .form-field__label {
@@ -1036,8 +1039,21 @@ input, textarea { user-select: text; }
   color: var(--label-secondary);
 }
 .badge--success { background: rgba(52, 199, 89, 0.15); color: var(--system-green); }
+.badge--partial { background: rgba(255, 149, 0, 0.15); color: var(--system-orange); }
 .badge--error   { background: rgba(255, 59, 48, 0.15); color: var(--system-red); }
 .badge--cancelled { background: rgba(142, 142, 147, 0.2); color: var(--system-gray); }
+
+/* One line per destination under the run's own row. The mark carries the
+   state, so the path itself keeps the muted treatment it has always had and
+   the eye still lands on the path first. */
+.history-dest { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.history-dest .history-path { margin-top: 0; }
+.history-dest__mark { font-size: 11px; line-height: 1; width: 12px; text-align: center; flex: none; }
+.history-dest__mark--success { color: var(--system-green); }
+.history-dest__mark--error { color: var(--system-red); }
+.history-dest__mark--unreachable { color: var(--system-orange); }
+.history-dest__mark--cancelled { color: var(--system-gray); }
+.history-dest__error { font-size: 11px; color: var(--label-secondary); }
 
 /* ─── Modal ─── */
 .modal {
