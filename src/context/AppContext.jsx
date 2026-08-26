@@ -43,6 +43,9 @@ export function AppProvider({ children }) {
   const [loaded, setLoaded] = useState(false);
   const [toast, setToast] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
+  // { task, status: 'scanning' | 'ready', payload } while the pre-run
+  // preview dialog is open, null when it is not.
+  const [previewState, setPreviewState] = useState(null);
   const { beginRestore, endRestore } = useProgress();
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
@@ -252,24 +255,51 @@ export function AppProvider({ children }) {
     });
   }, []);
 
-  const startBackup = useCallback(async (task) => {
-    if (settings.confirmBeforeBackup) {
-      const ok = await confirm({
-        title: tr('task.confirm.backup.title', { name: task.name }),
-        body: tr('task.confirm.backup.body', {
-          source: task.source,
-          destination: taskDestinations(task).join('\n'),
-        }),
-        confirmLabel: tr('task.confirm.backup.action'),
-      });
-      if (!ok) return;
-    }
+  const launchBackup = useCallback(async (task) => {
     try {
       await bridge.startBackup(task, settings);
     } catch (e) {
       showToast(tr('backup.toast.failed', { error: e }), 'error');
     }
-  }, [settings, confirm, showToast, tr]);
+  }, [settings, showToast, tr]);
+
+  const startBackup = useCallback(async (task) => {
+    if (!settings.confirmBeforeBackup) {
+      await launchBackup(task);
+      return;
+    }
+    // The dialog opens *before* the answer is known. Working out what would
+    // change is a full source walk plus a stat of every counterpart, which
+    // on a large tree over USB takes long enough that a button which
+    // appeared to do nothing would be pressed again.
+    setPreviewState({ task, status: 'scanning', payload: null });
+    try {
+      const payload = await bridge.previewBackup(task, settings);
+      // Cancelling closed the dialog already; a late answer must not
+      // reopen it.
+      if (payload.cancelled) return;
+      setPreviewState((prev) => (
+        prev && prev.task.id === task.id ? { ...prev, status: 'ready', payload } : prev
+      ));
+    } catch (e) {
+      setPreviewState(null);
+      showToast(tr('backup.toast.failed', { error: e }), 'error');
+    }
+  }, [settings, launchBackup, showToast, tr]);
+
+  // Read outside the updater and launched after it: StrictMode invokes
+  // updaters twice, and a side effect inside one starts two backups (#F6).
+  const confirmPreview = useCallback(() => {
+    const pending = previewState?.task;
+    setPreviewState(null);
+    if (pending) launchBackup(pending);
+  }, [previewState, launchBackup]);
+
+  const cancelPreview = useCallback(() => {
+    setPreviewState(null);
+    // Stop the scan too, not just the window: it is holding a disk busy.
+    bridge.cancelPreview();
+  }, []);
 
   const cancelBackup = useCallback(async (taskId) => {
     await bridge.cancelBackup(taskId);
@@ -381,14 +411,16 @@ export function AppProvider({ children }) {
   // in ProgressContext so a running job doesn't invalidate this value ten
   // times a second and re-render every consumer with it.
   const value = useMemo(() => ({
-    tasks, history, settings, loaded, toast, confirmState, resolvedTheme,
+    tasks, history, settings, loaded, toast, confirmState, resolvedTheme, previewState,
     startBackup, cancelBackup, addTask, editTask, deleteTask,
     deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
+    confirmPreview, cancelPreview,
     showToast, handleConfirm, confirm, tr,
   }), [
-    tasks, history, settings, loaded, toast, confirmState, resolvedTheme,
+    tasks, history, settings, loaded, toast, confirmState, resolvedTheme, previewState,
     startBackup, cancelBackup, addTask, editTask, deleteTask,
     deleteHistory, clearHistory, updateSetting, revealFolder, restoreBackup, cancelRestore,
+    confirmPreview, cancelPreview,
     showToast, handleConfirm, confirm, tr,
   ]);
 

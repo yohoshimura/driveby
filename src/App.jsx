@@ -9,6 +9,7 @@ import History from './components/History';
 import Settings from './components/Settings';
 import Statistics from './components/Statistics';
 import ConfirmDialog from './components/ConfirmDialog';
+import BackupPreviewDialog from './components/BackupPreviewDialog';
 import RestoreOverlay from './components/RestoreOverlay';
 import Splash, { SPLASH_MS } from './components/Splash';
 import Toast from './components/Toast';
@@ -35,7 +36,10 @@ export default function App() {
 }
 
 function Shell() {
-  const { loaded, toast, confirmState, handleConfirm, settings, updateSetting, showToast } = useApp();
+  const {
+    loaded, toast, confirmState, handleConfirm, settings, updateSetting, showToast,
+    previewState, confirmPreview, cancelPreview,
+  } = useApp();
   const t = useT();
   const [view, setView] = useState(() => settings.lastView || 'home');
   const [sidebarOpen, setSidebarOpen] = useState(() => settings.sidebarOpen !== false);
@@ -135,6 +139,11 @@ function Shell() {
             </main>
           </div>
           <ConfirmDialog state={confirmState} onResolve={handleConfirm} />
+          <BackupPreviewDialog
+            state={previewState}
+            onConfirm={confirmPreview}
+            onCancel={cancelPreview}
+          />
           <RestoreOverlay />
           <Toast toast={toast} />
         </div>

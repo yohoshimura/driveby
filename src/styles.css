@@ -1099,6 +1099,35 @@ input, textarea { user-select: text; }
 }
 .modal__actions .btn { flex: 1; }
 
+/* ─── Pre-run preview ─── */
+/* Wider than a confirmation: this one carries a line of figures per
+   destination, and wrapping them would hide the number that matters. */
+.modal__content--wide { max-width: 560px; }
+.preview { margin-bottom: 18px; }
+.preview-dest {
+  padding: 10px 0;
+  border-top: 0.5px solid var(--separator);
+}
+.preview-dest:first-child { border-top: none; }
+.preview-dest__path {
+  font-family: 'SF Mono', Menlo, monospace; font-size: 11px;
+  color: var(--label-secondary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 6px;
+}
+.preview-dest__stats {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  font-size: 12px; color: var(--label-secondary);
+}
+.preview-dest__absent { font-size: 12px; color: var(--system-orange); }
+.preview-stat b { color: var(--label-primary); font-weight: 600; }
+.preview-stat em { font-style: normal; margin-left: 5px; opacity: 0.7; }
+.preview-stat--danger b { color: var(--system-red); }
+.preview-stat--muted { opacity: 0.55; }
+.preview-note {
+  margin-top: 10px; font-size: 11px; color: var(--system-orange);
+}
+
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes fade-out { from { opacity: 1; } to { opacity: 0; } }
 @keyframes sheet-in {

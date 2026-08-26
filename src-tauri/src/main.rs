@@ -4,6 +4,7 @@ mod backup;
 mod fsutil;
 mod glob;
 mod persist;
+mod preview;
 mod ratelimit;
 mod restore;
 mod scheduler;
@@ -126,6 +127,26 @@ async fn start_backup(
         .map_err(|e| e.to_string())
 }
 
+/// What `start_backup` would do, without doing it. Cancellable, because on
+/// a large tree it is a full source walk plus a stat of every counterpart,
+/// and the user is sitting in front of a modal dialog while it runs.
+#[tauri::command]
+async fn preview_backup(
+    state: tauri::State<'_, preview::PreviewState>,
+    task: Task,
+    settings: Settings,
+) -> Result<preview::PreviewPayload, String> {
+    preview::plan_backup(&state, task, settings)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_preview(state: tauri::State<'_, preview::PreviewState>) -> Result<(), String> {
+    state.cancel();
+    Ok(())
+}
+
 #[tauri::command]
 async fn cancel_backup(
     state: tauri::State<'_, BackupState>,
@@ -204,6 +225,7 @@ fn main() {
         ))
         .manage(BackupState::default())
         .manage(RestoreState::default())
+        .manage(preview::PreviewState::default())
         .manage(UiFlags::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -257,6 +279,8 @@ fn main() {
         get_history,
         save_history,
         start_backup,
+        preview_backup,
+        cancel_preview,
         cancel_backup,
         restore_backup,
         cancel_restore,

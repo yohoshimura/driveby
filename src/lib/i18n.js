@@ -72,7 +72,6 @@ const MESSAGES = {
     'task.confirm.delete.title': 'Delete this task?',
     'task.confirm.delete.body': 'Existing backup folders will not be removed.',
     'task.confirm.backup.title': 'Back up “{name}”?',
-    'task.confirm.backup.body': 'From: {source}\nTo: {destination}',
     'task.confirm.backup.action': 'Start Backup',
     'task.running.destination': 'destination {index} of {total}',
 
@@ -107,6 +106,14 @@ const MESSAGES = {
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Backup of “{name}” complete',
     'backup.toast.partial': 'Backed up to {done} of {total} destinations',
+
+    'preview.scanning': 'Working out what would change…',
+    'preview.nothing': 'Nothing to copy — every destination already matches the source.',
+    'preview.label.new': 'new',
+    'preview.label.modified': 'modified',
+    'preview.label.deleted': 'deleted',
+    'preview.label.unchanged': 'unchanged',
+    'preview.action.anyway': 'Run anyway',
 
     'restore.dialog.select': 'Select restore destination',
     'restore.dialog.title': 'Restore this backup?',
@@ -284,7 +291,6 @@ const MESSAGES = {
     'task.confirm.delete.title': 'Supprimer cette tâche ?',
     'task.confirm.delete.body': 'Les dossiers de sauvegarde existants ne seront pas supprimés.',
     'task.confirm.backup.title': 'Sauvegarder « {name} » ?',
-    'task.confirm.backup.body': 'Depuis : {source}\nVers : {destination}',
     'task.confirm.backup.action': 'Lancer la sauvegarde',
     'task.running.destination': 'destination {index} sur {total}',
 
@@ -319,6 +325,14 @@ const MESSAGES = {
     'backup.notification.title': 'driveby',
     'backup.notification.body': 'Sauvegarde de « {name} » terminée',
     'backup.toast.partial': 'Sauvegardé vers {done} destinations sur {total}',
+
+    'preview.scanning': 'Analyse de ce qui va changer…',
+    'preview.nothing': 'Rien à copier — chaque destination correspond déjà à la source.',
+    'preview.label.new': 'nouveaux',
+    'preview.label.modified': 'modifiés',
+    'preview.label.deleted': 'supprimés',
+    'preview.label.unchanged': 'inchangés',
+    'preview.action.anyway': 'Lancer quand même',
 
     'restore.dialog.select': 'Sélectionner la destination de restauration',
     'restore.dialog.title': 'Restaurer cette sauvegarde ?',

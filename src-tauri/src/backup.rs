@@ -312,11 +312,11 @@ pub struct CompletePayload {
     pub unreadable: Option<u64>,
 }
 
-struct FileEntry {
-    path: PathBuf,
-    rel: String,
-    size: u64,
-    mtime: SystemTime,
+pub(crate) struct FileEntry {
+    pub(crate) path: PathBuf,
+    pub(crate) rel: String,
+    pub(crate) size: u64,
+    pub(crate) mtime: SystemTime,
 }
 
 /// Cooperative-cancellation sentinel string used by the inner `execute_one()`
@@ -324,7 +324,7 @@ struct FileEntry {
 /// outer `run_backup()` no longer string-matches this — it consults the
 /// token directly — but having a single named constant keeps the in-function
 /// returns consistent and greppable.
-const CANCELLED_MSG: &str = "backup cancelled";
+pub(crate) const CANCELLED_MSG: &str = "backup cancelled";
 
 // ─────────────────────────────────────────────────────────────────────
 // Entry point
@@ -620,7 +620,7 @@ struct PhaseStats {
 
 /// Validate the source, once for the whole run. Fatal on failure: with no
 /// readable source there is nothing to write to any destination.
-async fn preflight_source(task: &Task) -> Result<PathBuf> {
+pub(crate) async fn preflight_source(task: &Task) -> Result<PathBuf> {
     let source = PathBuf::from(&task.source);
     if !source.is_absolute() {
         return Err(anyhow!("Paths must be absolute"));
@@ -662,7 +662,7 @@ async fn preflight_destination(destination: &Path) -> Result<()> {
 ///
 /// Fatal for the entire run rather than per destination, because the damage
 /// would be done by the destination that looks perfectly healthy.
-fn reject_destination_overlaps(source: &Path, destinations: &[PathBuf]) -> Result<()> {
+pub(crate) fn reject_destination_overlaps(source: &Path, destinations: &[PathBuf]) -> Result<()> {
     for (i, dest) in destinations.iter().enumerate() {
         reject_overlap(source, dest)?;
         for other in &destinations[i + 1..] {
@@ -898,23 +898,12 @@ async fn recase_dirs_phase<R: Runtime>(
 async fn prune_phase<R: Runtime>(
     ctx: &RunCtx<'_, R>,
     files: &[FileEntry],
-    walked: &WalkResult,
-    patterns: &glob::PatternSet,
+    protected: &ProtectedSet<'_>,
     stats: &mut PhaseStats,
 ) -> Result<()> {
     ctx.emit_phase("pruning", stats.copied_bytes, stats.copied_files, None);
     let keep = KeepSet::new(files.iter().map(|f| f.rel.clone()));
-    if let Err(e) = prune_destination(
-        ctx.target,
-        &keep,
-        &walked.excluded,
-        &walked.unreadable,
-        patterns,
-        ctx.token,
-        stats,
-    )
-    .await
-    {
+    if let Err(e) = prune_destination(ctx.target, &keep, protected, ctx.token, stats).await {
         ctx.check_cancelled()?;
         warn!("prune destination failed: {}", e);
     }
@@ -1117,6 +1106,10 @@ async fn execute_all<R: Runtime>(
         );
     }
 
+    // Built once from the walk: what prune must leave alone is a property
+    // of the source side, identical for every destination.
+    let protected = ProtectedSet::new(&walked, &patterns);
+
     let dest_count = destinations.len() as u32;
     let mut outcomes: Vec<DestinationOutcome> = Vec::with_capacity(destinations.len());
     for (index, destination) in destinations.iter().enumerate() {
@@ -1147,7 +1140,7 @@ async fn execute_all<R: Runtime>(
             index as u32,
             dest_count,
             &mut walked,
-            &patterns,
+            &protected,
             settings,
             token,
         )
@@ -1183,7 +1176,7 @@ async fn execute_one<R: Runtime>(
     dest_index: u32,
     dest_count: u32,
     walked: &mut WalkResult,
-    patterns: &glob::PatternSet,
+    protected: &ProtectedSet<'_>,
     settings: &Settings,
     token: &CancellationToken,
 ) -> Result<DestinationOutcome> {
@@ -1205,7 +1198,7 @@ async fn execute_one<R: Runtime>(
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
     #[cfg(windows)]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
-    prune_phase(&ctx, &walked.files, walked, patterns, &mut stats).await?;
+    prune_phase(&ctx, &walked.files, protected, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
     mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
 
@@ -1317,8 +1310,86 @@ fn fold_outcomes(
     }
 }
 
+/// The destination paths that must survive a prune pass whatever the source
+/// says about them, in one place so that the preview and the prune itself
+/// cannot come to different conclusions about what is safe.
+///
+/// Three kinds of protection, and they exist for different reasons:
+///
+/// - **excluded** — the user said "don't copy this". Deleting it from the
+///   destination would be the opposite of what they asked (#2).
+/// - **unreadable** — the source walk could not enumerate it, so it
+///   contributes nothing to the keep set. Without this guard a transient
+///   permission error would read as "deleted at source" and take the whole
+///   subtree with it.
+/// - **patterns** — the same exclude globs, applied to destination paths
+///   that were never in the source walk at all.
+///
+/// The first two sets are keyed by the *source's* spelling while the prune
+/// pass walks the *destination's*. On a case-preserving filesystem those
+/// differ the moment a folder is re-cased, and a literal comparison then
+/// misses the protection — which deleted precisely what the user asked to
+/// keep (#R6). Both sides are folded once, here.
+pub(crate) struct ProtectedSet<'a> {
+    excluded: HashSet<String>,
+    unreadable: HashSet<String>,
+    patterns: &'a glob::PatternSet,
+    /// The source root itself could not be enumerated.
+    source_root_unreadable: bool,
+}
+
+impl<'a> ProtectedSet<'a> {
+    pub(crate) fn new(walked: &WalkResult, patterns: &'a glob::PatternSet) -> Self {
+        Self::from_parts(&walked.excluded, &walked.unreadable, patterns)
+    }
+
+    pub(crate) fn from_parts(
+        excluded: &HashSet<String>,
+        unreadable: &HashSet<String>,
+        patterns: &'a glob::PatternSet,
+    ) -> Self {
+        Self {
+            excluded: excluded.iter().map(|s| fold_rel(s)).collect(),
+            unreadable: unreadable.iter().map(|s| fold_rel(s)).collect(),
+            patterns,
+            // An empty relative path is the root's own.
+            source_root_unreadable: unreadable.contains(""),
+        }
+    }
+
+    /// Whether this destination path is protected — and therefore must not
+    /// be deleted, nor descended into: pruning the contents of a protected
+    /// directory would still effectively delete protected data.
+    pub(crate) fn covers(&self, rel: &str) -> bool {
+        let probe = fold_rel(rel);
+        is_root_icon_marker(rel)
+            || self.excluded.contains(&probe)
+            || self.unreadable.contains(&probe)
+            || self.patterns.matches(rel)
+    }
+
+    /// Nothing in the destination can be shown to be orphaned when the
+    /// source root itself was unreadable: the keep set is empty for reasons
+    /// that have nothing to do with the user deleting anything.
+    pub(crate) fn source_root_unreadable(&self) -> bool {
+        self.source_root_unreadable
+    }
+}
+
+/// Case-fold a relative path for comparison, on the platforms whose
+/// filesystems are case-insensitive.
+#[cfg(windows)]
+fn fold_rel(rel: &str) -> String {
+    rel.to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn fold_rel(rel: &str) -> String {
+    rel.to_string()
+}
+
 /// Walk `root` and remove any file whose relative path is not present in
-/// `keep` AND not protected by `excluded` / `unreadable` / `patterns`.
+/// `keep` AND not covered by `protected`.
 ///
 /// Excluded paths are preserved so that adding `node_modules` to the exclude
 /// list never wipes pre-existing destination data (#2). Unreadable paths are
@@ -1329,39 +1400,19 @@ fn fold_outcomes(
 ///
 /// Note that the guard skips the entry *without pushing it on the stack*, so
 /// protecting a directory protects its whole subtree. Skipped on cancellation.
-#[allow(clippy::too_many_arguments)]
 async fn prune_destination(
     root: &Path,
     keep: &KeepSet,
-    excluded: &HashSet<String>,
-    unreadable: &HashSet<String>,
-    patterns: &glob::PatternSet,
+    protected: &ProtectedSet<'_>,
     token: &CancellationToken,
     stats: &mut PhaseStats,
 ) -> Result<()> {
-    // An empty relative path is the root's own. Its presence means the source
-    // root itself could not be enumerated, so *nothing* in the destination
-    // can be shown to be orphaned — the entry-by-entry guard below would
-    // never match it, which is what once made prune wipe whole destinations.
-    if unreadable.contains("") {
+    // The entry-by-entry guard below can never match the root's own empty
+    // relative path, which is what once made prune wipe whole destinations.
+    if protected.source_root_unreadable() {
         warn!("source root was unreadable — skipping prune entirely");
         return Ok(());
     }
-
-    // `excluded` and `unreadable` are keyed by the *source* spelling, but
-    // everything below walks the *destination* spelling. On a case-
-    // preserving filesystem those differ the moment the user re-cases a
-    // folder, and a literal comparison then fails to see the protection —
-    // deleting from the backup precisely what the user asked not to touch.
-    // Fold once here so the lookups stay O(1) (#R6).
-    #[cfg(windows)]
-    let folded_excluded: HashSet<String> = excluded.iter().map(|s| s.to_lowercase()).collect();
-    #[cfg(windows)]
-    let excluded = &folded_excluded;
-    #[cfg(windows)]
-    let folded_unreadable: HashSet<String> = unreadable.iter().map(|s| s.to_lowercase()).collect();
-    #[cfg(windows)]
-    let unreadable = &folded_unreadable;
 
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
@@ -1402,15 +1453,7 @@ async fn prune_destination(
             // terms, not via `excluded`: that set is filled in by the source
             // walk, so relying on it meant the destination only kept its
             // icon when the source root happened to have one too.
-            #[cfg(windows)]
-            let probe = rel_str.to_lowercase();
-            #[cfg(not(windows))]
-            let probe = rel_str.clone();
-            if is_root_icon_marker(&rel_str)
-                || excluded.contains(&probe)
-                || unreadable.contains(&probe)
-                || patterns.matches(&rel_str)
-            {
+            if protected.covers(&rel_str) {
                 continue;
             }
 
@@ -1498,7 +1541,7 @@ async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PhaseStats) {
 /// external backup drives) rounds mtime to even seconds, so the round-trip
 /// `set_file_mtime(dest, src)` can land 1s off the source — without this
 /// tolerance every sync re-copies every file (#4).
-fn same_mtime(a: SystemTime, b: SystemTime) -> bool {
+pub(crate) fn same_mtime(a: SystemTime, b: SystemTime) -> bool {
     let da = a.duration_since(std::time::UNIX_EPOCH).ok();
     let db = b.duration_since(std::time::UNIX_EPOCH).ok();
     match (da, db) {
@@ -1532,7 +1575,7 @@ fn is_root_icon_marker(rel_str: &str) -> bool {
 ///   2. A post-copy hash-verification pass compares src vs dst via xxh3 and
 ///      force re-copies any drift before the parent-folder attribute is
 ///      applied.
-fn is_icon_descriptor(rel_str: &str) -> bool {
+pub(crate) fn is_icon_descriptor(rel_str: &str) -> bool {
     std::path::Path::new(rel_str)
         .file_name()
         .map(|n| n.to_string_lossy().eq_ignore_ascii_case("desktop.ini"))
@@ -1541,14 +1584,14 @@ fn is_icon_descriptor(rel_str: &str) -> bool {
 
 /// The relative paths the source says the destination should hold, with the
 /// lookup rules the prune pass needs.
-struct KeepSet {
+pub(crate) struct KeepSet {
     exact: HashSet<String>,
     /// Windows only: lowercased relative path -> the source's own spelling.
     #[cfg(windows)]
     by_lowercase: std::collections::HashMap<String, String>,
 }
 
-enum KeepStatus<'a> {
+pub(crate) enum KeepStatus<'a> {
     /// Spelled the same on both sides — leave it alone.
     Exact,
     /// The source has this file but spells it differently in case only.
@@ -1559,7 +1602,7 @@ enum KeepStatus<'a> {
 }
 
 impl KeepSet {
-    fn new(rels: impl Iterator<Item = String>) -> Self {
+    pub(crate) fn new(rels: impl Iterator<Item = String>) -> Self {
         let exact: HashSet<String> = rels.collect();
         #[cfg(windows)]
         let by_lowercase = exact
@@ -1573,7 +1616,7 @@ impl KeepSet {
         }
     }
 
-    fn status(&self, rel: &str) -> KeepStatus<'_> {
+    pub(crate) fn status(&self, rel: &str) -> KeepStatus<'_> {
         if self.exact.contains(rel) {
             return KeepStatus::Exact;
         }
@@ -1586,18 +1629,18 @@ impl KeepSet {
 }
 
 /// Everything the source walk learned, in one place.
-struct WalkResult {
-    files: Vec<FileEntry>,
-    dirs: Vec<(PathBuf, String)>,
-    total_bytes: u64,
-    skipped: usize,
+pub(crate) struct WalkResult {
+    pub(crate) files: Vec<FileEntry>,
+    pub(crate) dirs: Vec<(PathBuf, String)>,
+    pub(crate) total_bytes: u64,
+    pub(crate) skipped: usize,
     /// Relative paths the user's exclude patterns matched.
-    excluded: HashSet<String>,
+    pub(crate) excluded: HashSet<String>,
     /// Relative paths we could not fully read: directories whose listing
     /// failed or was cut short, files we could not stat, entries whose type
     /// we could not determine. The prune pass must treat these exactly like
     /// exclusions — see `prune_destination`.
-    unreadable: HashSet<String>,
+    pub(crate) unreadable: HashSet<String>,
 }
 
 /// Relative path of `path` under `root`, with `/` separators. Both walkers
@@ -1614,14 +1657,14 @@ fn listing_failure_is_fatal(dir: &Path, root: &Path) -> bool {
     dir == root
 }
 
-fn rel_of(root: &Path, path: &Path) -> String {
+pub(crate) fn rel_of(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
 }
 
-async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
+pub(crate) async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
     let mut files = Vec::new();
     let mut dirs: Vec<(PathBuf, String)> = Vec::new();
     let mut excluded: HashSet<String> = HashSet::new();
@@ -1949,6 +1992,7 @@ mod tests {
     ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
         let mut walked = walk(Path::new(&task.source), &patterns).await?;
+        let protected = ProtectedSet::new(&walked, &patterns);
         execute_one(
             app,
             backup_id,
@@ -1957,7 +2001,7 @@ mod tests {
             0,
             1,
             &mut walked,
-            &patterns,
+            &protected,
             settings,
             token,
         )
@@ -2683,9 +2727,7 @@ mod tests {
         prune_destination(
             &root,
             &keep,
-            &excluded,
-            &unreadable,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&excluded, &unreadable, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
@@ -2728,9 +2770,7 @@ mod tests {
         prune_destination(
             &root,
             &KeepSet::new(std::iter::empty()),
-            &empty,
-            &empty,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
@@ -2768,9 +2808,7 @@ mod tests {
         prune_destination(
             &root,
             &KeepSet::new(std::iter::empty()),
-            &empty,
-            &empty,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
@@ -2808,9 +2846,7 @@ mod tests {
         prune_destination(
             &root,
             &KeepSet::new(["iconfolder/keep.txt".to_string()].into_iter()),
-            &empty,
-            &empty,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
@@ -2848,9 +2884,7 @@ mod tests {
         prune_destination(
             &root,
             &keep,
-            &empty,
-            &empty,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
@@ -2936,9 +2970,7 @@ mod tests {
         prune_destination(
             &root,
             &KeepSet::new(std::iter::empty()),
-            &empty,
-            &unreadable,
-            &glob::PatternSet::new(&[]),
+            &ProtectedSet::from_parts(&empty, &unreadable, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
         )
