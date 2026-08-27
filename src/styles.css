@@ -1097,6 +1097,16 @@ input, textarea { user-select: text; }
 }
 .history-dest > * { justify-self: start; }
 .history-dest .history-path { margin-top: 0; max-width: 100%; }
+/* A single destination has its actions at the end of the row instead, so
+   the line is just the mark and the path and needs none of the width the
+   action columns were holding. */
+.history-dest--plain { grid-template-columns: 12px auto 1fr; }
+
+/* Restore, Reveal and Delete, in that order, pinned to the right. Right-
+   aligned rather than laid out on a fixed grid: Delete is on every row, so
+   ending there is what makes the column read straight down even when a row
+   has no Restore to offer. */
+.history-actions { display: flex; gap: 2px; align-items: center; justify-content: flex-end; }
 .history-dest__mark { font-size: 11px; line-height: 1; width: 12px; text-align: center; flex: none; }
 .history-dest__mark--success { color: var(--system-green); }
 .history-dest__mark--error { color: var(--system-red); }
