@@ -1049,6 +1049,16 @@ input, textarea { user-select: text; }
 }
 .history-table tr:hover td { background: var(--bg-control-hover); }
 .th--right, .td--right { text-align: right; }
+.th--center, .td--center { text-align: center; }
+/* The date column takes exactly the width its one line needs. `width: 1%`
+   with nowrap is the table trick for that: the browser gives the column its
+   minimum, which nowrap makes the full string, and hands the slack to the
+   columns that can use it. */
+.history-table th:first-child,
+.history-table td:first-child { width: 1%; white-space: nowrap; }
+/* Sizes and durations are two words that mean one thing. "2.48 GB" broken
+   across two lines is read twice. */
+.history-table .mono { white-space: nowrap; }
 .history-task-name { font-weight: 600; color: var(--label-primary); font-size: 13px; }
 .history-path {
   font-family: 'SF Mono', Menlo, monospace; font-size: 11px;

@@ -23,7 +23,6 @@ export function makeFormatters(lang) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
-  const dateTime = new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' });
   const dayMonth = new Intl.DateTimeFormat(locale, { day: '2-digit', month: '2-digit' });
   const weekdayShort = new Intl.DateTimeFormat(locale, { weekday: 'short' });
   const clock = new Intl.DateTimeFormat(locale, { hour: 'numeric', minute: '2-digit' });
@@ -49,9 +48,24 @@ export function makeFormatters(lang) {
     return `${integer.format(Math.floor(seconds / 3600))}h ${integer.format(Math.floor((seconds % 3600) / 60))}m`;
   };
 
-  // Empty string for a missing timestamp: the caller owns the "Never"
-  // label (it needs t(), which formatters deliberately don't).
-  const formatTime = (iso) => (iso ? dateTime.format(new Date(iso)) : '');
+  // DD/MM/YYYY, HH:MM — fixed, in every language, and assembled by hand
+  // rather than through Intl.
+  //
+  // Intl would put the month first in English, and a column that reads
+  // 08/24 in one language and 24/08 in the other is a column you have to
+  // stop and think about. The components come off the local Date, so the
+  // instant shown is still the machine's own time.
+  //
+  // Empty string for a missing or unreadable timestamp: the caller owns the
+  // "Never" label (it needs t(), which formatters deliberately don't), and
+  // a row with a broken date should show nothing rather than "Invalid Date".
+  const pad = (n) => String(n).padStart(2, '0');
+  const formatTime = (iso) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
 
   // dayKey is "YYYY-MM-DD". Parse the parts ourselves so the label can't
   // shift a day across timezones the way `new Date('YYYY-MM-DD')` (UTC

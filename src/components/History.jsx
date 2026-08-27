@@ -98,10 +98,10 @@ export default function History() {
           <tr>
             <th>{t('history.col.date')}</th>
             <th>{t('history.col.task')}</th>
-            <th>{t('history.col.status')}</th>
-            <th className="th--right">{t('history.col.size')}</th>
-            <th className="th--right">{t('history.col.files')}</th>
-            <th className="th--right">{t('history.col.duration')}</th>
+            <th className="th--center">{t('history.col.status')}</th>
+            <th className="th--center">{t('history.col.size')}</th>
+            <th className="th--center">{t('history.col.files')}</th>
+            <th className="th--center">{t('history.col.duration')}</th>
             <th className="th--right">{t('history.col.actions')}</th>
           </tr>
         </thead>
@@ -160,14 +160,14 @@ export default function History() {
                   </div>
                 )}
               </td>
-              <td>
+              <td className="td--center">
                 <span className={`badge badge--${entry.status}`}>
                   {t(STATUS_KEY[entry.status] || STATUS_KEY.error)}
                 </span>
               </td>
-              <td className="td--right"><span className="mono">{entry.totalBytes ? formatBytes(entry.totalBytes) : t('common.dash')}</span></td>
-              <td className="td--right"><span className="mono">{entry.totalFiles != null ? formatNumber(entry.totalFiles) : t('common.dash')}</span></td>
-              <td className="td--right"><span className="mono">{entry.durationMs ? formatDuration(Math.round(entry.durationMs / 1000)) : t('common.dash')}</span></td>
+              <td className="td--center"><span className="mono">{entry.totalBytes ? formatBytes(entry.totalBytes) : t('common.dash')}</span></td>
+              <td className="td--center"><span className="mono">{entry.totalFiles != null ? formatNumber(entry.totalFiles) : t('common.dash')}</span></td>
+              <td className="td--center"><span className="mono">{entry.durationMs ? formatDuration(Math.round(entry.durationMs / 1000)) : t('common.dash')}</span></td>
               <td className="td--right">
                 <Button size="small" variant="borderless" onClick={() => deleteHistory(entry.id)}>{t('common.delete')}</Button>
               </td>

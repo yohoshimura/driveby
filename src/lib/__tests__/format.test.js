@@ -18,9 +18,16 @@ describe('makeFormatters (fr)', () => {
     expect(fr.formatDayLabel('2026-08-19')).toBe('19/08');
   });
 
-  test('dates follow the app language, not the OS locale', () => {
-    const s = fr.formatTime('2026-08-19T14:05:00Z');
-    expect(s).toContain('août');
+  test('dates read DD/MM/YYYY, HH:MM — the same in every language', () => {
+    // Built in local time and round-tripped through ISO, the way a stored
+    // timestamp is, so the assertion holds whatever the machine's timezone.
+    const iso = new Date(2026, 7, 19, 14, 5).toISOString();
+    expect(fr.formatTime(iso)).toBe('19/08/2026, 14:05');
+    expect(makeFormatters('en').formatTime(iso)).toBe('19/08/2026, 14:05');
+  });
+
+  test('a timestamp that is not a date renders as nothing', () => {
+    expect(fr.formatTime('not a date')).toBe('');
   });
 });
 
