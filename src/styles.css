@@ -1048,8 +1048,14 @@ input, textarea { user-select: text; }
   vertical-align: middle;
 }
 .history-table tr:hover td { background: var(--bg-control-hover); }
-.th--right, .td--right { text-align: right; }
-.th--center, .td--center { text-align: center; }
+/* `.history-table th` sets text-align on a selector one point more specific
+   than a bare class, so a `th--right` or `th--center` on its own never won
+   and every header stayed left while its column's contents did not. Naming
+   the table in the selector is what makes these apply. */
+.th--right, .td--right,
+.history-table th.th--right { text-align: right; }
+.th--center, .td--center,
+.history-table th.th--center { text-align: center; }
 /* The date column takes exactly the width its one line needs. `width: 1%`
    with nowrap is the table trick for that: the browser gives the column its
    minimum, which nowrap makes the full string, and hands the slack to the
@@ -1090,17 +1096,21 @@ input, textarea { user-select: text; }
    Restore. */
 .history-dest {
   display: grid;
-  grid-template-columns: 12px minmax(0, 252px) 80px 80px 1fr;
+  grid-template-columns: minmax(0, 252px) 80px 80px 1fr 12px;
   align-items: center;
   gap: 6px;
   margin-top: 2px;
 }
 .history-dest > * { justify-self: start; }
-.history-dest .history-path { margin-top: 0; max-width: 100%; }
+.history-dest .history-path { margin-top: 0; max-width: 340px; }
+/* The state marker sits at the far end of the column rather than in front
+   of the path: leading with it indented every path away from the task name
+   above it, and pinned right it lines up down the table instead. */
+.history-dest__mark { justify-self: end; }
 /* A single destination has its actions at the end of the row instead, so
-   the line is just the mark and the path and needs none of the width the
-   action columns were holding. */
-.history-dest--plain { grid-template-columns: 12px auto 1fr; }
+   the line is the path and its marker and needs none of the width the
+   action columns were holding open. */
+.history-dest--plain { grid-template-columns: minmax(0, max-content) 1fr 12px; }
 
 /* Restore, Reveal and Delete, in that order, pinned to the right. Right-
    aligned rather than laid out on a fixed grid: Delete is on every row, so

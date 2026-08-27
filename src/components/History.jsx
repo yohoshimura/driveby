@@ -133,17 +133,9 @@ export default function History() {
                         className={`history-dest${perDestination ? '' : ' history-dest--plain'}`}
                         key={`${i}-${dest.path}`}
                       >
-                        <span
-                          className={`history-dest__mark history-dest__mark--${status}`}
-                          role="img"
-                          aria-label={label}
-                          title={label}
-                        >
-                          {DEST_MARK[status]}
-                        </span>
                         <span className="history-path" title={dest.path}>{dest.path}</span>
-                        {/* Both action cells are always rendered, empty when
-                            the action does not apply, so the columns line up
+                        {/* Every cell is rendered on every line, empty when
+                            it has nothing to say, so the columns line up
                             down the table instead of shuffling left. */}
                         {perDestination && (status === 'success' ? (
                           <Button
@@ -162,7 +154,15 @@ export default function History() {
                             {t('common.reveal')}
                           </Button>
                         ) : <span />)}
-                        {dest.error && <span className="history-dest__error">{dest.error}</span>}
+                        <span className="history-dest__error">{dest.error || ''}</span>
+                        <span
+                          className={`history-dest__mark history-dest__mark--${status}`}
+                          role="img"
+                          aria-label={label}
+                          title={label}
+                        >
+                          {DEST_MARK[status]}
+                        </span>
                       </div>
                     );
                   })}
