@@ -1107,10 +1107,10 @@ input, textarea { user-select: text; }
    of the path: leading with it indented every path away from the task name
    above it, and pinned right it lines up down the table instead. */
 .history-dest__mark { justify-self: end; }
-/* A single destination has its actions at the end of the row instead, so
-   the line is the path and its marker and needs none of the width the
-   action columns were holding open. */
-.history-dest--plain { grid-template-columns: minmax(0, max-content) 1fr 12px; }
+/* A single destination has its actions at the end of the row and no marker
+   of its own — the Status badge two columns over already says how it went —
+   so the line is the path and whatever went wrong with it. */
+.history-dest--plain { grid-template-columns: minmax(0, max-content) 1fr; }
 
 /* Restore, Reveal and Delete, in that order, pinned to the right. Right-
    aligned rather than laid out on a fixed grid: Delete is on every row, so

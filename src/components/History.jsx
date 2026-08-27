@@ -155,14 +155,21 @@ export default function History() {
                           </Button>
                         ) : <span />)}
                         <span className="history-dest__error">{dest.error || ''}</span>
-                        <span
-                          className={`history-dest__mark history-dest__mark--${status}`}
-                          role="img"
-                          aria-label={label}
-                          title={label}
-                        >
-                          {DEST_MARK[status]}
-                        </span>
+                        {/* The marker only earns its place when a row has
+                            several destinations: there the Status badge says
+                            "partial" without saying which drive missed out.
+                            With one, it repeats the badge two columns to its
+                            left. */}
+                        {perDestination && (
+                          <span
+                            className={`history-dest__mark history-dest__mark--${status}`}
+                            role="img"
+                            aria-label={label}
+                            title={label}
+                          >
+                            {DEST_MARK[status]}
+                          </span>
+                        )}
                       </div>
                     );
                   })}
