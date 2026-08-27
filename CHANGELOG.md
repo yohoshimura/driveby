@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.7.2
+
+Five features, all of them about the same thing: knowing what a backup is about to do, and where it is going.
+
+**A task can back up to several destinations.** One source, as many drives as you like — an internal disk, an external one, one that lives at a friend's house. Keeping a folder on three drives used to mean three tasks: three schedules to keep in step, three unrelated history rows, and no way to notice that the copy on the drive in the drawer was six weeks behind the other two.
+
+The destinations are written one after another, from a single snapshot of the source, so the three copies are made from the same tree rather than from three trees minutes apart. A drive that is not connected no longer costs the others their backup: the ones that are there are written, the run is reported as *partial*, and the schedule clock does not advance — so a drive left unplugged stays visible instead of hiding behind a fresh timestamp.
+
+Destinations nested inside one another are refused before anything is written. Each destination is mirrored against the source, which means one sitting inside another would be deleted by its host on the very first run — a backup erasing a backup.
+
+**Confirming a backup now says what it will do.** The old dialog showed the source and the destination, two paths you picked yourself. It now counts the work first: how many files are new, how many changed, and how many are about to be **deleted** from the copy — the one thing a mirror backup does that cannot be undone. Deletions are coloured, and the confirm button turns destructive when there are any.
+
+The count is worked out by the same code that performs the run, so the dialog cannot promise one thing and the backup do another. On a large tree the scan takes a moment; the dialog opens straight away and can be cancelled while it works. Scheduled runs never wait for it.
+
+**A speed ceiling.** Settings takes a maximum in MB/s, empty meaning no limit. It is shared by every backup running at once — the point being that the machine stays usable while one runs, and three tasks firing together must not add up to three times the ceiling. Stopping a run still stops it immediately, even at a low ceiling.
+
+**Schedules can follow the clock.** Alongside hourly, daily, weekly and monthly — which have always meant "this long since the last one" — a schedule can now name days and a time: Monday and Thursday at 22:00, in your own timezone. The form shows the next run as you set it. A missed occurrence is caught up rather than skipped, so closing the app at 22:00 and opening it at 23:10 still runs the backup; a run that fails waits for the next occurrence rather than retrying every minute.
+
+**An unplugged drive is a reminder, not an error.** A scheduled task whose destinations are all missing used to walk the source, fail, and file a red history row — once per interval, for ever. It now does not start at all: you are told once, and the task card shows which destination is missing while it stays that way. Plugging the drive back in does not set a backup going while you are still handling the disk; it goes at the next scheduled time.
+
+### Behaviour changes worth knowing
+
+- `tasks.json` is rewritten once on first launch to hold a list of destinations instead of a single one. An older version of driveby can still read the result.
+- History has one row per run, with a line per destination underneath carrying its own state, Restore and Reveal. Sizes and file counts are totals across destinations: three copies of a 4 GB source really did move 12 GB.
+- A partial run counts with the errors in Statistics — something you asked for did not get backed up.
+- The chart of backed-up data no longer paints a task in the error red.
+
 ## 1.7.0
 
 A correctness release. A review of the whole codebase turned up sixteen defects; three of them could destroy data that had already been backed up, and all three were the same mistake made in three places.
