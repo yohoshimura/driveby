@@ -48,7 +48,7 @@ export function makeFormatters(lang) {
     return `${integer.format(Math.floor(seconds / 3600))}h ${integer.format(Math.floor((seconds % 3600) / 60))}m`;
   };
 
-  // DD/MM/YYYY, HH:MM — fixed, in every language, and assembled by hand
+  // DD/MM/YYYY - HH:MM — fixed, in every language, and assembled by hand
   // rather than through Intl.
   //
   // Intl would put the month first in English, and a column that reads
@@ -64,7 +64,7 @@ export function makeFormatters(lang) {
     if (!iso) return '';
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return '';
-    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} - ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
 
   // dayKey is "YYYY-MM-DD". Parse the parts ourselves so the label can't
