@@ -96,6 +96,26 @@ jobs:
             ${{ matrix.args }}
             ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config src-tauri/tauri.updater.conf.json' || '' }}
 
+      # The portable Windows build: the very binary the two installers wrap,
+      # attached on its own for anyone who wants driveby on a USB stick or on
+      # a machine they cannot install software on. Tauri bundles no such
+      # target, so it is lifted out of the build directory by hand.
+      #
+      # The name has to say `portable`: the NSIS installer is also an .exe,
+      # and downloading the wrong one means either installing when you meant
+      # not to, or double-clicking an installer that never arrives.
+      - name: Attach the portable Windows build
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          portable="driveby_${version}_x64-portable.exe"
+          cp src-tauri/target/release/driveby.exe "$portable"
+          gh release upload "$GITHUB_REF_NAME" "$portable" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
   # tauri-action drafts the release, and every matrix job appends its own
   # platform's assets to that same draft. Publishing from inside the matrix
   # would therefore make the release public the moment the first job finished,

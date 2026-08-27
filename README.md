@@ -56,6 +56,12 @@ no administrator rights are needed, and it registers normally under
 SmartScreen shows a blue warning on first run: *More info*, then *Run anyway*.
 An `.msi` is published alongside it for deployment tooling.
 
+To run driveby without installing it — from a USB stick, or on a machine you
+cannot install software on — take the `-portable.exe` instead. It is the same
+program, with nothing to uninstall afterwards. Settings, tasks and history go
+to `%APPDATA%\com.driveby.app` either way, so a portable copy still remembers
+its tasks, and still needs to be running for a schedule to fire.
+
 **macOS.** Take the `_universal.dmg` — one build for both Apple Silicon and
 Intel — and drag driveby to Applications. macOS refuses the first launch
 because the app is not notarised; open **System Settings → Privacy &
