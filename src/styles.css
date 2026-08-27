@@ -1072,8 +1072,21 @@ input, textarea { user-select: text; }
 /* One line per destination under the run's own row. The mark carries the
    state, so the path itself keeps the muted treatment it has always had and
    the eye still lands on the path first. */
-.history-dest { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
-.history-dest .history-path { margin-top: 0; }
+/* A grid rather than a flex row, with the path column a fixed width: each
+   destination line is its own container, so nothing aligns the actions
+   between rows unless the column they sit in is the same width everywhere.
+   Every line renders all four cells — an empty span where a button does not
+   apply — so Reveal stays under Reveal even on a row that cannot offer a
+   Restore. */
+.history-dest {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 220px) 84px 84px 1fr;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+.history-dest > * { justify-self: start; }
+.history-dest .history-path { margin-top: 0; max-width: 100%; }
 .history-dest__mark { font-size: 11px; line-height: 1; width: 12px; text-align: center; flex: none; }
 .history-dest__mark--success { color: var(--system-green); }
 .history-dest__mark--error { color: var(--system-red); }

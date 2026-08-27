@@ -125,7 +125,10 @@ export default function History() {
                         {DEST_MARK[status]}
                       </span>
                       <span className="history-path" title={dest.path}>{dest.path}</span>
-                      {status === 'success' && (
+                      {/* Both action cells are always rendered, empty when
+                          the action does not apply, so the columns line up
+                          down the table instead of shuffling left. */}
+                      {status === 'success' ? (
                         <Button
                           size="small"
                           variant="borderless"
@@ -134,14 +137,14 @@ export default function History() {
                         >
                           {t('common.restore')}
                         </Button>
-                      )}
+                      ) : <span />}
                       {/* No Reveal for a destination that was never written:
                           the folder it names is not there to open. */}
-                      {(status === 'success' || status === 'error') && (
+                      {status === 'success' || status === 'error' ? (
                         <Button size="small" variant="borderless" onClick={() => revealFolder(dest.path)}>
                           {t('common.reveal')}
                         </Button>
-                      )}
+                      ) : <span />}
                       {dest.error && <span className="history-dest__error">{dest.error}</span>}
                     </div>
                   );

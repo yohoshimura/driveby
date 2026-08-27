@@ -3,10 +3,15 @@ import { useFormat } from '../../hooks/useFormat';
 import { useT } from '../../hooks/useT';
 
 const PIE_SIZE = 140;
+// Colours for the task slices. The system red (#ff3b30) is deliberately not
+// among them: it is the error colour everywhere else in the app, and a chart
+// of successful backups whose largest slice was red read as a disaster when
+// it was the opposite. The pink next to it sits at the far end for the same
+// reason — nothing that says "something went wrong" in the first few slots.
 const PALETTE = [
-  '#007aff', '#5856d6', '#af52de', '#ff2d55', '#ff3b30',
-  '#ff9500', '#ffcc00', '#34c759', '#00c7be', '#30b0c7',
-  '#a2845e', '#8e8e93',
+  '#007aff', '#5856d6', '#af52de', '#ff9500', '#34c759',
+  '#00c7be', '#ffcc00', '#30b0c7', '#a2845e', '#ff2d55',
+  '#8e8e93',
 ];
 
 function colorForTask(taskId, lookup) {
