@@ -28,9 +28,9 @@ jobs:
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
-  # Keeps the #[cfg(not(windows))] side of fsutil — and the no-op recase
-  # path — compiling and passing, which is what makes the macOS/Linux
-  # bundles in release.yml trustworthy.
+  # The case-*sensitive* half of the contract, and the only runner that can
+  # build the fixture for it: two directories differing only in case. It also
+  # compiles the readdir-based NameResolver, which is shared with macOS.
   linux:
     name: Linux — tests
     runs-on: ubuntu-22.04
@@ -54,5 +54,27 @@ jobs:
       - run: npm ci
       # tauri::generate_context! reads frontendDist, so dist/ must exist
       # before the Rust tests compile.
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # driveby ships a universal .dmg, so until now the only thing that ever
+  # compiled the macOS target was the release build — after the tag, when a
+  # failure is expensive. The case-folding paths (recase_dirs_phase, the
+  # NameResolver, the overlap fold) are live on APFS and reachable nowhere
+  # else, and ActivationPolicy is macOS-only by definition.
+  macos:
+    name: macOS — tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
