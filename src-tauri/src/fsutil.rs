@@ -232,19 +232,25 @@ impl NameResolver {
 
 /// One directory's entries, indexed both ways.
 ///
-/// `exact` is consulted first, and that ordering is the whole safety story on
-/// a case-*sensitive* APFS volume — which macOS will happily format. Asked
-/// about `Foo` while both `Foo` and `foo` exist, it answers `Foo`, so the
-/// caller sees no drift and renames nothing. Only a spelling that is on disk
-/// under neither casing falls through to `folded`, and a fold that two
-/// entries share is deliberately unanswerable: renaming one onto the other
-/// would destroy a file.
+/// `exact` is consulted first and answers on every filesystem: a spelling
+/// that is on disk is its own answer. `folded` is the case-drift lookup and
+/// is consulted **only where the filesystem folds case**. On a case-sensitive
+/// volume — which macOS will format APFS as on request, and where
+/// `recase_dirs_phase` still runs — `docs` and `Docs` are two different
+/// directories, so answering "the real spelling of `Docs` is `docs`" would
+/// have the caller rename a directory that prune should have deleted.
 ///
-/// Names are folded with plain lowercasing, which is what the Windows side
-/// has always done. It does not normalise Unicode, so a name stored decomposed
-/// (HFS+ did this to every filename) will not fold onto its composed
-/// spelling. That reads as "no match", the caller leaves the entry alone, and
-/// the old spelling survives — exactly what happens today.
+/// A fold that two entries share is deliberately unanswerable: renaming one
+/// onto the other would destroy a file. On a folding volume that pair cannot
+/// normally exist, but the fold here is Rust's `to_lowercase` and the
+/// filesystem's is its own table — `K` (U+212A) and `k` lowercase alike while
+/// the volume may keep them apart — so the guard stands.
+///
+/// Plain lowercasing is what the Windows side has always done. It does not
+/// normalise Unicode, so a name stored decomposed (HFS+ did this to every
+/// filename) will not fold onto its composed spelling. That reads as "no
+/// match", the caller leaves the entry alone, and the old spelling survives —
+/// exactly what happens today.
 #[cfg(not(windows))]
 #[derive(Default)]
 struct DirNames {
@@ -276,6 +282,17 @@ impl DirNames {
         if self.exact.contains(want) {
             return Some(want.to_os_string());
         }
+        if !CASE_INSENSITIVE_FS {
+            return None;
+        }
+        self.fold(want)
+    }
+
+    /// The folded lookup on its own, without the platform gate `get` applies.
+    /// Only the tests call it directly — to reach the ambiguity guard, whose
+    /// fixture needs two entries differing in case and so can only be built
+    /// where `get` would have refused to fold in the first place.
+    fn fold(&self, want: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
         self.folded
             .get(&want.to_string_lossy().to_lowercase())
             .cloned()
@@ -461,28 +478,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Two entries that differ only in case can exist only on a case-sensitive
-    /// volume — Linux here, but macOS will format APFS that way on request,
-    /// which is why the guard exists at all. Renaming one onto the other would
-    /// destroy a file, so an ambiguous fold must refuse to answer, while an
-    /// exact hit must still be reported.
+    /// The ambiguity guard, reached past the platform gate.
+    ///
+    /// Building the fixture takes two entries differing only in case, which
+    /// needs a case-sensitive volume — so this runs on Linux, while the code
+    /// path it protects lives on a folding one, where the pair arises only
+    /// through Unicode that `to_lowercase` collapses and the filesystem does
+    /// not. `fold` is therefore called directly: `get` would refuse to fold
+    /// on the very host that can set the fixture up.
+    #[cfg(not(windows))]
     #[test]
-    fn on_disk_name_refuses_an_ambiguous_fold() {
+    fn an_ambiguous_fold_refuses_to_answer() {
         if CASE_INSENSITIVE_FS {
             return; // the fixture cannot be built here
         }
         let root = make_test_dir("on-disk-ambiguous");
         std::fs::create_dir_all(root.join("Foo")).unwrap();
         std::fs::create_dir_all(root.join("foo")).unwrap();
-        let mut names = NameResolver::default();
+        std::fs::create_dir_all(root.join("Solo")).unwrap();
+        let names = DirNames::read(&root).unwrap();
         assert_eq!(
-            names.on_disk_name(&root.join("Foo")).unwrap(),
-            std::ffi::OsStr::new("Foo"),
-            "an exact spelling answers for itself"
+            names.fold(std::ffi::OsStr::new("SOLO")).unwrap(),
+            std::ffi::OsStr::new("Solo"),
+            "a fold only one entry answers to resolves to that entry"
         );
         assert!(
-            names.on_disk_name(&root.join("FOO")).is_none(),
+            names.fold(std::ffi::OsStr::new("FOO")).is_none(),
             "a fold two entries share must not pick one"
+        );
+        // And the gate itself: on this host `get` must never fold at all.
+        assert!(
+            names.get(std::ffi::OsStr::new("solo")).is_none(),
+            "a case-sensitive volume has no case drift to find"
+        );
+        assert_eq!(
+            names.get(std::ffi::OsStr::new("Solo")).unwrap(),
+            std::ffi::OsStr::new("Solo"),
+            "but an exact spelling still answers for itself"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
