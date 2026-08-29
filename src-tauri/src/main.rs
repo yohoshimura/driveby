@@ -234,6 +234,9 @@ fn main() {
                     // Keep the process — and with it the scheduler — alive.
                     api.prevent_close();
                     let _ = window.hide();
+                    // On macOS the Dock tile outlives the window it stands
+                    // for, so drop it: the tray icon is now the only way back.
+                    tray::set_dock_visible(window.app_handle(), false);
                 }
             }
         })
@@ -260,11 +263,14 @@ fn main() {
                 }
             });
 
-            // Autostart passes --hidden: come up in the tray only.
+            // Autostart passes --hidden: come up in the tray only. Launched
+            // at login there is no window at all, so a Dock tile would be
+            // there purely to be clicked and do nothing.
             if std::env::args().any(|a| a == "--hidden") {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.hide();
                 }
+                tray::set_dock_visible(app.handle(), false);
             }
 
             scheduler::spawn(app.handle().clone());
