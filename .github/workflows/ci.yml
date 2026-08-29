@@ -57,7 +57,7 @@ jobs:
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
-  # driveby ships a universal .dmg, so until now the only thing that ever
+  # Driveby ships a universal .dmg, so until now the only thing that ever
   # compiled the macOS target was the release build — after the tag, when a
   # failure is expensive. The case-folding paths (recase_dirs_phase, the
   # NameResolver, the overlap fold) are live on APFS and reachable nowhere

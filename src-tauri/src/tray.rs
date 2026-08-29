@@ -47,7 +47,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .icon(app.default_window_icon().cloned().ok_or_else(|| {
             tauri::Error::AssetNotFound("default window icon".into())
         })?)
-        .tooltip("driveby")
+        .tooltip("Driveby")
         .menu(&menu)
         // Without this a left click opens the menu on Windows and the
         // show-window handler below never runs.
@@ -74,7 +74,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// macOS only: match the Dock tile to whether there is a window to go back to.
 ///
 /// A session living behind the tray icon alone is what `Accessory` describes —
-/// no Dock tile, no menu bar of its own — and leaving driveby `Regular` while
+/// no Dock tile, no menu bar of its own — and leaving Driveby `Regular` while
 /// hidden puts a tile in the Dock that answers no click, since there is no
 /// window for it to raise. The other platforms have no equivalent: a Windows
 /// taskbar button belongs to a window and goes with it, and this is a no-op

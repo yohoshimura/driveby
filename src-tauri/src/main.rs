@@ -245,7 +245,7 @@ fn main() {
                 let _ = std::fs::create_dir_all(&dir);
             }
             setup_logging(app.handle());
-            info!("driveby {} starting", env!("CARGO_PKG_VERSION"));
+            info!("Driveby {} starting", env!("CARGO_PKG_VERSION"));
 
             if let Err(e) = tray::setup(app.handle()) {
                 tracing::warn!("could not create tray icon: {}", e);
