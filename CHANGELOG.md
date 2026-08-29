@@ -22,7 +22,7 @@ The count is worked out by the same code that performs the run, so the dialog ca
 
 ### Behaviour changes worth knowing
 
-- `tasks.json` is rewritten once on first launch to hold a list of destinations instead of a single one. An older version of driveby can still read the result.
+- `tasks.json` is rewritten once on first launch to hold a list of destinations instead of a single one. An older version of Driveby can still read the result.
 - History has one row per run, with a line per destination underneath carrying its own state, Restore and Reveal. Sizes and file counts are totals across destinations: three copies of a 4 GB source really did move 12 GB.
 - A partial run counts with the errors in Statistics — something you asked for did not get backed up.
 - The chart of backed-up data no longer paints a task in the error red.

@@ -1,10 +1,10 @@
-# driveby
+# Driveby
 
 A desktop backup app for keeping folders mirrored onto a local or external
 drive. Built with Tauri 2 + Rust and React 18.
 
 Point it at a folder, choose where the copy should live, and pick how often it
-should run. driveby keeps the destination matching the source and stays out of
+should run. Driveby keeps the destination matching the source and stays out of
 the way the rest of the time.
 
 ## What it does
@@ -20,7 +20,7 @@ files copy at once; one at a time suits an older spinning disk better.
 Files you delete at the source are removed from the copy on the next run.
 There is no version history to roll back through — see *Limits* below.
 
-**Runs without you.** Closing the window can leave driveby in the notification
+**Runs without you.** Closing the window can leave Driveby in the notification
 area so scheduled backups still fire, and it can start with your session.
 
 **Exclusions.** Skip files and folders by pattern: `*` for any characters,
@@ -56,26 +56,26 @@ no administrator rights are needed, and it registers normally under
 SmartScreen shows a blue warning on first run: *More info*, then *Run anyway*.
 An `.msi` is published alongside it for deployment tooling.
 
-To run driveby without installing it — from a USB stick, or on a machine you
+To run Driveby without installing it — from a USB stick, or on a machine you
 cannot install software on — take the `-portable.exe` instead. It is the same
 program, with nothing to uninstall afterwards. Settings, tasks and history go
 to `%APPDATA%\com.driveby.app` either way, so a portable copy still remembers
 its tasks, and still needs to be running for a schedule to fire.
 
 **macOS.** Take the `_universal.dmg` — one build for both Apple Silicon and
-Intel — and drag driveby to Applications. macOS refuses the first launch
+Intel — and drag Driveby to Applications. macOS refuses the first launch
 because the app is not notarised; open **System Settings → Privacy &
-Security**, find the message naming driveby, and click **Open Anyway**.
+Security**, find the message naming Driveby, and click **Open Anyway**.
 
 **Linux.** The `.AppImage` runs on any distribution: `chmod +x` it and go. For
 a system install, take the `.deb` or the `.rpm` instead.
 
 ```bash
-sudo apt install ./driveby_*_amd64.deb     # Debian, Ubuntu
-sudo dnf install ./driveby-*.x86_64.rpm    # Fedora, RHEL
+sudo apt install ./*_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./*.x86_64.rpm     # Fedora, RHEL
 ```
 
-driveby checks for updates on its own and installs them from the Settings
+Driveby checks for updates on its own and installs them from the Settings
 screen. A `.deb` or `.rpm` install is the exception: a packaged install is
 updated through your package manager, not by the app.
 
@@ -84,7 +84,7 @@ updated through your package manager, not by the app.
 - **No versioned snapshots.** Restoring gives you the state of the last run, not
   a point in time you choose. This is a deliberate design choice, not an
   oversight — versioning changes the storage model entirely.
-- Scheduled backups only run while driveby is running, whether in a window or
+- Scheduled backups only run while Driveby is running, whether in a window or
   in the notification area.
 - The tray menu is English-only.
 

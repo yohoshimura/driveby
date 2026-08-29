@@ -88,7 +88,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'driveby ${{ github.ref_name }}'
+          releaseName: 'Driveby ${{ github.ref_name }}'
           releaseBody: 'See CHANGELOG.md for what changed in this release.'
           releaseDraft: true
           prerelease: false
@@ -97,7 +97,7 @@ jobs:
             ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '--config src-tauri/tauri.updater.conf.json' || '' }}
 
       # The portable Windows build: the very binary the two installers wrap,
-      # attached on its own for anyone who wants driveby on a USB stick or on
+      # attached on its own for anyone who wants Driveby on a USB stick or on
       # a machine they cannot install software on. Tauri bundles no such
       # target, so it is lifted out of the build directory by hand.
       #
@@ -111,7 +111,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          portable="driveby_${version}_x64-portable.exe"
+          portable="Driveby_${version}_x64-portable.exe"
           cp src-tauri/target/release/driveby.exe "$portable"
           gh release upload "$GITHUB_REF_NAME" "$portable" \
             --repo "$GITHUB_REPOSITORY" --clobber

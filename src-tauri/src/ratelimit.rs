@@ -88,7 +88,7 @@ impl RateLimiter {
 
 /// The one bucket every copy in the process draws from.
 ///
-/// Global on purpose. "driveby never goes above 50 MB/s" has to hold when
+/// Global on purpose. "Driveby never goes above 50 MB/s" has to hold when
 /// the scheduler fires three tasks at once, and a limiter per run would let
 /// them add up to three times the ceiling — which is precisely the moment
 /// the machine feels slow and the setting was supposed to prevent.
