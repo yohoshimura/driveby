@@ -1,6 +1,6 @@
 use crate::fsutil::{
     apply_attrs, clear_readonly, long_path, path_contains, read_attrs, reject_overlap,
-    scratch_path, ATTR_KEEP,
+    scratch_path, ATTR_KEEP, CASE_INSENSITIVE_FS,
 };
 use crate::glob;
 use crate::persist;
@@ -846,20 +846,21 @@ async fn copy_one<R: Runtime>(
 }
 
 /// Re-spell destination directories whose on-disk casing no longer matches
-/// the source: NTFS is case-insensitive but case-preserving, so when the
-/// user re-cases a folder at source, every write goes through the existing
-/// destination entry and the old spelling survives. File-level drift is
-/// `recase_entry`'s job during prune; this pass owns the directory
+/// the source: NTFS and APFS are case-insensitive but case-*preserving*, so
+/// when the user re-cases a folder at source, every write goes through the
+/// existing destination entry and the old spelling survives. File-level drift
+/// is `recase_entry`'s job during prune; this pass owns the directory
 /// components, which `with_file_name` can never reach.
 ///
 /// Shallow-first so parents are corrected before children are looked at —
 /// though lookups resolve case-insensitively either way, so the pass is
 /// order-tolerant, and it is idempotent: a cancelled run finishes the job
 /// on the next one.
-// TODO(macOS): APFS is case-insensitive by default too — extend this cfg
-// (and KeepSet::by_lowercase, and fsutil::on_disk_name) once macOS is a
-// supported target.
-#[cfg(windows)]
+///
+/// Not compiled where the filesystem is case-sensitive: there, two spellings
+/// are two different directories and re-spelling one would be a rename the
+/// user never asked for.
+#[cfg(any(windows, target_os = "macos"))]
 async fn recase_dirs_phase<R: Runtime>(
     ctx: &RunCtx<'_, R>,
     dirs: &[(PathBuf, String)],
@@ -867,6 +868,7 @@ async fn recase_dirs_phase<R: Runtime>(
 ) {
     let mut rels: Vec<&str> = dirs.iter().map(|(_, r)| r.as_str()).collect();
     rels.sort_by_key(|r| r.matches('/').count());
+    let mut names = crate::fsutil::NameResolver::default();
     for rel in rels {
         if ctx.token.is_cancelled() {
             return;
@@ -877,7 +879,7 @@ async fn recase_dirs_phase<R: Runtime>(
         let dest = ctx.target.join(rel);
         // Not created yet (empty source dirs only materialize in
         // mirror_dir_attrs_phase) — nothing to re-spell.
-        let Some(actual) = crate::fsutil::on_disk_name(&dest) else {
+        let Some(actual) = names.on_disk_name(&dest) else {
             continue;
         };
         if actual == want {
@@ -1203,7 +1205,7 @@ async fn execute_one<R: Runtime>(
     let mut stats = PhaseStats::default();
 
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
     prune_phase(&ctx, &walked.files, protected, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
@@ -1392,15 +1394,18 @@ impl<'a> ProtectedSet<'a> {
 }
 
 /// Case-fold a relative path for comparison, on the platforms whose
-/// filesystems are case-insensitive.
-#[cfg(windows)]
+/// filesystems are case-insensitive. Identity everywhere else, where two
+/// spellings really are two different paths.
+///
+/// `CASE_INSENSITIVE_FS` is a `const`, so the branch is resolved at compile
+/// time exactly as the old pair of `cfg`s was — but there is now one place
+/// that decides it for the whole crate.
 fn fold_rel(rel: &str) -> String {
-    rel.to_lowercase()
-}
-
-#[cfg(not(windows))]
-fn fold_rel(rel: &str) -> String {
-    rel.to_string()
+    if CASE_INSENSITIVE_FS {
+        rel.to_lowercase()
+    } else {
+        rel.to_string()
+    }
 }
 
 /// Walk `root` and remove any file whose relative path is not present in
@@ -1479,13 +1484,14 @@ async fn prune_destination(
                 match keep.status(&rel_str) {
                     KeepStatus::Exact => {}
                     KeepStatus::CaseDrift(source_rel) => {
-                        // NTFS is case-insensitive but case-*preserving*, so
-                        // when the user re-cases a source file the copy loop
-                        // writes through to the existing directory entry and
-                        // leaves the old spelling on disk. prune then failed
-                        // to find that spelling in `keep` and deleted the
-                        // file it had just copied — the backup silently lost
-                        // it until the following run. Re-spell instead.
+                        // NTFS and APFS are case-insensitive but case-
+                        // *preserving*, so when the user re-cases a source
+                        // file the copy loop writes through to the existing
+                        // directory entry and leaves the old spelling on
+                        // disk. prune then failed to find that spelling in
+                        // `keep` and deleted the file it had just copied —
+                        // the backup silently lost it until the following
+                        // run. Re-spell instead.
                         recase_entry(&path, source_rel, stats).await;
                     }
                     KeepStatus::Absent => {
@@ -1601,9 +1607,12 @@ pub(crate) fn is_icon_descriptor(rel_str: &str) -> bool {
 /// lookup rules the prune pass needs.
 pub(crate) struct KeepSet {
     exact: HashSet<String>,
-    /// Windows only: lowercased relative path -> the source's own spelling.
-    #[cfg(windows)]
-    by_lowercase: std::collections::HashMap<String, String>,
+    /// Case-folding filesystems only: folded relative path -> the source's own
+    /// spelling. Left empty elsewhere rather than `cfg`-ed away, so that the
+    /// lookup below reads the same on every platform — an empty map simply
+    /// never reports drift. Building it for a 100k-file tree that can never
+    /// drift would still be a waste, hence the guard in `new`.
+    folded: std::collections::HashMap<String, String>,
 }
 
 pub(crate) enum KeepStatus<'a> {
@@ -1619,24 +1628,19 @@ pub(crate) enum KeepStatus<'a> {
 impl KeepSet {
     pub(crate) fn new(rels: impl Iterator<Item = String>) -> Self {
         let exact: HashSet<String> = rels.collect();
-        #[cfg(windows)]
-        let by_lowercase = exact
-            .iter()
-            .map(|r| (r.to_lowercase(), r.clone()))
-            .collect();
-        Self {
-            exact,
-            #[cfg(windows)]
-            by_lowercase,
-        }
+        let folded = if CASE_INSENSITIVE_FS {
+            exact.iter().map(|r| (fold_rel(r), r.clone())).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        Self { exact, folded }
     }
 
     pub(crate) fn status(&self, rel: &str) -> KeepStatus<'_> {
         if self.exact.contains(rel) {
             return KeepStatus::Exact;
         }
-        #[cfg(windows)]
-        if let Some(source_rel) = self.by_lowercase.get(&rel.to_lowercase()) {
+        if let Some(source_rel) = self.folded.get(&fold_rel(rel)) {
             return KeepStatus::CaseDrift(source_rel);
         }
         KeepStatus::Absent
@@ -2416,7 +2420,7 @@ mod tests {
     /// A folder the user re-cased at source keeps the destination's stale
     /// spelling forever: 1.5 stopped prune from *deleting* files through the
     /// drifted directory, and 1.6 actually re-spells the directory entry.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn execute_respells_a_recased_directory_at_the_destination() {
         let root = tempfile::tempdir().unwrap();
@@ -2473,7 +2477,7 @@ mod tests {
 
     /// Multi-level drift: every re-cased component of the path gets its
     /// source spelling back, not just the deepest one.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn execute_respells_nested_recased_directories() {
         let root = tempfile::tempdir().unwrap();
@@ -2938,12 +2942,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The user re-cases a source file (`readme.md` -> `README.md`). NTFS is
-    /// case-preserving, so the copy loop writes through the existing entry
-    /// and the destination keeps the old spelling. prune used to miss that
-    /// spelling in `keep` and delete the file it had just copied, leaving
+    /// The user re-cases a source file (`readme.md` -> `README.md`). NTFS and
+    /// APFS are case-preserving, so the copy loop writes through the existing
+    /// entry and the destination keeps the old spelling. prune used to miss
+    /// that spelling in `keep` and delete the file it had just copied, leaving
     /// the backup incomplete for a whole run while still reporting success.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn prune_recases_instead_of_deleting_on_case_only_rename() {
         let root = scratch("prune-case-drift");
@@ -2964,8 +2968,8 @@ mod tests {
         .await
         .unwrap();
 
-        // exists() is case-insensitive on Windows, so check the actual
-        // directory entry to prove the spelling was corrected.
+        // exists() is case-insensitive on both these filesystems, so check
+        // the actual directory entry to prove the spelling was corrected.
         let names: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())

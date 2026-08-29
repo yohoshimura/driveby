@@ -54,15 +54,15 @@ impl PatternSet {
                 };
                 // A pattern that doesn't compile is dropped rather than
                 // failing the run, matching the pre-1.5 behaviour.
-                // Windows filenames are case-insensitive, and this same set
-                // is consulted by the source walk *and* by the prune pass.
+                // NTFS and APFS filenames are case-insensitive, and this same
+                // set is consulted by the source walk *and* by the prune pass.
                 // A case-sensitive pattern agrees with itself only as long
                 // as both sides see the same spelling: re-case a folder in
                 // the source and `raw` stops it being copied while `RAW` at
                 // the destination no longer looks protected, so prune wipes
                 // the subtree (#R6).
                 regex::RegexBuilder::new(&glob_to_regex(body))
-                    .case_insensitive(cfg!(windows))
+                    .case_insensitive(crate::fsutil::CASE_INSENSITIVE_FS)
                     .build()
                     .ok()
                     .map(|re| (re, negated))
@@ -101,15 +101,24 @@ mod tests {
 
     /// The same PatternSet is consulted by the source walk and by the prune
     /// pass, which see the source and destination spellings respectively.
-    /// On Windows those differ after a re-case, and a case-sensitive match
-    /// meant prune deleted a subtree the user had excluded (#R6).
-    #[cfg(windows)]
+    /// On NTFS and APFS those differ after a re-case, and a case-sensitive
+    /// match meant prune deleted a subtree the user had excluded (#R6).
+    ///
+    /// Asserted against the constant rather than skipped off-Windows, so the
+    /// Linux job also pins the case-*sensitive* half of the contract: there,
+    /// `RAW` genuinely is a different folder and must not be excluded by a
+    /// pattern that says `raw`.
     #[test]
-    fn patterns_ignore_case_on_windows() {
+    fn patterns_ignore_case_exactly_where_the_filesystem_does() {
         let set = PatternSet::from_input("raw");
         assert!(set.matches("raw"), "the source spelling excludes");
-        assert!(set.matches("RAW"), "the destination spelling must too");
-        assert!(set.matches("Photos/Raw"), "and at depth");
+        let folds = crate::fsutil::CASE_INSENSITIVE_FS;
+        assert_eq!(
+            set.matches("RAW"),
+            folds,
+            "the destination spelling must too, on a folding filesystem"
+        );
+        assert_eq!(set.matches("Photos/Raw"), folds, "and at depth");
     }
 
     fn set(patterns: &[&str]) -> PatternSet {
