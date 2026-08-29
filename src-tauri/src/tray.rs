@@ -33,8 +33,6 @@ impl UiFlags {
 /// close-to-tray is on: it is the only route back to a hidden window, and
 /// creating/destroying it as a setting changes is where the platform bugs
 /// live.
-// TODO(macOS): pair this with ActivationPolicy::Accessory so a
-// tray-only session can drop the dock icon.
 pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // Labels stay English and unqualified: the menu would have to be rebuilt
     // on every language change to localize it, and the tray icon already
@@ -73,11 +71,42 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
+/// macOS only: match the Dock tile to whether there is a window to go back to.
+///
+/// A session living behind the tray icon alone is what `Accessory` describes —
+/// no Dock tile, no menu bar of its own — and leaving driveby `Regular` while
+/// hidden puts a tile in the Dock that answers no click, since there is no
+/// window for it to raise. The other platforms have no equivalent: a Windows
+/// taskbar button belongs to a window and goes with it, and this is a no-op
+/// there.
+///
+/// Called *before* showing rather than after: an `Accessory` app cannot become
+/// the active application, so a `set_focus` issued while the policy still says
+/// `Accessory` raises the window without giving it the keyboard.
+pub fn set_dock_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if visible {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        };
+        if let Err(e) = app.set_activation_policy(policy) {
+            warn!("tray: could not set activation policy: {}", e);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, visible);
+    }
+}
+
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else {
         warn!("tray: no main window to show");
         return;
     };
+    set_dock_visible(app, true);
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
