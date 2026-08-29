@@ -8,6 +8,26 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 // ─────────────────────────────────────────────────────────────────────
+// Case-folding filesystems
+// ─────────────────────────────────────────────────────────────────────
+
+/// Whether this target's usual filesystem compares filenames case-
+/// insensitively while storing the spelling it was given. NTFS and APFS both
+/// do; ext4 and friends do not.
+///
+/// Everything that has to reconcile a *source* spelling with a *destination*
+/// spelling keys off this one constant instead of repeating a platform list.
+/// Three places quietly disagreeing about it is what made #R6 possible — an
+/// excluded folder deleted from the backup because the exclude matched the
+/// source's casing and the prune pass saw the destination's.
+///
+/// Both filesystems are configurable — NTFS per directory, APFS per volume —
+/// so `true` describes the default, not a guarantee. Every reader of it is
+/// written to stay correct on a case-sensitive volume anyway: the extra
+/// lookups simply never find a second spelling.
+pub const CASE_INSENSITIVE_FS: bool = cfg!(any(windows, target_os = "macos"));
+
+// ─────────────────────────────────────────────────────────────────────
 // Extended-length paths
 // ─────────────────────────────────────────────────────────────────────
 
@@ -141,41 +161,126 @@ pub fn clear_readonly(p: &Path) {
     set_attrs(p, attrs & !ATTR_READONLY);
 }
 
-/// The exact on-disk spelling of `p`'s final component, resolved
-/// case-insensitively — i.e. what the directory entry is actually called,
-/// as opposed to what the caller spelled it as. None if the entry does not
-/// exist (or `p` has no final component, e.g. a drive root).
-#[cfg(windows)]
-pub fn on_disk_name(p: &Path) -> Option<std::ffi::OsString> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
-    let lp = long_path(p);
-    let wide: Vec<u16> = lp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-    unsafe { FindClose(handle) };
-    let len = data
-        .cFileName
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(data.cFileName.len());
-    Some(std::ffi::OsString::from_wide(&data.cFileName[..len]))
+/// Answers "what is this directory entry *actually* called?" — the on-disk
+/// spelling of a path's final component, as opposed to the spelling the
+/// caller used to reach it. None when the entry does not exist under any
+/// casing, when `p` has no final component (a drive root), or when the answer
+/// would be a guess.
+///
+/// It is a struct rather than a free function because the two platforms
+/// answer at very different prices. Windows resolves one path with one
+/// `FindFirstFileW`. Everywhere else the only portable answer is to list the
+/// parent — and `recase_dirs_phase` asks about every directory in the tree,
+/// so a parent holding ten thousand of them would be listed ten thousand
+/// times, quadratic in the width of the tree. Listings are therefore memoized
+/// by parent, which brings the whole pass back down to one walk of the
+/// destination. Windows has nothing to memoize and holds no state.
+///
+/// Each entry is asked about once, so a listing going stale behind a rename
+/// this pass performs itself is never consulted again.
+#[derive(Default)]
+pub struct NameResolver {
+    #[cfg(not(windows))]
+    listings: std::collections::HashMap<PathBuf, DirNames>,
 }
 
-// TODO(macOS): APFS is case-insensitive by default too — give this a
-// readdir-based lookup (and extend KeepSet::by_lowercase) when directory
-// recasing is brought to macOS.
+#[cfg(windows)]
+impl NameResolver {
+    pub fn on_disk_name(&mut self, p: &Path) -> Option<std::ffi::OsString> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+        let lp = long_path(p);
+        let wide: Vec<u16> = lp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        unsafe { FindClose(handle) };
+        let len = data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(data.cFileName.len());
+        Some(std::ffi::OsString::from_wide(&data.cFileName[..len]))
+    }
+}
+
 #[cfg(not(windows))]
-pub fn on_disk_name(_p: &Path) -> Option<std::ffi::OsString> {
-    None
+impl NameResolver {
+    // Compiled on Linux as well as macOS, though only macOS reaches it in a
+    // real run: it is what lets the Linux CI job exercise the lookup that the
+    // macOS bundle depends on, on a runner that actually exists.
+    pub fn on_disk_name(&mut self, p: &Path) -> Option<std::ffi::OsString> {
+        let name = p.file_name()?;
+        let parent = p.parent()?;
+        if !self.listings.contains_key(parent) {
+            // An unreadable parent caches as empty on purpose: the answer is
+            // "no idea", and repeating a failing syscall per child would not
+            // improve on it.
+            let names = DirNames::read(parent).unwrap_or_default();
+            self.listings.insert(parent.to_path_buf(), names);
+        }
+        self.listings.get(parent)?.get(name)
+    }
+}
+
+/// One directory's entries, indexed both ways.
+///
+/// `exact` is consulted first, and that ordering is the whole safety story on
+/// a case-*sensitive* APFS volume — which macOS will happily format. Asked
+/// about `Foo` while both `Foo` and `foo` exist, it answers `Foo`, so the
+/// caller sees no drift and renames nothing. Only a spelling that is on disk
+/// under neither casing falls through to `folded`, and a fold that two
+/// entries share is deliberately unanswerable: renaming one onto the other
+/// would destroy a file.
+///
+/// Names are folded with plain lowercasing, which is what the Windows side
+/// has always done. It does not normalise Unicode, so a name stored decomposed
+/// (HFS+ did this to every filename) will not fold onto its composed
+/// spelling. That reads as "no match", the caller leaves the entry alone, and
+/// the old spelling survives — exactly what happens today.
+#[cfg(not(windows))]
+#[derive(Default)]
+struct DirNames {
+    exact: std::collections::HashSet<std::ffi::OsString>,
+    /// Folded name -> the sole entry that folds to it, or None when several
+    /// do and no rename can be safely inferred.
+    folded: std::collections::HashMap<String, Option<std::ffi::OsString>>,
+}
+
+#[cfg(not(windows))]
+impl DirNames {
+    fn read(dir: &Path) -> Option<Self> {
+        let mut out = Self::default();
+        for entry in std::fs::read_dir(dir).ok()? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            // readdir never yields the same name twice, so an occupied slot
+            // is always a genuine second spelling.
+            out.folded
+                .entry(name.to_string_lossy().to_lowercase())
+                .and_modify(|slot| *slot = None)
+                .or_insert_with(|| Some(name.clone()));
+            out.exact.insert(name);
+        }
+        Some(out)
+    }
+
+    fn get(&self, want: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        if self.exact.contains(want) {
+            return Some(want.to_os_string());
+        }
+        self.folded
+            .get(&want.to_string_lossy().to_lowercase())
+            .cloned()
+            .flatten()
+    }
 }
 
 #[cfg(not(windows))]
@@ -193,14 +298,14 @@ pub fn clear_readonly(_p: &Path) {}
 // Source / destination overlap rejection
 // ─────────────────────────────────────────────────────────────────────
 
-/// True if `child` equals or is nested under `parent` (case-insensitive on
-/// Windows). Both inputs must be absolute. Falls back to lossy string compare
-/// if the paths can't be canonicalised yet (e.g. the destination doesn't
-/// exist) — callers validate existence first. Critically: on Windows,
-/// `canonicalize()` prepends `\\?\` to existing paths but not to non-existing
-/// ones, so we strip that prefix on both sides before comparing — otherwise
-/// an existing parent would never appear to "contain" a not-yet-created child
-/// even when it lexically does.
+/// True if `child` equals or is nested under `parent` (case-insensitively
+/// where the filesystem is). Both inputs must be absolute. Falls back to a
+/// lossy string compare if the paths can't be canonicalised yet (e.g. the
+/// destination doesn't exist) — callers validate existence first. Critically:
+/// on Windows, `canonicalize()` prepends `\\?\` to existing paths but not to
+/// non-existing ones, so we strip that prefix on both sides before comparing
+/// — otherwise an existing parent would never appear to "contain" a
+/// not-yet-created child even when it lexically does.
 pub fn path_contains(parent: &Path, child: &Path) -> bool {
     let p = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     let c = std::fs::canonicalize(child).unwrap_or_else(|_| child.to_path_buf());
@@ -234,7 +339,17 @@ fn normalize_for_compare(p: &Path) -> String {
 
 #[cfg(not(windows))]
 fn normalize_for_compare(p: &Path) -> String {
-    p.to_string_lossy().to_string()
+    let s = p.to_string_lossy();
+    // Folded on APFS for the same reason the Windows arm folds on NTFS, and
+    // the stakes here are the highest in the crate: `/Volumes/D/Photos` and
+    // `/Volumes/D/photos` are one directory, so an overlap that goes unspotted
+    // is a restore whose `File::create` truncates the very file it is about to
+    // read — every file in the backup emptied, and the run reporting success.
+    if CASE_INSENSITIVE_FS {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Reject any nesting between a read side and a write side.
@@ -321,19 +436,70 @@ mod tests {
         p
     }
 
-    #[cfg(windows)]
     #[test]
     fn on_disk_name_reports_the_real_spelling() {
         let root = make_test_dir("on-disk-name");
         let dir = root.join("MixedCase");
-        let _ = std::fs::remove_dir(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Query with the wrong case: the answer is what's actually on disk.
+        let mut names = NameResolver::default();
+        // The spelling that is on disk always resolves to itself, everywhere.
         assert_eq!(
-            on_disk_name(&root.join("mixedcase")).unwrap(),
+            names.on_disk_name(&dir).unwrap(),
             std::ffi::OsStr::new("MixedCase")
         );
-        assert!(on_disk_name(&root.join("absent")).is_none());
+        assert!(names.on_disk_name(&root.join("absent")).is_none());
+        // Asked with the wrong case, a case-folding filesystem still finds it
+        // and reports what the entry is really called — which is the whole
+        // point of the lookup. A case-sensitive one correctly finds nothing.
+        let wrong_case = names.on_disk_name(&root.join("mixedcase"));
+        if CASE_INSENSITIVE_FS {
+            assert_eq!(wrong_case.unwrap(), std::ffi::OsStr::new("MixedCase"));
+        } else {
+            assert!(wrong_case.is_none());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two entries that differ only in case can exist only on a case-sensitive
+    /// volume — Linux here, but macOS will format APFS that way on request,
+    /// which is why the guard exists at all. Renaming one onto the other would
+    /// destroy a file, so an ambiguous fold must refuse to answer, while an
+    /// exact hit must still be reported.
+    #[test]
+    fn on_disk_name_refuses_an_ambiguous_fold() {
+        if CASE_INSENSITIVE_FS {
+            return; // the fixture cannot be built here
+        }
+        let root = make_test_dir("on-disk-ambiguous");
+        std::fs::create_dir_all(root.join("Foo")).unwrap();
+        std::fs::create_dir_all(root.join("foo")).unwrap();
+        let mut names = NameResolver::default();
+        assert_eq!(
+            names.on_disk_name(&root.join("Foo")).unwrap(),
+            std::ffi::OsStr::new("Foo"),
+            "an exact spelling answers for itself"
+        );
+        assert!(
+            names.on_disk_name(&root.join("FOO")).is_none(),
+            "a fold two entries share must not pick one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The memoized listing must not go stale in the direction that matters:
+    /// a second question about the same parent has to be answered from the
+    /// cache, and a question about a different parent must still be read.
+    #[test]
+    fn on_disk_name_caches_per_parent() {
+        let root = make_test_dir("on-disk-cache");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        std::fs::create_dir_all(root.join("two/deep")).unwrap();
+        let mut names = NameResolver::default();
+        assert!(names.on_disk_name(&root.join("one")).is_some());
+        assert!(names.on_disk_name(&root.join("two")).is_some());
+        assert!(names.on_disk_name(&root.join("two/deep")).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -388,6 +554,24 @@ mod tests {
         // every file it is about to read.
         let d = make_test_dir("overlap-same");
         assert!(reject_overlap(&d, &d).is_err());
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    /// The same folder spelled two ways is still the same folder on NTFS and
+    /// APFS, and this is the check standing between a restore and
+    /// `File::create` truncating the file it is about to read. Before
+    /// `CASE_INSENSITIVE_FS` the fold was `cfg(windows)`, so a Mac accepted
+    /// `~/Photos` against `~/photos` as two unrelated folders.
+    #[test]
+    fn reject_overlap_folds_case_where_the_filesystem_does() {
+        let d = make_test_dir("overlap-case");
+        let shouty = d.with_file_name(d.file_name().unwrap().to_string_lossy().to_uppercase());
+        assert_eq!(
+            reject_overlap(&d, &shouty).is_err(),
+            CASE_INSENSITIVE_FS,
+            "one directory under two spellings must be rejected exactly where \
+             the filesystem considers them one"
+        );
         let _ = std::fs::remove_dir(&d);
     }
 
