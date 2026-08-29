@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.7.3
+
+The Mac build has been published since 1.7.0 and had never been tested. Three
+defects were waiting there, and all three are the same oversight: the code
+asked "is this Windows?" when the question it meant was "does this filesystem
+ignore case?".
+
+**A backup on a Mac could delete the folder you excluded.** APFS is
+case-insensitive, exactly as NTFS is. Rename a folder's case at the source —
+`raw` to `RAW` — and the destination keeps the old spelling, because a
+case-preserving filesystem writes through the entry it already has. Five
+separate places decided for themselves whether to compare spellings case-
+insensitively, and every one of them answered "no" on a Mac: the exclusion
+matched the source's casing, the prune pass saw the destination's, the
+protection was not recognised, and the subtree went. This is the defect 1.7.0
+fixed on Windows, still live on the platform nobody had run the tests on.
+
+They now read one answer, so the five cannot drift apart again.
+
+**A restore could empty every file it was meant to bring back.** The check
+that refuses a source and destination nested in one another compared paths
+case-sensitively off Windows. On a Mac `~/Photos` and `~/photos` are one
+directory, so the two were accepted as unrelated — and restoring a backup
+onto itself opens each file for writing before reading it.
+
+**Directory re-casing works on a Mac.** The pass that gives a re-cased folder
+its source spelling back never ran there. It does now, resolving a directory's
+real name by reading its parent — memoized per parent, so a folder holding ten
+thousand subdirectories is read once rather than ten thousand times.
+
+**Driveby leaves the Dock when it goes to the menu bar.** Closing to the tray
+left a Dock tile behind for a window that no longer existed, and starting at
+login put one there for an app that deliberately has no window yet. The tile
+now comes and goes with the window.
+
+**The name is spelled Driveby.** A capital D wherever it is shown — window
+title, tray tooltip, sidebar, every string in both languages, the installers.
+Settings, tasks and history stay exactly where they are.
+
+### Behaviour changes worth knowing
+
+- The macOS app bundle and the Windows installers are named `Driveby`. On both
+  systems that is the same path as before, since neither filesystem
+  distinguishes the case — the subject of this whole release. Linux packages
+  genuinely change name, so the README's install commands no longer spell it.
+- CI now builds and tests on macOS alongside Windows and Linux. It caught a
+  defect in this release's own first draft.
+
 ## 1.7.2
 
 Five features, all of them about the same thing: knowing what a backup is about to do, and where it is going.
