@@ -107,6 +107,8 @@ const MESSAGES = {
     'form.aria.remove_destination': 'Remove destination {path}',
     'form.error.dest_overlap': 'Destinations cannot be inside one another',
     'form.error.dest_in_source': 'A destination cannot be inside the source folder',
+    'form.error.dest_foreign': 'That destination overlaps the task “{name}” ({path}). Each task deletes whatever its own source does not have, so the two would erase each other.',
+    'form.error.dest_holds_source': 'That destination contains the source folder of the task “{name}” ({path}). Backing up here would delete the files that task backs up.',
 
     'backup.toast.complete': 'Backup complete',
     'backup.toast.cancelled': 'Backup cancelled',
@@ -335,6 +337,8 @@ const MESSAGES = {
     'form.aria.remove_destination': 'Retirer la destination {path}',
     'form.error.dest_overlap': 'Les destinations ne peuvent pas être imbriquées',
     'form.error.dest_in_source': 'Une destination ne peut pas se trouver dans le dossier source',
+    'form.error.dest_foreign': 'Cette destination recoupe la tâche « {name} » ({path}). Chaque tâche supprime ce que sa propre source ne contient pas : les deux s’effaceraient mutuellement.',
+    'form.error.dest_holds_source': 'Cette destination contient le dossier source de la tâche « {name} » ({path}). Sauvegarder ici supprimerait les fichiers que cette tâche sauvegarde.',
 
     'backup.toast.complete': 'Sauvegarde terminée',
     'backup.toast.cancelled': 'Sauvegarde annulée',

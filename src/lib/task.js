@@ -90,3 +90,31 @@ export function findOverlap(paths, fold = FOLDS_CASE) {
   }
   return null;
 }
+
+/// The first *other task* these destinations collide with, or null.
+///
+/// Mirrors `reject_foreign_overlaps` in src-tauri/src/backup.rs. Each
+/// destination is mirror-pruned against its own task's source, so sharing a
+/// folder with another task is not sharing at all: each run deletes what the
+/// other just wrote and reports it as a successful clean-up. Nesting is the
+/// same thing, and another task's *source* under this destination is worse —
+/// the prune would empty the folder they back up from.
+///
+/// Returns `{ name, path, kind }`, where `kind` is `'destination'` or
+/// `'source'`, so the message can say which of the two it hit.
+export function findForeignOverlap(destinations, otherTasks, fold = FOLDS_CASE) {
+  for (const other of otherTasks ?? []) {
+    for (const mine of destinations) {
+      for (const theirs of taskDestinations(other)) {
+        if (pathContains(mine, theirs, fold) || pathContains(theirs, mine, fold)) {
+          return { name: other?.name ?? '', path: theirs, kind: 'destination' };
+        }
+      }
+      const theirSource = other?.source;
+      if (theirSource && pathContains(mine, theirSource, fold)) {
+        return { name: other?.name ?? '', path: theirSource, kind: 'source' };
+      }
+    }
+  }
+  return null;
+}

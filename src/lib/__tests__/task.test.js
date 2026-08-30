@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { findOverlap, migrateTasks, pathContains, taskDestinations } from '../task';
+import { findForeignOverlap, findOverlap, migrateTasks, pathContains, taskDestinations } from '../task';
 
 describe('taskDestinations', () => {
   test('reads the plural field', () => {
@@ -100,5 +100,43 @@ describe('findOverlap', () => {
 
   test('catches the same folder listed twice under two spellings', () => {
     expect(findOverlap(['D:/a', 'D:\\A\\'], true)).toEqual(['D:/a', 'D:\\A\\']);
+  });
+});
+
+describe('findForeignOverlap', () => {
+  const task = (id, name, source, destinations) => ({ id, name, source, destinations });
+
+  test('catches another task writing to the same folder', () => {
+    const others = [task('b', 'Docs', '/docs', ['/backup'])];
+    expect(findForeignOverlap(['/backup'], others, true))
+      .toEqual({ name: 'Docs', path: '/backup', kind: 'destination' });
+  });
+
+  test('catches nesting in either direction', () => {
+    const outer = [task('b', 'Docs', '/docs', ['/backup'])];
+    expect(findForeignOverlap(['/backup/photos'], outer, true)).not.toBeNull();
+    const inner = [task('b', 'Docs', '/docs', ['/backup/photos'])];
+    expect(findForeignOverlap(['/backup'], inner, true)).not.toBeNull();
+  });
+
+  test('catches a destination that would swallow another task source', () => {
+    const others = [task('b', 'Archive', '/mirror/2024', ['/archive'])];
+    expect(findForeignOverlap(['/mirror'], others, true))
+      .toEqual({ name: 'Archive', path: '/mirror/2024', kind: 'source' });
+  });
+
+  test('allows separate folders on one drive', () => {
+    const others = [task('b', 'Docs', '/docs', ['/backup/docs'])];
+    expect(findForeignOverlap(['/backup/photos'], others, true)).toBeNull();
+  });
+
+  test('reads legacy single-destination tasks too', () => {
+    const legacy = [{ id: 'b', name: 'Old', source: '/docs', destination: '/backup' }];
+    expect(findForeignOverlap(['/backup'], legacy, true)?.name).toBe('Old');
+  });
+
+  test('is null with nothing to compare against', () => {
+    expect(findForeignOverlap(['/backup'], [], true)).toBeNull();
+    expect(findForeignOverlap(['/backup'], undefined, true)).toBeNull();
   });
 });

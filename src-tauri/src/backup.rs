@@ -365,7 +365,15 @@ pub async fn run_backup<R: Runtime>(
     // instead of at the next backup.
     ratelimit::shared().set_rate(settings.max_speed_bytes());
 
-    let result = execute_all(app, &backup_id, &task, &settings, &token).await;
+    // The cross-task check lives here rather than in `execute_all` because
+    // this is the only layer that can see the other tasks at all. Kept inside
+    // the same `result` so that a refusal still unregisters the run below.
+    let result = async {
+        let destinations: Vec<PathBuf> = task.destinations().iter().map(PathBuf::from).collect();
+        reject_foreign_overlaps(&task.id, &destinations, &other_tasks(app, &task.id).await)?;
+        execute_all(app, &backup_id, &task, &settings, &token).await
+    }
+    .await;
 
     // Snapshot cancellation state from the token *before* unregister, so we
     // don't depend on stringly-typed error matching (`err.to_string().contains
@@ -433,6 +441,33 @@ pub async fn run_backup<R: Runtime>(
     info!(task = %task.name, success = payload.success, "emitting backup-complete");
     let _ = app.emit("backup-complete", payload.clone());
     Ok(payload)
+}
+
+/// Every task on disk except this one, for the cross-task overlap check.
+///
+/// Deserialised one element at a time rather than as a `Vec<Task>`: serde
+/// abandons the whole array at the first bad element, so a single hand-edited
+/// or downgrade-written task would leave this check with nothing to compare
+/// against — silently disabling the guard in exactly the situation where the
+/// file is in a state nobody has reviewed.
+///
+/// Not being able to read the list at all yields no others, which is
+/// deliberately fail-open: an unreadable tasks.json must not make every backup
+/// refuse to start.
+async fn other_tasks<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Vec<Task> {
+    let Ok(dir) = app.path().app_data_dir() else {
+        return Vec::new();
+    };
+    let value: serde_json::Value =
+        persist::read_json_or(&dir.join("tasks.json"), serde_json::Value::Array(vec![])).await;
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|v| serde_json::from_value::<Task>(v.clone()).ok())
+        .filter(|t| t.id != task_id)
+        .collect()
 }
 
 async fn update_last_backup<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Result<()> {
@@ -669,6 +704,59 @@ async fn preflight_destination(destination: &Path) -> Result<()> {
 ///
 /// Fatal for the entire run rather than per destination, because the damage
 /// would be done by the destination that looks perfectly healthy.
+/// Reject a destination that another task already reads from or writes to.
+///
+/// Every destination is mirror-pruned against *this* task's source: whatever
+/// sits under it that the source does not have is deleted. Another task's
+/// backup living there is therefore not merely shared — it is removed file by
+/// file and counted as a successful clean-up. The two tasks then take turns
+/// destroying each other, both reporting success on every run, and the history
+/// stays green while neither backup ever survives a full cycle.
+///
+/// Nothing caught this before: `reject_destination_overlaps` only ever saw one
+/// task's own list, `BackupState::try_register` keys the concurrency guard on
+/// the task id so both runs start, and the form's `findOverlap` is per-task too.
+///
+/// Another task's *source* under my destination is the same hazard wearing a
+/// worse hat — my prune would delete the files they back up from. Checked here
+/// as well, and by symmetry: every task runs this against every other, so the
+/// mirror case (my source under their destination) is caught when they run.
+pub(crate) fn reject_foreign_overlaps(
+    task_id: &str,
+    destinations: &[PathBuf],
+    others: &[Task],
+) -> Result<()> {
+    for other in others.iter().filter(|o| o.id != task_id) {
+        let their_source = PathBuf::from(&other.source);
+        let their_destinations: Vec<PathBuf> =
+            other.destinations().iter().map(PathBuf::from).collect();
+        for mine in destinations {
+            for theirs in &their_destinations {
+                if path_contains(mine, theirs) || path_contains(theirs, mine) {
+                    return Err(anyhow!(
+                        "Destination {} overlaps the task \"{}\", which backs up to {}. \
+                         Each task deletes whatever its own source does not have, so the \
+                         two would erase each other's backups.",
+                        mine.display(),
+                        other.name,
+                        theirs.display()
+                    ));
+                }
+            }
+            if path_contains(mine, &their_source) {
+                return Err(anyhow!(
+                    "Destination {} contains the source folder of the task \"{}\" ({}). \
+                     Backing up here would delete the files that task backs up.",
+                    mine.display(),
+                    other.name,
+                    their_source.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn reject_destination_overlaps(source: &Path, destinations: &[PathBuf]) -> Result<()> {
     for (i, dest) in destinations.iter().enumerate() {
         reject_overlap(source, dest)?;
@@ -2420,6 +2508,74 @@ mod tests {
     /// A folder the user re-cased at source keeps the destination's stale
     /// spelling forever: 1.5 stopped prune from *deleting* files through the
     /// drifted directory, and 1.6 actually re-spells the directory entry.
+    fn task_at(id: &str, source: &str, destinations: &[&str]) -> Task {
+        Task {
+            id: id.to_string(),
+            name: id.to_string(),
+            source: source.to_string(),
+            destination: None,
+            destinations: Some(destinations.iter().map(|d| d.to_string()).collect()),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        }
+    }
+
+    /// Two tasks pointed at one folder used to mirror-prune each other. Run A
+    /// wrote its files, run B deleted every one of them as "not in my source",
+    /// counted them in `cleaned`, and reported success — then A's next run did
+    /// the same to B. Both histories stayed green while neither backup ever
+    /// survived a cycle.
+    #[test]
+    fn a_destination_another_task_writes_to_is_refused() {
+        let others = vec![task_at("B", "/docs", &["/backup"])];
+        let err = reject_foreign_overlaps("A", &[PathBuf::from("/backup")], &others)
+            .expect_err("sharing one folder must be refused");
+        assert!(
+            err.to_string().contains('B'),
+            "the message has to name the other task: {}",
+            err
+        );
+    }
+
+    /// Nesting is the same hazard: the outer task's prune walks into the
+    /// inner one's folder and deletes everything the outer source lacks.
+    #[test]
+    fn a_destination_nested_in_another_tasks_destination_is_refused() {
+        let others = vec![task_at("B", "/docs", &["/backup"])];
+        assert!(reject_foreign_overlaps("A", &[PathBuf::from("/backup/photos")], &others).is_err());
+        // …and the other way round.
+        let others = vec![task_at("B", "/docs", &["/backup/photos"])];
+        assert!(reject_foreign_overlaps("A", &[PathBuf::from("/backup")], &others).is_err());
+    }
+
+    /// My prune deletes whatever my source does not have — so another task's
+    /// *source* under my destination is a folder I would empty out.
+    #[test]
+    fn a_destination_holding_another_tasks_source_is_refused() {
+        let others = vec![task_at("B", "/mirror/2024", &["/archive"])];
+        let err = reject_foreign_overlaps("A", &[PathBuf::from("/mirror")], &others)
+            .expect_err("this would delete what B backs up from");
+        assert!(err.to_string().contains("source"), "{}", err);
+    }
+
+    /// The normal way to use one drive for several tasks: separate folders
+    /// under a shared parent. Siblings never overlap and must stay allowed.
+    #[test]
+    fn separate_folders_on_one_drive_are_allowed() {
+        let others = vec![task_at("B", "/docs", &["/backup/docs"])];
+        assert!(reject_foreign_overlaps("A", &[PathBuf::from("/backup/photos")], &others).is_ok());
+    }
+
+    /// A task is not its own foreigner — re-running one must not trip on the
+    /// destinations it already owns.
+    #[test]
+    fn a_task_does_not_overlap_itself() {
+        let others = vec![task_at("A", "/photos", &["/backup"])];
+        assert!(reject_foreign_overlaps("A", &[PathBuf::from("/backup")], &others).is_ok());
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn execute_respells_a_recased_directory_at_the_destination() {

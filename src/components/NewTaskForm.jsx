@@ -4,7 +4,7 @@ import FormField from './common/FormField';
 import { bridge } from '../lib/tauri';
 import { useT } from '../hooks/useT';
 import { useFormat } from '../hooks/useFormat';
-import { findOverlap, pathContains, taskDestinations } from '../lib/task';
+import { findForeignOverlap, findOverlap, pathContains, taskDestinations } from '../lib/task';
 import {
   DEFAULT_SCHEDULE_TIME,
   WEEKDAY_INDEXES,
@@ -21,7 +21,7 @@ const INITIAL = {
   scheduleTime: DEFAULT_SCHEDULE_TIME,
 };
 
-export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, initialTask, dataState }) {
+export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, initialTask, dataState, otherTasks = [] }) {
   const t = useT();
   const { formatTime, formatWeekdays } = useFormat();
   const isEdit = !!initialTask;
@@ -108,6 +108,15 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     if (findOverlap(task.destinations)) return showToast?.(t('form.error.dest_overlap'), 'error');
     if (task.destinations.some((d) => pathContains(task.source, d) || pathContains(d, task.source))) {
       return showToast?.(t('form.error.dest_in_source'), 'error');
+    }
+    // Sharing a folder with another task is not sharing: each run mirror-prunes
+    // the folder against its own source and deletes what the other just wrote,
+    // reporting it as a clean-up. The backend refuses such a run outright; this
+    // says so at the point the folder is picked, while it is still a choice.
+    const foreign = findForeignOverlap(task.destinations, otherTasks);
+    if (foreign) {
+      const key = foreign.kind === 'source' ? 'form.error.dest_holds_source' : 'form.error.dest_foreign';
+      return showToast?.(t(key, { name: foreign.name, path: foreign.path }), 'error');
     }
     // Resolve the default here rather than leaving the list empty: an edit
     // saved with nothing picked used to store a blank destination, and the

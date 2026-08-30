@@ -53,6 +53,9 @@ export default function Home() {
           key={renderEditing ? renderEditing.id : 'new'}
           initialTask={renderEditing}
           dataState={formAnim}
+          // Everything the new destination could collide with. The task being
+          // edited is excluded: it does not overlap itself.
+          otherTasks={tasks.filter((other) => other.id !== renderEditing?.id)}
           onAdd={(draft) => {
             const ok = addTask(draft);
             if (ok) {
