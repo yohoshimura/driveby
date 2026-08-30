@@ -59,6 +59,27 @@ fn close_to_tray_of(settings: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The speed ceiling in bytes per second, read through `Settings` rather than
+/// off the JSON directly so that the awkward values a hand-edited file can
+/// hold — negative, NaN, infinity — are all rejected the one way they are
+/// rejected everywhere else.
+fn max_speed_bytes_of(settings: &Value) -> u64 {
+    serde_json::from_value::<Settings>(settings.clone())
+        .unwrap_or_default()
+        .max_speed_bytes()
+}
+
+/// Push the ceiling into the process-wide limiter.
+///
+/// `run_backup` sets it too, from the settings it was handed — but that only
+/// covers a ceiling chosen *before* a run starts. The setting exists so the
+/// machine stays usable while a backup runs, which means the moment it is
+/// most likely to be changed is halfway through one. Mirrored here for the
+/// same reason `closeToTray` is: the live state has to follow the file.
+fn apply_speed_ceiling(settings: &Value) {
+    ratelimit::shared().set_rate(max_speed_bytes_of(settings));
+}
+
 #[tauri::command]
 async fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
     let path = data_path(&app, "settings.json")?;
@@ -73,6 +94,7 @@ async fn save_settings(
 ) -> Result<(), String> {
     let path = data_path(&app, "settings.json")?;
     flags.set_close_to_tray(close_to_tray_of(&settings));
+    apply_speed_ceiling(&settings);
     persist::write_json_atomic(&path, &settings)
         .await
         .map_err(|e| e.to_string())
@@ -260,6 +282,7 @@ fn main() {
                     handle
                         .state::<UiFlags>()
                         .set_close_to_tray(close_to_tray_of(&settings));
+                    apply_speed_ceiling(&settings);
                 }
             });
 
@@ -300,4 +323,49 @@ fn main() {
     builder
         .run(tauri::generate_context!())
         .expect("Tauri runtime failed to start (check logs in app_log_dir/driveby.log)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ceiling is read out of the same JSON the frontend writes, so the
+    /// camelCase key has to survive the round trip. A rename mismatch here
+    /// would not fail loudly — it would silently read `None` and mean "no
+    /// ceiling" for ever, which is exactly the setting being off.
+    #[test]
+    fn the_ceiling_is_read_from_the_key_the_ui_writes() {
+        let settings = serde_json::json!({ "maxSpeedMbps": 5.0 });
+        assert_eq!(max_speed_bytes_of(&settings), 5 * 1024 * 1024);
+    }
+
+    /// Every way of saying "no ceiling", including the ones a hand-edited
+    /// settings.json can produce. `Settings::max_speed_bytes` owns these
+    /// rules; this pins that the JSON path really goes through it rather
+    /// than re-deriving them.
+    #[test]
+    fn absent_and_absurd_ceilings_all_mean_no_ceiling() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "maxSpeedMbps": 0 }),
+            serde_json::json!({ "maxSpeedMbps": -5.0 }),
+            serde_json::json!({ "maxSpeedMbps": null }),
+        ] {
+            assert_eq!(max_speed_bytes_of(&value), 0, "for {}", value);
+        }
+    }
+
+    /// A settings file whose types are wrong must not read as a tiny
+    /// ceiling that would stall every copy — it reads as no ceiling.
+    #[test]
+    fn an_unparseable_settings_object_leaves_the_ceiling_off() {
+        let settings = serde_json::json!({ "maxSpeedMbps": "fast" });
+        assert_eq!(max_speed_bytes_of(&settings), 0);
+    }
+
+    #[test]
+    fn close_to_tray_defaults_to_off() {
+        assert!(!close_to_tray_of(&serde_json::json!({})));
+        assert!(close_to_tray_of(&serde_json::json!({ "closeToTray": true })));
+    }
 }

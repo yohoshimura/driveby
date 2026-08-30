@@ -121,7 +121,7 @@ impl Settings {
     /// A missing, zero, negative or NaN value is "no ceiling"; the `as`
     /// cast saturates, so an absurd number is simply a very high ceiling
     /// rather than a wrapped-around tiny one.
-    fn max_speed_bytes(&self) -> u64 {
+    pub fn max_speed_bytes(&self) -> u64 {
         match self.max_speed_mbps {
             Some(mbps) if mbps > 0.0 => (mbps * 1024.0 * 1024.0) as u64,
             _ => 0,
