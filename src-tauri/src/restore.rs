@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 /// Cooperative-cancellation sentinel, same convention as the backup
 /// pipeline's: the inner loop short-circuits with this message and the
@@ -163,7 +164,8 @@ async fn restore<R: Runtime>(
     // Restore → pick the backup folder as the destination).
     reject_overlap(&backup_path, &destination)?;
 
-    let files = walk(&backup_path).await?;
+    let mut tree = walk(&backup_path).await?;
+    let files = &tree.files;
     let total_files = files.len() as u64;
     let total_bytes: u64 = files.iter().map(|(_, _, size)| *size).sum();
 
@@ -174,7 +176,7 @@ async fn restore<R: Runtime>(
     // per-file emit flooded the webview on trees of small files.
     let mut last_emit = Instant::now();
 
-    for (rel, src, size) in &files {
+    for (rel, src, size) in files {
         let dst = long_path(&destination.join(rel));
         if let Err(e) = restore_one(src, &dst, token).await {
             return Ok(RestorePayload {
@@ -196,6 +198,10 @@ async fn restore<R: Runtime>(
             emit_progress(app, copied_files, total_files, copied_bytes, total_bytes);
         }
     }
+
+    // After the files: the directories that hold none of them, and the folder
+    // attributes no file can carry.
+    restore_dirs(&mut tree.dirs, &destination, token).await;
 
     // Unconditional final emit so the UI lands on 100% even when the
     // throttle swallowed the last in-loop event.
@@ -241,8 +247,20 @@ fn emit_progress<R: Runtime>(
 // Returns (relative path, absolute source path, size). Surfaces I/O errors
 // instead of silently truncating the iteration like the v1.1.0 walker did
 // (#6) — a missed file in a "successful" restore is a quiet data-loss bug.
-async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
+/// What the backup folder holds.
+///
+/// Directories are carried alongside the files because the file loop cannot
+/// account for all of them: `create_dir_all` on a file's parent brings back
+/// every directory that contains something, and no others. An empty one has
+/// nothing to bring it into being and simply never arrived.
+struct Tree {
+    files: Vec<(String, PathBuf, u64)>,
+    dirs: Vec<(String, PathBuf)>,
+}
+
+async fn walk(root: &Path) -> Result<Tree> {
     let mut out = Vec::new();
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     // Extended-length form throughout, so a backup of a deep tree — which
     // the backup pipeline handles fine — is also restorable.
     let root = long_path(root);
@@ -266,22 +284,63 @@ async fn walk(root: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
             if ft.is_symlink() {
                 continue;
             }
+            let rel_str = match path.strip_prefix(root) {
+                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
             if ft.is_dir() {
+                dirs.push((rel_str, path.clone()));
                 stack.push(path);
             } else if ft.is_file() {
                 let meta = fs::metadata(&path)
                     .await
                     .with_context(|| format!("metadata {}", path.display()))?;
-                let rel = match path.strip_prefix(root) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
                 out.push((rel_str, path.clone(), meta.len()));
             }
         }
     }
-    Ok(out)
+    Ok(Tree { files: out, dirs })
+}
+
+/// Recreate the backup's directories at the destination and give them their
+/// attributes back.
+///
+/// Two things the file loop cannot do on its own.
+///
+/// An empty directory has no file to bring it into being, so it never
+/// arrived at all — the restored tree quietly had fewer folders than the
+/// backup it came from.
+///
+/// And a custom folder icon needs *both* halves: the `desktop.ini` and the
+/// System or ReadOnly bit on the folder holding it. `copy` restores the file's
+/// attributes and says it does so "the way the backup pipeline does" — but the
+/// backup pipeline also has `mirror_dir_attrs_phase` for the folder, and
+/// restore had no counterpart. Every restored folder came back with the
+/// default icon, which is the outcome that comment exists to prevent.
+///
+/// Deepest first, so a folder's read-only bit goes on after its children are
+/// there: creating inside a `+R` folder fails on Windows. A failure here is
+/// warned about rather than fatal — a missing icon must not fail a restore
+/// that brought every file back.
+async fn restore_dirs(
+    dirs: &mut [(String, PathBuf)],
+    destination: &Path,
+    token: &CancellationToken,
+) {
+    dirs.sort_by_key(|(rel, _)| std::cmp::Reverse(rel.len()));
+    for (rel, src_dir) in dirs.iter() {
+        if token.is_cancelled() {
+            return;
+        }
+        let dst_dir = long_path(&destination.join(rel));
+        if let Err(e) = fs::create_dir_all(&dst_dir).await {
+            warn!("could not recreate directory {}: {}", rel, e);
+            continue;
+        }
+        if let Some(attrs) = read_attrs(src_dir) {
+            apply_attrs(&dst_dir, attrs);
+        }
+    }
 }
 
 /// Restore one file of the backup into the destination tree.
@@ -372,6 +431,70 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backup's directory structure has to come back whole. An empty
+    /// folder has no file to bring it into being, so `create_dir_all` on each
+    /// file's parent never reached it — the restored tree quietly held fewer
+    /// folders than the backup it came from, and nothing said so.
+    #[tokio::test]
+    async fn an_empty_directory_in_the_backup_is_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(backup.join("with-files")).unwrap();
+        std::fs::create_dir_all(backup.join("empty/deeper-and-empty")).unwrap();
+        std::fs::write(backup.join("with-files/a.txt"), b"a").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let app = tauri::test::mock_app();
+        let payload = restore(app.handle(), &CancellationToken::new(), backup, dest.clone())
+            .await
+            .unwrap();
+        assert!(payload.success);
+
+        assert!(dest.join("with-files/a.txt").exists());
+        assert!(
+            dest.join("empty").is_dir(),
+            "an empty directory in the backup has to come back"
+        );
+        assert!(
+            dest.join("empty/deeper-and-empty").is_dir(),
+            "and so does an empty one nested inside it"
+        );
+    }
+
+    /// A custom folder icon needs both halves — the `desktop.ini` *and* the
+    /// System or ReadOnly bit on the folder holding it. Restore brought back
+    /// the file's attributes and none of the folder's, so every restored
+    /// folder came back with the default icon: the very outcome the comment
+    /// above `copy` says the backup side goes to some length to prevent.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_folder_gets_its_attributes_back() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        let dest = root.path().join("dest");
+        let iconish = backup.join("IconFolder");
+        std::fs::create_dir_all(&iconish).unwrap();
+        std::fs::write(iconish.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        // The System bit is the folder half of the mechanism.
+        crate::fsutil::apply_attrs(&iconish, 0x4);
+
+        let app = tauri::test::mock_app();
+        restore(app.handle(), &CancellationToken::new(), backup, dest.clone())
+            .await
+            .unwrap();
+
+        let restored = read_attrs(&dest.join("IconFolder")).expect("the folder must exist");
+        assert_eq!(
+            restored & 0x4,
+            0x4,
+            "the folder's System bit did not come back: {:#x}",
+            restored
+        );
+        clear_readonly(&dest.join("IconFolder"));
+    }
 
     /// Cancelling a restore must not cost the user the file they already
     /// had. The destination used to be opened with File::create — which
