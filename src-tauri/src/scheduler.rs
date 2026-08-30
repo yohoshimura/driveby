@@ -11,7 +11,7 @@ use std::time::Duration;
 use tauri::async_runtime;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::time;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A schedule's spacing. Monthly is its own variant because a calendar
 /// month is not a fixed number of days — "every 30 days" drifts through
@@ -217,26 +217,55 @@ struct MissingDestinations {
     missing: Vec<String>,
 }
 
-/// Stat each destination, with a deadline on every one.
+/// Stat every distinct destination once, all at the same time, with a
+/// deadline on each.
 ///
 /// A dead network share can leave `metadata` blocking for the whole SMB
-/// timeout — tens of seconds — and the tick is sequential, so one unplugged
-/// NAS would stall every other task's schedule behind it. Two seconds is
-/// generous for a local volume and short enough that a missing one costs
-/// less than the tick interval.
-async fn probe_destinations(destinations: &[String]) -> Vec<String> {
-    let mut missing = Vec::new();
-    for destination in destinations {
+/// timeout — tens of seconds — so each probe is capped at two seconds:
+/// generous for a local volume, short enough to matter.
+///
+/// The probes used to run one after another, per task, which made the cap
+/// misleading. Fifteen tasks with two unreachable destinations each cost
+/// sixty seconds of pure waiting, and the tick then slept another sixty on
+/// top — the scheduler spent half its life blocked and every interval
+/// schedule drifted later. Run together, the whole sweep costs one timeout
+/// rather than one per destination, and a destination two tasks share is
+/// stat'd once.
+async fn probe_all(destinations: &HashSet<String>) -> HashMap<String, bool> {
+    let checks = destinations.iter().map(|destination| async move {
         let probe = time::timeout(
             Duration::from_secs(2),
             tokio::fs::metadata(long_path(Path::new(destination))),
         )
         .await;
-        if !matches!(probe, Ok(Ok(meta)) if meta.is_dir()) {
-            missing.push(destination.clone());
-        }
-    }
-    missing
+        (
+            destination.clone(),
+            matches!(probe, Ok(Ok(meta)) if meta.is_dir()),
+        )
+    });
+    futures_util::future::join_all(checks).await.into_iter().collect()
+}
+
+/// The destinations of `task` that `present` says are not there.
+fn missing_from(task: &Task, present: &HashMap<String, bool>) -> Vec<String> {
+    task.destinations()
+        .into_iter()
+        .filter(|d| !present.get(d).copied().unwrap_or(false))
+        .collect()
+}
+
+/// Has this task anywhere left to write?
+///
+/// Both ends of `tick` ask this — one to re-arm the unplugged-drive reminder,
+/// the other to decide whether to speak — so it is written once. Asking it two
+/// different ways is what made the reminder go quiet: the flag was cleared on
+/// *nothing* missing while the reminder fired on *everything* missing, and a
+/// task whose drives went, half-returned, and went again fell in the gap.
+///
+/// A task with no destinations at all trivially has nowhere missing, and never
+/// reaches the reminder anyway; it counts as writable so the flag cannot stick.
+fn has_somewhere_to_write(destinations: &[String], missing: &[String]) -> bool {
+    destinations.is_empty() || missing.len() < destinations.len()
 }
 
 pub fn spawn(app: AppHandle) {
@@ -259,8 +288,14 @@ pub fn spawn(app: AppHandle) {
         // rather than re-derived, so the event only fires when the answer
         // actually changes instead of once a minute for ever.
         let mut reported: Vec<MissingDestinations> = Vec::new();
+        // Survives the tick, so a failed scheduler.json write is retried on the
+        // next one. Held here rather than inside tick for exactly that reason:
+        // as a local it was reset to false after a failure, and the clocks were
+        // then only re-persisted if some later tick happened to change
+        // something else.
+        let mut dirty = false;
         loop {
-            if let Err(e) = tick(&app, &seen, &mut reported).await {
+            if let Err(e) = tick(&app, &seen, &mut reported, &mut dirty).await {
                 tracing::warn!("scheduler tick failed: {}", e);
             }
             time::sleep(Duration::from_secs(60)).await;
@@ -272,6 +307,7 @@ async fn tick(
     app: &AppHandle,
     seen: &Mutex<HashMap<String, TaskClock>>,
     reported: &mut Vec<MissingDestinations>,
+    dirty: &mut bool,
 ) -> anyhow::Result<()> {
     let Some(tasks_path) = data_path(app, "tasks.json") else {
         return Ok(());
@@ -280,12 +316,44 @@ async fn tick(
         return Ok(());
     };
 
-    let tasks_json: serde_json::Value =
-        persist::read_json_or(&tasks_path, serde_json::Value::Array(vec![])).await;
+    // Whether the task list on disk can be believed. A tasks.json we could
+    // not read yields no tasks, and "no tasks" must not be mistaken for "the
+    // user deleted every task" — see the clock GC at the end of this tick.
+    let loaded: persist::Loaded<serde_json::Value> = persist::load_json(&tasks_path).await;
+    let list_is_trustworthy = !matches!(loaded, persist::Loaded::Damaged);
+    let tasks_json = match loaded {
+        persist::Loaded::Ok(value) => value,
+        _ => serde_json::Value::Array(vec![]),
+    };
+
     let settings_json: serde_json::Value =
         persist::read_json_or(&settings_path, serde_json::json!({})).await;
-    let settings: Settings = serde_json::from_value(settings_json).unwrap_or_default();
-    let tasks: Vec<Task> = serde_json::from_value(tasks_json).unwrap_or_default();
+    let settings: Settings = match serde_json::from_value(settings_json) {
+        Ok(s) => s,
+        Err(e) => {
+            // All-or-nothing, so one wrong-typed field costs the user their
+            // exclude patterns on every scheduled run while manual runs — whose
+            // settings come from the frontend — keep working. Say so rather
+            // than diverge in silence.
+            warn!("settings.json could not be read ({}); scheduled runs use defaults", e);
+            Settings::default()
+        }
+    };
+
+    // Deserialised per entry, not as a `Vec<Task>`: serde abandons the whole
+    // array at the first bad element, so one hand-edited task would stop every
+    // other task from being scheduled — silently.
+    let entries: Vec<serde_json::Value> = tasks_json.as_array().cloned().unwrap_or_default();
+    let mut tasks: Vec<Task> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        match serde_json::from_value::<Task>(entry.clone()) {
+            Ok(task) => tasks.push(task),
+            Err(e) => warn!(
+                "a task in tasks.json could not be read ({}); it will not run on a schedule",
+                e
+            ),
+        }
+    }
 
     let state = match app.try_state::<BackupState>() {
         Some(s) => s,
@@ -293,29 +361,48 @@ async fn tick(
     };
 
     let now = Utc::now();
-    let live_ids: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
-    // Batch clock mutations into at most one scheduler.json write per tick.
-    let mut dirty = false;
+    // Taken from every entry carrying an id, including entries that failed to
+    // deserialise above: the task is still on disk, so its clock has to survive
+    // the GC even while it cannot be scheduled.
+    let live_ids: HashSet<String> = entries
+        .iter()
+        .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect();
     // Rebuilt from scratch each tick and compared with what the UI was last
     // told, so the event fires on change rather than once a minute.
     let mut absent: Vec<MissingDestinations> = Vec::new();
 
+    // One sweep for the whole tick. Manual tasks are included deliberately:
+    // their cards show an absent destination too, and that is what the
+    // `destinations-status` event below carries.
+    let present = probe_all(&tasks.iter().flat_map(|t| t.destinations()).collect()).await;
+
     for task in tasks {
         let destinations = task.destinations();
-        let missing = probe_destinations(&destinations).await;
+        let missing = missing_from(&task, &present);
+        // "Nowhere left to write" — the state the reminder is about, and the
+        // one its flag has to be cleared out of. Computed once because the two
+        // used to be written separately and did not agree: the flag cleared on
+        // *nothing* missing while the reminder fired on *everything* missing,
+        // leaving a gap at "some missing". A task with two drives that lost
+        // both, got one back, then lost both again fell into it and was never
+        // mentioned a second time.
+        let all_missing = !has_somewhere_to_write(&destinations, &missing);
         if !missing.is_empty() {
             absent.push(MissingDestinations {
                 task_id: task.id.clone(),
                 task_name: task.name.clone(),
                 missing: missing.clone(),
             });
-        } else {
-            // Everything is back: arm the notification for the next absence.
+        }
+        if !all_missing {
+            // There is somewhere to write again: arm the reminder for the
+            // next time there is not.
             let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(clock) = s.get_mut(&task.id) {
                 if clock.missing_notified {
                     clock.missing_notified = false;
-                    dirty = true;
+                    *dirty = true;
                 }
             }
         }
@@ -356,7 +443,7 @@ async fn tick(
                 }
             }
         };
-        dirty |= first_observation;
+        *dirty |= first_observation;
         if first_observation && last.is_none() {
             continue;
         }
@@ -373,7 +460,7 @@ async fn tick(
             let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(c) = s.get_mut(&task.id) {
                 c.last_attempt = Some(now);
-                dirty = true;
+                *dirty = true;
             }
         }
 
@@ -386,13 +473,13 @@ async fn tick(
         // occurrence, so plugging the drive back in at lunchtime does not
         // set a backup going while the user is still handling the disk. It
         // goes at the next scheduled time, which is what they asked for.
-        if !destinations.is_empty() && missing.len() == destinations.len() {
+        if all_missing {
             let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let already_told = s.get(&task.id).is_some_and(|c| c.missing_notified);
             if !already_told {
                 if let Some(clock) = s.get_mut(&task.id) {
                     clock.missing_notified = true;
-                    dirty = true;
+                    *dirty = true;
                 }
                 drop(s);
                 info!(task = %task.name, "destination not connected — backup skipped");
@@ -428,12 +515,22 @@ async fn tick(
 
     // Forget tasks the user has deleted, so the map tracks the task list
     // rather than growing for the lifetime of the file.
+    //
+    // Only when the list can be believed. A tasks.json that could not be read
+    // yields an empty `live_ids`, and this would then read it as "every task
+    // was deleted" and drop every clock — re-anchoring `first_seen` for tasks
+    // that have never run (delaying each a full interval) and forgetting
+    // `last_attempt` for failing ones (allowing an immediate retry). Those are
+    // exactly the two regressions the persisted clock exists to prevent, and a
+    // transient lock on the file was enough to cause both.
     let snapshot = {
         let mut s = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = s.len();
-        s.retain(|id, _| live_ids.contains(id));
-        dirty |= s.len() != before;
-        if dirty {
+        if list_is_trustworthy {
+            let before = s.len();
+            s.retain(|id, _| live_ids.contains(id));
+            *dirty |= s.len() != before;
+        }
+        if *dirty {
             Some(s.clone())
         } else {
             None
@@ -441,6 +538,10 @@ async fn tick(
     };
     if let (Some(snapshot), Some(path)) = (snapshot, data_path(app, "scheduler.json")) {
         persist::write_json_atomic(&path, &snapshot).await?;
+        // Cleared only once the clocks are actually on disk. `?` above leaves
+        // it set, so the next tick writes them again rather than waiting for
+        // some unrelated change to mark the map dirty a second time.
+        *dirty = false;
     }
     Ok(())
 }
@@ -461,6 +562,51 @@ mod tests {
             last_attempt: None,
             missing_notified: false,
         }
+    }
+
+    fn dests(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The sequence that used to go silent. The reminder's flag was cleared
+    /// on *nothing* missing while the reminder fired on *everything* missing,
+    /// so a task that lost both drives, got one back, then lost both again
+    /// never spoke the second time — the flag was still set from the first.
+    ///
+    /// Step 2 is the one that matters: a task with one drive left can still
+    /// run, so the reminder has to re-arm there, not only at full recovery.
+    #[test]
+    fn a_partial_recovery_re_arms_the_unplugged_reminder() {
+        let all = dests(&["D1", "D2"]);
+
+        assert!(
+            !has_somewhere_to_write(&all, &all),
+            "both drives gone: nothing to write, the reminder speaks"
+        );
+        assert!(
+            has_somewhere_to_write(&all, &dests(&["D2"])),
+            "one drive back: the task runs partially, so the reminder re-arms"
+        );
+        assert!(
+            !has_somewhere_to_write(&all, &all),
+            "both gone again: it must speak a second time"
+        );
+    }
+
+    /// A single-destination task is the common case and must not regress:
+    /// its only drive missing is the same thing as all of them missing.
+    #[test]
+    fn one_destination_missing_is_nowhere_to_write() {
+        let one = dests(&["D1"]);
+        assert!(!has_somewhere_to_write(&one, &one));
+        assert!(has_somewhere_to_write(&one, &[]));
+    }
+
+    /// A task with no destinations never reaches the reminder at all, so it
+    /// counts as writable — otherwise its flag could latch on and stay.
+    #[test]
+    fn a_task_with_no_destinations_never_latches_the_flag() {
+        assert!(has_somewhere_to_write(&[], &[]));
     }
 
     fn day() -> Schedule {
