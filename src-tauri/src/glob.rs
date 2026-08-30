@@ -52,6 +52,14 @@ impl PatternSet {
                     Some(body) => (body, true),
                     None => (pattern.as_str(), false),
                 };
+                // `matches` normalises the candidate path to `/` before
+                // testing, so the pattern has to agree. Without this the
+                // separator a Windows user reaches for first was escaped into
+                // a *literal* backslash — `Photos\raw` compiled to
+                // `^Photos\\raw$`, matched nothing against `Photos/raw`, and
+                // was never reported as wrong. The folder they thought they
+                // had excluded was copied on every run.
+                let body = body.replace('\\', "/");
                 // A pattern that doesn't compile is dropped rather than
                 // failing the run, matching the pre-1.5 behaviour.
                 // NTFS and APFS filenames are case-insensitive, and this same
@@ -61,7 +69,7 @@ impl PatternSet {
                 // the source and `raw` stops it being copied while `RAW` at
                 // the destination no longer looks protected, so prune wipes
                 // the subtree (#R6).
-                regex::RegexBuilder::new(&glob_to_regex(body))
+                regex::RegexBuilder::new(&glob_to_regex(&body))
                     .case_insensitive(crate::fsutil::CASE_INSENSITIVE_FS)
                     .build()
                     .ok()
@@ -123,6 +131,33 @@ mod tests {
 
     fn set(patterns: &[&str]) -> PatternSet {
         PatternSet::new(&patterns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// The separator a Windows user reaches for first has to work. It used to
+    /// be escaped into a *literal* backslash, so `Photos\raw` compiled to
+    /// `^Photos\\raw$` and could never match the `Photos/raw` the walk
+    /// produces. Nothing reported the rule as wrong — it simply excluded
+    /// nothing, and the folder was copied on every run.
+    #[test]
+    fn a_pattern_written_with_backslashes_still_excludes() {
+        let backslash = char::from(92u8);
+        let win = format!("Photos{}raw", backslash);
+        assert!(set(&[&win]).matches("Photos/raw"));
+        // And the same rule reaches the same path however the caller spells it.
+        assert!(set(&[&win]).matches(&format!("Photos{}raw", backslash)));
+        // The forward-slash spelling keeps working, unchanged.
+        assert!(set(&["Photos/raw"]).matches("Photos/raw"));
+    }
+
+    /// Mixed separators in one pattern, which is what a pasted path looks
+    /// like, and a negation written the same way.
+    #[test]
+    fn backslashes_work_at_depth_and_under_negation() {
+        let b = char::from(92u8);
+        assert!(set(&[&format!("a{}b/c", b)]).matches("a/b/c"));
+        let p = set(&[&format!("node_modules{}*", b), &format!("!node_modules{}keep", b)]);
+        assert!(p.matches("node_modules/junk"));
+        assert!(!p.matches("node_modules/keep"));
     }
 
     #[test]
