@@ -19,6 +19,17 @@ struct Bucket {
     tokens: f64,
     /// When `tokens` was last brought up to date.
     last: Instant,
+    /// The largest single request seen so far, which the cap must never fall
+    /// below: a bucket smaller than the chunk being asked for could never
+    /// fill enough to grant it, and the copy loop would wait for ever.
+    ///
+    /// Remembered rather than recomputed per call. The cap used to be
+    /// `max(rate, n)` of whichever request happened to be in hand, so a full
+    /// 1 MiB chunk raised it, tokens accrued up there, and the short final
+    /// chunk of the same file lowered it again — clamping away budget that
+    /// had already been earned. The error was conservative, but it meant a
+    /// ceiling that quietly delivered less than it advertised.
+    largest_request: f64,
 }
 
 pub struct RateLimiter {
@@ -41,6 +52,7 @@ impl RateLimiter {
             bucket: Mutex::new(Bucket {
                 tokens: 0.0,
                 last: Instant::now(),
+                largest_request: 0.0,
             }),
         }
     }
@@ -63,14 +75,17 @@ impl RateLimiter {
         if rate == 0 {
             return;
         }
-        // One second of budget, but never less than what is being asked
-        // for: a bucket smaller than the chunk can never fill enough to
-        // grant it, and the copy loop would wait for ever.
-        let capacity = (rate as f64).max(n as f64);
         let rate = rate as f64;
         loop {
             let wait = {
                 let mut bucket = self.bucket.lock().await;
+                // One second of budget, but never less than the biggest chunk
+                // anyone has asked for. Derived from the remembered maximum,
+                // not from this call, so a small request cannot discard what a
+                // large one banked — while lowering the ceiling still lowers
+                // the cap, because `rate` is read fresh each time.
+                bucket.largest_request = bucket.largest_request.max(n as f64);
+                let capacity = rate.max(bucket.largest_request);
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
                 bucket.last = now;
@@ -101,6 +116,33 @@ pub fn shared() -> &'static RateLimiter {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A large chunk followed by a small one. The cap used to be derived
+    /// from whichever request was in hand, so the 4 000-byte call raised it,
+    /// four seconds of budget accrued up there, and the next 10-byte call
+    /// lowered it back to one second — throwing away three seconds{27} worth
+    /// the copy loop had already waited for. The copy loop does exactly this
+    /// at the end of every file.
+    #[tokio::test(start_paused = true)]
+    async fn a_small_request_does_not_discard_what_a_large_one_banked() {
+        let limiter = RateLimiter::new();
+        limiter.set_rate(1_000);
+        // Ask for a big chunk once so the bucket knows how large it must be.
+        limiter.acquire(4_000).await;
+        // Idle long enough to refill to that capacity.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        // A short chunk, then the banked budget: all of it should still be
+        // there, so neither call waits.
+        let start = Instant::now();
+        limiter.acquire(10).await;
+        limiter.acquire(3_990).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the budget earned before the short chunk was thrown away"
+        );
+    }
 
     /// The default, and the path every run takes until someone sets a
     /// ceiling: no lock, no clock, no wait.
