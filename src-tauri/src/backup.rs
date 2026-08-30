@@ -1108,6 +1108,14 @@ async fn mirror_dir_attrs_phase<R: Runtime>(
     // Sort in place — `dirs` is not needed in source order after this point.
     dirs.sort_by_key(|(_, r)| std::cmp::Reverse(r.len()));
     for (src_dir, rel) in dirs.iter() {
+        // The last phase, and the only one that used to ignore the token.
+        // Four filesystem calls per directory with nothing to interrupt them
+        // meant Stop left the run visibly working for minutes on a wide tree
+        // over a slow share — and `run_backup` cannot unregister the task
+        // until this returns, so no new run could start either.
+        if ctx.token.is_cancelled() {
+            return;
+        }
         let dest_dir = ctx.target.join(rel);
         if let Err(e) = fs::create_dir_all(long_path(&dest_dir)).await {
             warn!("could not ensure destination dir {}: {}", rel, e);
@@ -1195,7 +1203,7 @@ async fn execute_all<R: Runtime>(
 
     info!(task = %task.name, "walking source");
     let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    let mut walked = walk(&source, &patterns).await?;
+    let mut walked = walk(&source, &patterns, token).await?;
     if !walked.unreadable.is_empty() {
         warn!(
             "{} source path(s) could not be read — their destination copies are left untouched",
@@ -1771,7 +1779,22 @@ pub(crate) fn rel_of(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-pub(crate) async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<WalkResult> {
+/// Enumerate the source tree.
+///
+/// Takes a token because on a large tree this *is* the long part, and both
+/// callers are cancellable for that reason. The preview said so in as many
+/// words — "cancellable, because on a large tree it is a full source walk" —
+/// while doing the walk with nothing watching the token, so Stop sat there
+/// until the walk finished on its own. A superseded preview scan kept reading
+/// the disk at full cost alongside the one that replaced it.
+///
+/// Checked once per directory and once per entry: cheap next to the `read_dir`
+/// and `metadata` calls either sits between.
+pub(crate) async fn walk(
+    root: &Path,
+    patterns: &glob::PatternSet,
+    token: &CancellationToken,
+) -> Result<WalkResult> {
     let mut files = Vec::new();
     let mut dirs: Vec<(PathBuf, String)> = Vec::new();
     let mut excluded: HashSet<String> = HashSet::new();
@@ -1782,6 +1805,9 @@ pub(crate) async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<Wal
     let mut stack: Vec<PathBuf> = vec![root_canonical.clone()];
 
     while let Some(dir) = stack.pop() {
+        if token.is_cancelled() {
+            return Err(anyhow!(CANCELLED_MSG));
+        }
         let mut entries = match fs::read_dir(&dir).await {
             Ok(v) => v,
             Err(e) => {
@@ -1801,6 +1827,9 @@ pub(crate) async fn walk(root: &Path, patterns: &glob::PatternSet) -> Result<Wal
             }
         };
         loop {
+            if token.is_cancelled() {
+                return Err(anyhow!(CANCELLED_MSG));
+            }
             let entry = match entries.next_entry().await {
                 Ok(Some(e)) => e,
                 Ok(None) => break,
@@ -2098,7 +2127,7 @@ mod tests {
         token: &CancellationToken,
     ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-        let mut walked = walk(Path::new(&task.source), &patterns).await?;
+        let mut walked = walk(Path::new(&task.source), &patterns, token).await?;
         let protected = ProtectedSet::new(&walked, &patterns);
         execute_one(
             app,
@@ -2508,6 +2537,37 @@ mod tests {
     /// A folder the user re-cased at source keeps the destination's stale
     /// spelling forever: 1.5 stopped prune from *deleting* files through the
     /// drifted directory, and 1.6 actually re-spells the directory entry.
+    /// The walk is the long part of a preview on a big tree, and the reason
+    /// the preview is cancellable at all — but it watched nothing, so Stop sat
+    /// there until the walk finished on its own and a superseded scan kept
+    /// reading the disk beside the one that replaced it.
+    #[tokio::test]
+    async fn a_cancelled_walk_stops_instead_of_finishing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a/b/c")).unwrap();
+        std::fs::write(root.path().join("a/b/c/file.txt"), b"x").unwrap();
+        let patterns = glob::PatternSet::new(&[]);
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = walk(root.path(), &patterns, &token)
+            .await
+            .err()
+            .expect("a cancelled walk must not report a tree");
+        assert!(
+            err.to_string().contains(CANCELLED_MSG),
+            "a cancelled walk has to read as cancelled, not as a failure: {}",
+            err
+        );
+
+        // And the same tree still walks when nothing has asked it to stop —
+        // the guard must not have made every walk return early.
+        let walked = walk(root.path(), &patterns, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(walked.files.len(), 1);
+    }
+
     fn task_at(id: &str, source: &str, destinations: &[&str]) -> Task {
         Task {
             id: id.to_string(),
@@ -3170,7 +3230,9 @@ mod tests {
     async fn walk_errors_when_root_is_missing() {
         let missing = std::env::temp_dir().join("driveby-backup-test-does-not-exist");
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(walk(&missing, &glob::PatternSet::new(&[])).await.is_err());
+        assert!(walk(&missing, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .is_err());
     }
 
     /// `read_dir` on the root failing is fatal, but the sibling case — the

@@ -140,7 +140,7 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     reject_destination_overlaps(&source, &destinations)?;
 
     let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    let walked = walk(&source, &patterns).await?;
+    let walked = walk(&source, &patterns, token).await?;
     let protected = ProtectedSet::new(&walked, &patterns);
     let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
 
