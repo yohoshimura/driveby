@@ -1,5 +1,112 @@
 # Changelog
 
+## 1.7.4
+
+Every defect below was already in 1.7.3, and not one of them announced itself.
+A backup that reports success while deleting the copy it was meant to protect,
+an exclusion that excludes nothing, a Stop button that stops nothing for
+another two minutes — each one looked, from the outside, exactly like Driveby
+working. That is what this release is about.
+
+**Two tasks writing to the same folder destroyed each other's backups.** Every
+destination is mirrored against its own task's source, so whatever the other
+task had just written was "not in my source" and went — file by file, counted
+as cleaned, reported as a successful run. Then the other task ran and did the
+same back. Both histories stayed green while neither backup ever survived a
+cycle.
+
+A destination that sits inside another task's destination is now refused at
+the start of the run, and so is one that sits on top of another task's
+*source* — the same hazard wearing a worse hat, since the prune would empty
+the folder that task backs up from. The message names the task in the way, so
+you can tell what to change. The form says it too, at the moment you pick the
+folder, while it is still a choice.
+
+**A settings or task file that would not parse was quietly replaced — and then
+overwritten.** A truncated `tasks.json` — a power cut mid-write, a bad sector —
+read as "no tasks". The list rendered empty, the next thing you touched saved
+that empty list over the only copy, and the tasks were gone with nothing to
+recover from. The same silence sat under `settings.json`, `history.json` and
+`scheduler.json`.
+
+A file that cannot be parsed is now moved aside as
+`<name>.corrupt-<timestamp>` *before* the empty default is handed out, so the
+original is still there when someone notices. A file that could not be *read*
+is left exactly where it is: unreadable is not the same as known-bad.
+
+**Exclusions written with a backslash excluded nothing.** `Photos\raw` — the
+separator Windows puts in front of you everywhere else — compiled into a rule
+that was accepted, listed, and could never match anything. The folder you
+believed you had excluded was walked and copied on every run, for as long as
+the pattern sat there. Both separators now mean the same thing.
+
+**The scheduler could forget every clock it had, and stop scheduling because
+of one bad task.** Both from the same cause: a `tasks.json` it could not read.
+One hand-edited task made it abandon the whole list, and an antivirus holding
+the file open for a moment did the same — and the empty result read as "the
+user deleted every task", so the saved schedule clocks were wiped. Tasks that
+had never run were pushed back a full interval; tasks that had failed forgot
+they had, and retried at once. Those are the two things the saved clock exists
+to prevent.
+
+Tasks are now read one at a time, so a bad one costs only itself, and the
+clocks are only cleaned up when the list can be believed. A `settings.json`
+that will not parse is reported rather than silently swapped for the defaults
+— which is how a scheduled run could ignore every exclusion you had set while
+manual runs, whose settings come from the window in front of you, kept working
+correctly.
+
+**The unplugged-drive reminder could go quiet for good.** Its "already told
+you" flag was cleared when *nothing* was missing, while the reminder fired
+when *everything* was missing — and a task with two drives fell in the gap.
+Lose both, plug one back in, lose both again, and it never spoke a second
+time.
+
+**The speed ceiling did not apply until the next backup.** It was read once,
+when a run started. So the sequence the setting exists for — a backup is
+saturating the disk, the machine is unusable, you open Settings and ask for
+5 MB/s — did nothing at all until that run finished. It now takes effect as
+soon as it is saved, mid-run.
+
+The ceiling also delivered a little less than it promised: the copy loop reads
+in 1 MiB chunks, every file ends on a short one, and that short chunk threw
+away budget the full chunks had already waited for. It happened at the end of
+every single file.
+
+**Stop reaches the whole run now.** Two places ignored it. Cancelling a
+preview left the source walk reading to the end of the tree — on a large one,
+minutes of the dialog sitting there having acknowledged nothing; and a
+superseded scan kept reading the disk at full cost alongside the one that had
+replaced it. Stopping a backup left its last phase, the one that mirrors
+folder attributes, running to completion — and until it returned, the task
+counted as busy and no new run could start.
+
+**A restore brought back the files, but not the folders.** It rebuilt the tree
+out of files alone, so a folder that held something came back and a folder
+that held nothing did not — the restored tree quietly had fewer directories
+than the backup it came from. Folder attributes were not restored either,
+which meant every folder with a custom icon came back with the default one,
+the exact outcome the backup goes to some trouble to prevent. Directories are
+now restored in their own right, deepest first, with their attributes.
+
+### Behaviour changes worth knowing
+
+- A `tasks.json`, `settings.json`, `history.json` or `scheduler.json` that
+  cannot be parsed is renamed to `<name>.corrupt-<timestamp>` and left in the
+  data folder. If a list ever comes back empty, look there before doing
+  anything else.
+- A task whose destination overlaps another task's destination or source is
+  refused — when you pick the folder, and again at the start of every run. If
+  you have such a pair today, both were destroying each other's backups; the
+  refusal is the first you will hear of it.
+- Exclude patterns are matched with `/` and `\` treated alike. A pattern that
+  used a backslash to escape a `*` or a `?` never worked here, so nothing that
+  matched before stops matching.
+- The scheduler probes each distinct destination once per tick and probes them
+  together. Fifteen tasks with two absent drives each used to spend sixty
+  seconds of a sixty-second tick waiting, which made every interval schedule
+  drift later.
+
 ## 1.7.3
 
 The Mac build has been published since 1.7.0 and had never been tested. Three
