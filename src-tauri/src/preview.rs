@@ -306,7 +306,8 @@ mod tests {
         Task {
             id: "preview".into(),
             name: "preview".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(
                 destinations

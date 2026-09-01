@@ -870,7 +870,8 @@ mod tests {
         Task {
             id: "t".into(),
             name: "t".into(),
-            source: "C:/src".into(),
+            source: Some("C:/src".into()),
+            sources: None,
             destination: None,
             destinations: Some(vec!["D:/dst".into()]),
             schedule: Some("custom".into()),

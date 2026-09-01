@@ -22,11 +22,27 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use xxhash_rust::xxh3::Xxh3;
 
+/// One source folder, and the destination subfolder it writes into.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Source {
+    pub path: String,
+    /// A folder *name*, not a path: no separators, no `.` or `..`. Validated
+    /// by `preflight_sources` before anything is written.
+    pub folder: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Task {
     pub id: String,
     pub name: String,
-    pub source: String,
+    /// The shape every tasks.json written before multi-source holds: exactly
+    /// one source. Kept readable for the same reason `destination` is — the
+    /// scheduler deserialises this struct and can tick before the frontend
+    /// migration has run, and a user who downgrades writes it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<Source>>,
     /// The shape every tasks.json written before 1.7.2 holds: exactly one
     /// destination. The frontend rewrites the file into `destinations` on
     /// first load, but this side has to keep reading it — the scheduler
@@ -50,6 +66,43 @@ pub struct Task {
 }
 
 impl Task {
+    /// Every source this task reads, in the order the user listed them,
+    /// blanks dropped and exact repeats collapsed.
+    ///
+    /// Only exact repeats, for the same reason `destinations()` gives: two
+    /// spellings of one folder are a filesystem question, and
+    /// `reject_destination_overlaps` has to ask it anyway.
+    pub fn sources(&self) -> Vec<Source> {
+        let listed = match &self.sources {
+            Some(list) if !list.is_empty() => list.clone(),
+            // A legacy task's subfolder is the source path's own name. A path
+            // with no final component — a bare drive root — cannot supply one,
+            // and is dropped rather than given an invented name.
+            _ => self
+                .source
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| {
+                    Path::new(s)
+                        .file_name()
+                        .map(|n| Source {
+                            path: s.to_string(),
+                            folder: n.to_string_lossy().to_string(),
+                        })
+                })
+                .into_iter()
+                .collect(),
+        };
+        let mut seen = HashSet::new();
+        listed
+            .into_iter()
+            .map(|s| Source { path: s.path.trim().to_string(), folder: s.folder.trim().to_string() })
+            .filter(|s| !s.path.is_empty() && !s.folder.is_empty())
+            .filter(|s| seen.insert(s.path.clone()))
+            .collect()
+    }
+
     /// Every destination this task writes to, in the order the user listed
     /// them, blanks dropped and exact repeats collapsed.
     ///
@@ -651,7 +704,7 @@ struct PhaseStats {
 /// Validate the source, once for the whole run. Fatal on failure: with no
 /// readable source there is nothing to write to any destination.
 pub(crate) async fn preflight_source(task: &Task) -> Result<PathBuf> {
-    let source = PathBuf::from(&task.source);
+    let source = PathBuf::from(&task.sources().first().map(|s| s.path.clone()).unwrap_or_default());
     if !source.is_absolute() {
         return Err(anyhow!("Paths must be absolute"));
     }
@@ -715,7 +768,6 @@ pub(crate) fn reject_foreign_overlaps(
     others: &[Task],
 ) -> Result<()> {
     for other in others.iter().filter(|o| o.id != task_id) {
-        let their_source = PathBuf::from(&other.source);
         let their_destinations: Vec<PathBuf> =
             other.destinations().iter().map(PathBuf::from).collect();
         for mine in destinations {
@@ -731,14 +783,19 @@ pub(crate) fn reject_foreign_overlaps(
                     ));
                 }
             }
-            if path_contains(mine, &their_source) {
-                return Err(anyhow!(
-                    "Destination {} contains the source folder of the task \"{}\" ({}). \
-                     Backing up here would delete the files that task backs up.",
-                    mine.display(),
-                    other.name,
-                    their_source.display()
-                ));
+            // A task can now list several sources; every one of theirs is
+            // the same hazard, not just the first.
+            for their in other.sources() {
+                let their_source = PathBuf::from(&their.path);
+                if path_contains(mine, &their_source) {
+                    return Err(anyhow!(
+                        "Destination {} contains the source folder of the task \"{}\" ({}). \
+                         Backing up here would delete the files that task backs up.",
+                        mine.display(),
+                        other.name,
+                        their_source.display()
+                    ));
+                }
             }
         }
     }
@@ -2179,7 +2236,8 @@ mod tests {
         token: &CancellationToken,
     ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-        let mut walked = walk(Path::new(&task.source), &patterns, token).await?;
+        let source = task.sources().first().map(|s| s.path.clone()).unwrap_or_default();
+        let mut walked = walk(Path::new(&source), &patterns, token).await?;
         let protected = ProtectedSet::new(&walked, &patterns);
         let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
         execute_one(
@@ -2256,7 +2314,8 @@ mod tests {
         let task = Task {
             id: "e2e".into(),
             name: "e2e".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -2309,7 +2368,8 @@ mod tests {
         Task {
             id: id.into(),
             name: id.into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(
                 dests
@@ -2439,7 +2499,8 @@ mod tests {
         let task = Task {
             id: "legacy".into(),
             name: "legacy".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: Some(dests[0].to_string_lossy().to_string()),
             destinations: None,
             schedule: None,
@@ -2545,7 +2606,8 @@ mod tests {
         let base = Task {
             id: "t".into(),
             name: "t".into(),
-            source: "C:/src".into(),
+            source: Some("C:/src".into()),
+            sources: None,
             destination: None,
             destinations: None,
             schedule: None,
@@ -2588,6 +2650,81 @@ mod tests {
         assert!(base.destinations().is_empty());
     }
 
+    /// The legacy shape every tasks.json written before this change holds:
+    /// one `source` string. It has to keep reading, because the scheduler
+    /// deserialises this struct and can tick before the frontend migration
+    /// has run — and a user who downgrades writes the old shape back.
+    #[test]
+    fn task_sources_normalises_both_shapes() {
+        let legacy: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t", "source": "C:/Photos"
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.sources(),
+            vec![Source { path: "C:/Photos".into(), folder: "Photos".into() }]
+        );
+
+        let plural: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t",
+            "source": "C:/Ignored",
+            "sources": [
+                { "path": "C:/Photos", "folder": "Photos" },
+                { "path": "C:/Work/Photos", "folder": "Photos-Work" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(plural.sources().len(), 2, "the plural field wins outright");
+        assert_eq!(plural.sources()[1].folder, "Photos-Work");
+    }
+
+    /// Blanks and exact repeats go, the way `destinations()` drops them.
+    /// Two spellings of one folder are left in on purpose: deciding they are
+    /// the same folder means asking the filesystem, which is the overlap
+    /// guard's job and it runs anyway.
+    #[test]
+    fn task_sources_drops_blanks_and_exact_repeats() {
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t",
+            "sources": [
+                { "path": "C:/Photos", "folder": "Photos" },
+                { "path": "   ", "folder": "Blank" },
+                { "path": "C:/Photos", "folder": "Photos" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(task.sources().len(), 1);
+    }
+
+    /// A task carrying neither field has no sources at all, rather than one
+    /// source whose path is the empty string — which would read as the
+    /// current directory and back up something nobody asked for.
+    #[test]
+    fn a_task_with_no_source_field_has_no_sources() {
+        let task: Task =
+            serde_json::from_value(serde_json::json!({ "id": "1", "name": "t" })).unwrap();
+        assert!(task.sources().is_empty());
+    }
+
+    /// A legacy path with a trailing separator still yields a usable folder
+    /// name: `file_name()` on "C:/Photos/" answers "Photos", but on a bare
+    /// root like "D:/" it answers nothing, and a source with no name of its
+    /// own cannot be given a subfolder automatically.
+    #[test]
+    fn a_legacy_source_folder_comes_from_the_paths_own_name() {
+        let with_slash: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t", "source": "C:/Photos/"
+        }))
+        .unwrap();
+        assert_eq!(with_slash.sources()[0].folder, "Photos");
+
+        let bare_root: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t", "source": "D:/"
+        }))
+        .unwrap();
+        assert!(bare_root.sources().is_empty(), "a root has no name to become a folder");
+    }
+
     /// A folder the user re-cased at source keeps the destination's stale
     /// spelling forever: 1.5 stopped prune from *deleting* files through the
     /// drifted directory, and 1.6 actually re-spells the directory entry.
@@ -2626,7 +2763,8 @@ mod tests {
         Task {
             id: id.to_string(),
             name: id.to_string(),
-            source: source.to_string(),
+            source: Some(source.to_string()),
+            sources: None,
             destination: None,
             destinations: Some(destinations.iter().map(|d| d.to_string()).collect()),
             schedule: None,
@@ -2705,7 +2843,8 @@ mod tests {
         let task = Task {
             id: "recase".into(),
             name: "recase".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -2762,7 +2901,8 @@ mod tests {
         let task = Task {
             id: "recase-nested".into(),
             name: "recase-nested".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -2824,7 +2964,8 @@ mod tests {
             let task = Task {
                 id: name.into(),
                 name: name.into(),
-                source: source.to_string_lossy().to_string(),
+                source: Some(source.to_string_lossy().to_string()),
+                sources: None,
                 destination: None,
                 destinations: Some(vec![dest.to_string_lossy().to_string()]),
                 schedule: None,
@@ -2874,7 +3015,8 @@ mod tests {
         let task = Task {
             id: "cancel-par".into(),
             name: "cancel-par".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -2939,7 +3081,8 @@ mod tests {
         let task = Task {
             id: "locked-src".into(),
             name: "locked-src".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -2997,7 +3140,8 @@ mod tests {
         let task = Task {
             id: "abort".into(),
             name: "abort".into(),
-            source: source.to_string_lossy().to_string(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
