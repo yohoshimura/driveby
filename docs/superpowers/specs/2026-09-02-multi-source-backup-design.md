@@ -171,10 +171,17 @@ it that exists.
   directory) contributes **no files**, and instead inserts its subfolder `rel`
   into the merged `unreadable`. Prune walks around it. The run continues on the
   other sources and reports the failure.
-- When **every** source fails, `""` also goes into `unreadable`, which is what
-  `source_root_unreadable()` reads — prune is then skipped entirely. That is
-  the honest generalisation of today's rule: if even one source walked, prune
-  is entitled to work on its subtree.
+- When **every** source fails, `walk_all` returns `Err`. Not a `""` entry in
+  `unreadable`: that would stop prune correctly but still let the run report
+  success, stamp `lastBackup`, and leave the scheduler believing the task ran.
+  Today a single missing source fails the run outright, and that must not
+  regress. An `Err` here preserves it — `execute_one` never runs, so
+  `source_root_unreadable()` needs no multi-source generalisation at all.
+
+A source that fails while others succeed makes the run **incomplete, not
+failed**: its count flows into `walked.unreadable`, which `CompletePayload`
+already surfaces as "this backup is knowingly incomplete but nothing was
+deleted for it".
 
 ## Behaviour changes worth naming
 
