@@ -106,13 +106,62 @@ async fn get_tasks(app: tauri::AppHandle) -> Result<Value, String> {
     Ok(persist::read_json_or(&path, Value::Array(vec![])).await)
 }
 
+/// Carry forward a `lastBackup` the incoming list has not caught up with.
+///
+/// The lock cannot span the read half of this read-modify-write: `get_tasks`
+/// answered the webview when it mounted, and the edit happened in React. What
+/// it *can* do is refuse to let a stale copy of the one field Rust owns
+/// overwrite a fresher one. `update_last_backup` is the only writer of
+/// tasks.json on this side and `lastBackup` is all it writes, so declining a
+/// value older than the one on disk closes the whole window — without a
+/// protocol change, and without touching any field the user edits.
+///
+/// RFC3339 in UTC, which is what `update_last_backup` emits, orders correctly
+/// as a plain string: fixed-width fields, most significant first. A missing or
+/// differently shaped value reads as `""` and therefore only ever loses to a
+/// real timestamp, never overwrites one.
+///
+/// A task the user deleted is simply absent from `incoming`, and nothing here
+/// puts it back.
+fn keep_newer_last_backup(incoming: &mut Value, on_disk: &Value) {
+    let Some(stored) = on_disk.as_array() else {
+        return;
+    };
+    let Some(items) = incoming.as_array_mut() else {
+        return;
+    };
+    for task in items {
+        let Some(obj) = task.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = obj.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+            continue;
+        };
+        let Some(disk_ts) = stored
+            .iter()
+            .find(|t| t.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            .and_then(|t| t.get("lastBackup"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let ours = obj.get("lastBackup").and_then(|v| v.as_str()).unwrap_or("");
+        if ours < disk_ts {
+            obj.insert("lastBackup".into(), Value::String(disk_ts.to_string()));
+        }
+    }
+}
+
 #[tauri::command]
 async fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
     let path = data_path(&app, "tasks.json")?;
-    // Hold the same lock the backup pipeline uses so a scheduler-driven
-    // lastBackup write can't land between the JS read-modify-write and
-    // clobber a user edit (#7).
+    let mut tasks = tasks;
+    // Hold the same lock the backup pipeline uses, so two writes cannot
+    // interleave — and re-read inside it, so the write cannot carry a
+    // lastBackup that went stale while the user had the list open.
     persist::with_tasks_lock(|| async {
+        let on_disk: Value = persist::read_json_or(&path, Value::Array(vec![])).await;
+        keep_newer_last_backup(&mut tasks, &on_disk);
         persist::write_json_atomic(&path, &tasks)
             .await
             .map_err(|e| e.to_string())
@@ -367,5 +416,70 @@ mod tests {
     fn close_to_tray_defaults_to_off() {
         assert!(!close_to_tray_of(&serde_json::json!({})));
         assert!(close_to_tray_of(&serde_json::json!({ "closeToTray": true })));
+    }
+
+    /// The window TASKS_LOCK never covered. A scheduled run stamps
+    /// `lastBackup` while the user has the task list open; the list the
+    /// webview then saves was read before that stamp, and the write used to
+    /// put the old value back — so the scheduler ran the task again on the
+    /// next tick. The user's own edits to every other field still win.
+    #[test]
+    fn a_save_cannot_put_back_a_last_backup_older_than_the_one_on_disk() {
+        let mut incoming = serde_json::json!([
+            { "id": "a", "name": "renamed by the user", "lastBackup": "2026-08-30T10:00:00+00:00" },
+        ]);
+        let on_disk = serde_json::json!([
+            { "id": "a", "name": "old name", "lastBackup": "2026-08-31T09:00:00+00:00" },
+        ]);
+        keep_newer_last_backup(&mut incoming, &on_disk);
+        assert_eq!(incoming[0]["lastBackup"], "2026-08-31T09:00:00+00:00");
+        assert_eq!(
+            incoming[0]["name"], "renamed by the user",
+            "the user's edit still wins"
+        );
+    }
+
+    /// Absent, null, and a value the incoming list made *newer* all behave.
+    /// A task created by this very save has no counterpart on disk and must
+    /// be left exactly as sent, `lastBackup: null` included.
+    #[test]
+    fn a_newer_or_absent_counterpart_leaves_the_incoming_value_alone() {
+        let mut incoming = serde_json::json!([
+            { "id": "a", "lastBackup": null },
+            { "id": "b", "lastBackup": "2026-08-31T12:00:00+00:00" },
+            { "id": "new", "lastBackup": null },
+        ]);
+        let on_disk = serde_json::json!([
+            { "id": "a", "lastBackup": "2026-08-31T09:00:00+00:00" },
+            { "id": "b", "lastBackup": "2026-08-31T08:00:00+00:00" },
+        ]);
+        keep_newer_last_backup(&mut incoming, &on_disk);
+        assert_eq!(
+            incoming[0]["lastBackup"], "2026-08-31T09:00:00+00:00",
+            "null loses to a real stamp"
+        );
+        assert_eq!(
+            incoming[1]["lastBackup"], "2026-08-31T12:00:00+00:00",
+            "the newer one stands"
+        );
+        assert_eq!(
+            incoming[2]["lastBackup"],
+            Value::Null,
+            "a task with no counterpart on disk is untouched"
+        );
+    }
+
+    /// A task the user deleted must stay deleted: it is simply not in the
+    /// incoming list, and nothing here puts it back.
+    #[test]
+    fn a_deleted_task_is_not_resurrected_from_disk() {
+        let mut incoming = serde_json::json!([{ "id": "kept", "lastBackup": null }]);
+        let on_disk = serde_json::json!([
+            { "id": "kept", "lastBackup": "2026-08-31T09:00:00+00:00" },
+            { "id": "deleted", "lastBackup": "2026-08-31T09:30:00+00:00" },
+        ]);
+        keep_newer_last_backup(&mut incoming, &on_disk);
+        assert_eq!(incoming.as_array().unwrap().len(), 1);
+        assert_eq!(incoming[0]["id"], "kept");
     }
 }
