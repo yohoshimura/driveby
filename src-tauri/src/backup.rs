@@ -276,7 +276,7 @@ impl DestinationOutcome {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletePayload {
     pub backup_id: String,
@@ -395,29 +395,20 @@ pub async fn run_backup<R: Runtime>(
         },
         // Nothing ran at all: a missing source, no destination set, or two
         // destinations nested in one another. There is no per-destination
-        // detail to report because no destination was ever opened.
+        // detail to report because no destination was ever opened — so the
+        // counts stay at their defaults rather than being spelled out as
+        // None eleven times, and `skip_serializing_if` keeps them off the
+        // wire so the UI can tell "nothing to report" from "zero".
         Err(err) => CompletePayload {
             backup_id: backup_id.clone(),
             task_id: task.id.clone(),
-            success: false,
-            partial: false,
             cancelled,
-            destinations: Vec::new(),
             error: if cancelled {
                 None
             } else {
                 Some(err.to_string())
             },
-            path: None,
-            total_bytes: None,
-            total_files: None,
-            duration_ms: None,
-            skipped: None,
-            cleaned: None,
-            unchanged: None,
-            failed: None,
-            verified: None,
-            unreadable: None,
+            ..Default::default()
         },
     };
 
@@ -3382,5 +3373,34 @@ mod tests {
         assert!(matches!(keep.status("Readme.md"), KeepStatus::Exact));
         assert!(matches!(keep.status("README.md"), KeepStatus::Exact));
         assert!(matches!(keep.status("other.md"), KeepStatus::Absent));
+    }
+
+    /// The failure payload is what the history row and the toast are built
+    /// from, so a field quietly changing shape here is a UI bug two layers
+    /// away. Pinned against `Default` rather than against eighteen literals:
+    /// a run that never opened a destination knows four things, and the
+    /// remaining fourteen are absent — which is what `skip_serializing_if`
+    /// then keeps off the wire entirely.
+    #[test]
+    fn the_failure_payload_reports_only_what_it_knows() {
+        let payload = CompletePayload {
+            backup_id: "b1".into(),
+            task_id: "t1".into(),
+            cancelled: false,
+            error: Some("No destination set for this task".into()),
+            ..Default::default()
+        };
+        assert!(!payload.success && !payload.partial);
+        assert!(payload.destinations.is_empty());
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["error"], "No destination set for this task");
+        assert_eq!(json["success"], false);
+        assert!(
+            json.get("totalBytes").is_none(),
+            "absent counts must not serialise"
+        );
+        assert!(json.get("path").is_none());
+        assert!(json.get("verified").is_none());
     }
 }
