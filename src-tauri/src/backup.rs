@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -446,11 +446,11 @@ pub async fn run_backup<R: Runtime>(
 /// deliberately fail-open: an unreadable tasks.json must not make every backup
 /// refuse to start.
 async fn other_tasks<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Vec<Task> {
-    let Ok(dir) = app.path().app_data_dir() else {
+    let Ok(path) = persist::data_path(app, "tasks.json") else {
         return Vec::new();
     };
     let value: serde_json::Value =
-        persist::read_json_or(&dir.join("tasks.json"), serde_json::Value::Array(vec![])).await;
+        persist::read_json_or(&path, serde_json::Value::Array(vec![])).await;
     let Some(items) = value.as_array() else {
         return Vec::new();
     };
@@ -462,11 +462,9 @@ async fn other_tasks<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Vec<Task>
 }
 
 async fn update_last_backup<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Result<()> {
-    let dir = app.path().app_data_dir().ok();
-    let Some(dir) = dir else {
+    let Ok(path) = persist::data_path(app, "tasks.json") else {
         return Ok(());
     };
-    let path = dir.join("tasks.json");
     // Serialise with the JS-side writer via the shared persist mutex (#7).
     persist::with_tasks_lock(|| async {
         let mut value: serde_json::Value =

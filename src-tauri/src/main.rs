@@ -18,14 +18,6 @@ use tauri::Manager;
 use tracing::info;
 use tray::UiFlags;
 
-fn data_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {}", e))?;
-    Ok(dir.join(name))
-}
-
 fn default_settings() -> Value {
     serde_json::json!({
         "defaultDestination": "",
@@ -82,7 +74,7 @@ fn apply_speed_ceiling(settings: &Value) {
 
 #[tauri::command]
 async fn get_settings(app: tauri::AppHandle) -> Result<Value, String> {
-    let path = data_path(&app, "settings.json")?;
+    let path = persist::data_path(&app, "settings.json")?;
     Ok(persist::read_json_or(&path, default_settings()).await)
 }
 
@@ -92,7 +84,7 @@ async fn save_settings(
     flags: tauri::State<'_, UiFlags>,
     settings: Value,
 ) -> Result<(), String> {
-    let path = data_path(&app, "settings.json")?;
+    let path = persist::data_path(&app, "settings.json")?;
     flags.set_close_to_tray(close_to_tray_of(&settings));
     apply_speed_ceiling(&settings);
     persist::write_json_atomic(&path, &settings)
@@ -102,7 +94,7 @@ async fn save_settings(
 
 #[tauri::command]
 async fn get_tasks(app: tauri::AppHandle) -> Result<Value, String> {
-    let path = data_path(&app, "tasks.json")?;
+    let path = persist::data_path(&app, "tasks.json")?;
     Ok(persist::read_json_or(&path, Value::Array(vec![])).await)
 }
 
@@ -154,7 +146,7 @@ fn keep_newer_last_backup(incoming: &mut Value, on_disk: &Value) {
 
 #[tauri::command]
 async fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
-    let path = data_path(&app, "tasks.json")?;
+    let path = persist::data_path(&app, "tasks.json")?;
     let mut tasks = tasks;
     // Hold the same lock the backup pipeline uses, so two writes cannot
     // interleave — and re-read inside it, so the write cannot carry a
@@ -171,13 +163,13 @@ async fn save_tasks(app: tauri::AppHandle, tasks: Value) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_history(app: tauri::AppHandle) -> Result<Value, String> {
-    let path = data_path(&app, "history.json")?;
+    let path = persist::data_path(&app, "history.json")?;
     Ok(persist::read_json_or(&path, Value::Array(vec![])).await)
 }
 
 #[tauri::command]
 async fn save_history(app: tauri::AppHandle, history: Value) -> Result<(), String> {
-    let path = data_path(&app, "history.json")?;
+    let path = persist::data_path(&app, "history.json")?;
     persist::with_history_lock(|| async {
         persist::write_json_atomic(&path, &history)
             .await
@@ -326,7 +318,7 @@ fn main() {
             // in step from then on.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(path) = data_path(&handle, "settings.json") {
+                if let Ok(path) = persist::data_path(&handle, "settings.json") {
                     let settings = persist::read_json_or(&path, default_settings()).await;
                     handle
                         .state::<UiFlags>()

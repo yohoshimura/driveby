@@ -9,6 +9,24 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+/// Where a data document lives.
+///
+/// The one answer, so that no two modules can quietly disagree about which
+/// directory `tasks.json` is in — this was written three ways, and the three
+/// did not even agree on how to spell failure. Callers that must keep working
+/// without it still can: `.ok()` reads exactly as the `Option` version did.
+pub fn data_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    name: &str,
+) -> Result<PathBuf, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {}", e))?;
+    Ok(dir.join(name))
+}
+
 /// What loading a JSON document found.
 ///
 /// The distinction `read_json_or` could not make on its own: a document that

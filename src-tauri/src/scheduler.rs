@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, Local, Months, NaiveTime, TimeZone, Utc, Weekda
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::async_runtime;
@@ -126,10 +126,6 @@ fn next_due(anchor: DateTime<Utc>, interval: Interval) -> DateTime<Utc> {
             // Unreachable this side of year 262143; fall back to 31 days.
             .unwrap_or(anchor + chrono::Duration::days(31)),
     }
-}
-
-fn data_path(app: &AppHandle, name: &str) -> Option<PathBuf> {
-    app.path().app_data_dir().ok().map(|d| d.join(name))
 }
 
 /// Is `task` due, given when it last ran and when we first saw it?
@@ -276,12 +272,12 @@ pub fn spawn(app: AppHandle) {
         // daily tasks doesn't fire all five 10s after launch (#13). The
         // clocks are reloaded from scheduler.json so "first observation"
         // means first ever, not first since the last app restart.
-        let initial: HashMap<String, TaskClock> = match data_path(&app, "scheduler.json") {
-            Some(p) => {
+        let initial: HashMap<String, TaskClock> = match persist::data_path(&app, "scheduler.json") {
+            Ok(p) => {
                 let v = persist::read_json_or(&p, serde_json::json!({})).await;
                 serde_json::from_value(v).unwrap_or_default()
             }
-            None => HashMap::new(),
+            Err(_) => HashMap::new(),
         };
         let seen: Mutex<HashMap<String, TaskClock>> = Mutex::new(initial);
         // What the UI was last told about absent destinations. Held here
@@ -309,10 +305,10 @@ async fn tick(
     reported: &mut Vec<MissingDestinations>,
     dirty: &mut bool,
 ) -> anyhow::Result<()> {
-    let Some(tasks_path) = data_path(app, "tasks.json") else {
+    let Ok(tasks_path) = persist::data_path(app, "tasks.json") else {
         return Ok(());
     };
-    let Some(settings_path) = data_path(app, "settings.json") else {
+    let Ok(settings_path) = persist::data_path(app, "settings.json") else {
         return Ok(());
     };
 
@@ -536,7 +532,7 @@ async fn tick(
             None
         }
     };
-    if let (Some(snapshot), Some(path)) = (snapshot, data_path(app, "scheduler.json")) {
+    if let (Some(snapshot), Ok(path)) = (snapshot, persist::data_path(app, "scheduler.json")) {
         persist::write_json_atomic(&path, &snapshot).await?;
         // Cleared only once the clocks are actually on disk. `?` above leaves
         // it set, so the next tick writes them again rather than waiting for
