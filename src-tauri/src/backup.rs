@@ -1530,6 +1530,10 @@ async fn prune_destination(
         return Ok(());
     }
 
+    // One resolver for the whole walk: on the platforms that answer this by
+    // listing the parent directory, a fresh one per entry would list each
+    // parent once per child.
+    let mut names = crate::fsutil::NameResolver::default();
     let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![long_path(root)];
     let root_canonical = long_path(root);
@@ -1588,7 +1592,13 @@ async fn prune_destination(
                         // `keep` and deleted the file it had just copied —
                         // the backup silently lost it until the following
                         // run. Re-spell instead.
-                        recase_entry(&path, source_rel, stats).await;
+                        recase_entry(&path, source_rel, &mut names, stats).await;
+                    }
+                    KeepStatus::Ambiguous => {
+                        // Two source spellings fold onto this entry. Leave it
+                        // exactly as it is rather than guess which one it is:
+                        // a rename would land on the other, and a delete
+                        // would take a file the source still has.
                     }
                     KeepStatus::Absent => {
                         // A destination file that inherited READONLY from a
@@ -1636,13 +1646,44 @@ async fn prune_destination(
 /// we started from, and we leave it alone. That directory-level drift is
 /// `recase_dirs_phase`'s job, which runs before prune — so by the time this
 /// is reached, pure directory drift no longer reads as `CaseDrift` at all.
-async fn recase_entry(path: &Path, source_rel: &str, stats: &mut PhaseStats) {
+async fn recase_entry(
+    path: &Path,
+    source_rel: &str,
+    names: &mut crate::fsutil::NameResolver,
+    stats: &mut PhaseStats,
+) {
     let Some(name) = Path::new(source_rel).file_name() else {
         return;
     };
     let target = path.with_file_name(name);
     if target == path {
         return; // drift is in a parent component, not the file name
+    }
+    // Ask the directory what it actually holds, the way `recase_dirs_phase`
+    // does — `target.exists()` would be the wrong question, because where the
+    // volume folds case `target` and `path` *are* the same entry and every
+    // legitimate re-spelling would be refused.
+    //
+    // Where the volume folds, the lookup resolves `target` back to the very
+    // entry we are about to rename and answers with *that* spelling, which
+    // differs from `name`, so the rename goes ahead. Where the volume really
+    // does distinguish case — APFS formatted case-sensitive, a per-directory
+    // case-sensitive NTFS, a Linux share — an entry spelled exactly `name` is
+    // a second, real file, and renaming onto it would destroy it. fsutil says
+    // the same thing about directories at `DirNames`; the file path never had
+    // the guard.
+    //
+    // Prune deletes as it walks, so on the platforms that memoize listings a
+    // cached one can outlive a deletion this pass performed. The only effect
+    // is a re-spelling refused this run that succeeds on the next: the pass is
+    // idempotent and converges, which is worth more than invalidation would be.
+    if names.on_disk_name(&target).as_deref() == Some(name) {
+        warn!(
+            "not restoring source casing for {}: a separate entry is already spelled {}",
+            path.display(),
+            name.to_string_lossy()
+        );
+        return;
     }
     match fs::rename(path, &target).await {
         Ok(()) => stats.recased += 1,
@@ -1704,11 +1745,16 @@ pub(crate) fn is_icon_descriptor(rel_str: &str) -> bool {
 pub(crate) struct KeepSet {
     exact: HashSet<String>,
     /// Case-folding filesystems only: folded relative path -> the source's own
-    /// spelling. Left empty elsewhere rather than `cfg`-ed away, so that the
-    /// lookup below reads the same on every platform — an empty map simply
-    /// never reports drift. Building it for a 100k-file tree that can never
-    /// drift would still be a waste, hence the guard in `new`.
-    folded: std::collections::HashMap<String, String>,
+    /// spelling, or None when several source paths fold onto it and no single
+    /// spelling can be inferred. That is the same guard, for the same reason,
+    /// as `DirNames::folded` in fsutil — renaming one of two entries onto the
+    /// other would destroy a file.
+    ///
+    /// Left empty where the filesystem does not fold rather than `cfg`-ed
+    /// away, so that the lookup below reads the same on every platform — an
+    /// empty map simply never reports drift. Building it for a 100k-file tree
+    /// that can never drift would still be a waste, hence the guard in `new`.
+    folded: std::collections::HashMap<String, Option<String>>,
 }
 
 pub(crate) enum KeepStatus<'a> {
@@ -1717,6 +1763,9 @@ pub(crate) enum KeepStatus<'a> {
     /// The source has this file but spells it differently in case only.
     /// Carries the source's spelling.
     CaseDrift(&'a str),
+    /// Several source paths fold onto this one. Neither a rename nor a delete
+    /// can be inferred safely, so the entry is left exactly as it is.
+    Ambiguous,
     /// Genuinely gone from the source.
     Absent,
 }
@@ -1724,11 +1773,19 @@ pub(crate) enum KeepStatus<'a> {
 impl KeepSet {
     pub(crate) fn new(rels: impl Iterator<Item = String>) -> Self {
         let exact: HashSet<String> = rels.collect();
-        let folded = if CASE_INSENSITIVE_FS {
-            exact.iter().map(|r| (fold_rel(r), r.clone())).collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        let mut folded = std::collections::HashMap::new();
+        if CASE_INSENSITIVE_FS {
+            for r in &exact {
+                // `exact` is a set, so an occupied slot is always a genuine
+                // second spelling — never the same path seen twice. Collapsing
+                // it to None is what stops the survivor being decided by
+                // whichever order the HashSet happened to iterate in.
+                folded
+                    .entry(fold_rel(r))
+                    .and_modify(|slot: &mut Option<String>| *slot = None)
+                    .or_insert_with(|| Some(r.clone()));
+            }
+        }
         Self { exact, folded }
     }
 
@@ -1736,10 +1793,11 @@ impl KeepSet {
         if self.exact.contains(rel) {
             return KeepStatus::Exact;
         }
-        if let Some(source_rel) = self.folded.get(&fold_rel(rel)) {
-            return KeepStatus::CaseDrift(source_rel);
+        match self.folded.get(&fold_rel(rel)) {
+            Some(Some(source_rel)) => KeepStatus::CaseDrift(source_rel),
+            Some(None) => KeepStatus::Ambiguous,
+            None => KeepStatus::Absent,
         }
-        KeepStatus::Absent
     }
 }
 
@@ -3279,5 +3337,42 @@ mod tests {
         assert!(root.join("sub/keep.txt").exists());
         assert_eq!(stats.deleted, 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guard `fsutil` documents for directories and the file path never
+    /// had. A destination that really does hold two spellings — a case-
+    /// sensitive APFS volume, a Linux share — used to have prune rename one
+    /// onto the other, destroying a file the run had just copied while still
+    /// reporting success. Exercised with two names that differ by more than
+    /// case: that is the same code path, and the only version of it that can
+    /// be built on a filesystem which folds.
+    #[tokio::test]
+    async fn recase_refuses_to_rename_onto_an_entry_that_already_exists() {
+        let root = scratch("recase-collision");
+        std::fs::write(root.join("old.txt"), b"drifted").unwrap();
+        std::fs::write(root.join("new.txt"), b"already here").unwrap();
+
+        let mut names = crate::fsutil::NameResolver::default();
+        let mut stats = PhaseStats::default();
+        recase_entry(&root.join("old.txt"), "new.txt", &mut names, &mut stats).await;
+
+        assert_eq!(stats.recased, 0, "the rename must not have happened");
+        assert_eq!(std::fs::read(root.join("new.txt")).unwrap(), b"already here");
+        assert_eq!(std::fs::read(root.join("old.txt")).unwrap(), b"drifted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two source paths that fold together leave no single spelling to
+    /// restore. The old map kept whichever `HashSet` iteration yielded last,
+    /// so prune would re-spell a destination entry to an arbitrary one of the
+    /// two — and could pick the other one on the very next run.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_fold_two_source_paths_share_is_unanswerable() {
+        let keep = KeepSet::new(["Readme.md".to_string(), "README.md".to_string()].into_iter());
+        assert!(matches!(keep.status("readme.md"), KeepStatus::Ambiguous));
+        assert!(matches!(keep.status("Readme.md"), KeepStatus::Exact));
+        assert!(matches!(keep.status("README.md"), KeepStatus::Exact));
+        assert!(matches!(keep.status("other.md"), KeepStatus::Absent));
     }
 }
