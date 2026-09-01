@@ -994,13 +994,12 @@ async fn recase_dirs_phase<R: Runtime>(
 /// copy", not "delete from dest" (#2) — as are paths the walk could not read.
 async fn prune_phase<R: Runtime>(
     ctx: &RunCtx<'_, R>,
-    files: &[FileEntry],
+    keep: &KeepSet,
     protected: &ProtectedSet<'_>,
     stats: &mut PhaseStats,
 ) -> Result<()> {
     ctx.emit_phase("pruning", stats.copied_bytes, stats.copied_files, None);
-    let keep = KeepSet::new(files.iter().map(|f| f.rel.clone()));
-    if let Err(e) = prune_destination(ctx.target, &keep, protected, ctx.token, stats).await {
+    if let Err(e) = prune_destination(ctx.target, keep, protected, ctx.token, stats).await {
         ctx.check_cancelled()?;
         warn!("prune destination failed: {}", e);
     }
@@ -1215,6 +1214,11 @@ async fn execute_all<R: Runtime>(
     // of the source side, identical for every destination.
     let protected = ProtectedSet::new(&walked, &patterns);
 
+    // Folded once for the run, for the same reason as the ProtectedSet above
+    // and the way preview.rs already does it: which destination we happen to
+    // be writing has no bearing on what the source says should be kept.
+    let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
+
     let dest_count = destinations.len() as u32;
     let mut outcomes: Vec<DestinationOutcome> = Vec::with_capacity(destinations.len());
     for (index, destination) in destinations.iter().enumerate() {
@@ -1246,6 +1250,7 @@ async fn execute_all<R: Runtime>(
             dest_count,
             &mut walked,
             &protected,
+            &keep,
             settings,
             token,
         )
@@ -1282,6 +1287,7 @@ async fn execute_one<R: Runtime>(
     dest_count: u32,
     walked: &mut WalkResult,
     protected: &ProtectedSet<'_>,
+    keep: &KeepSet,
     settings: &Settings,
     token: &CancellationToken,
 ) -> Result<DestinationOutcome> {
@@ -1303,7 +1309,7 @@ async fn execute_one<R: Runtime>(
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
     #[cfg(any(windows, target_os = "macos"))]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
-    prune_phase(&ctx, &walked.files, protected, &mut stats).await?;
+    prune_phase(&ctx, keep, protected, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
     mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
 
@@ -2187,6 +2193,7 @@ mod tests {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
         let mut walked = walk(Path::new(&task.source), &patterns, token).await?;
         let protected = ProtectedSet::new(&walked, &patterns);
+        let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
         execute_one(
             app,
             backup_id,
@@ -2196,6 +2203,7 @@ mod tests {
             1,
             &mut walked,
             &protected,
+            &keep,
             settings,
             token,
         )
