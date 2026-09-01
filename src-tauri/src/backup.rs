@@ -1,6 +1,6 @@
 use crate::fsutil::{
-    apply_attrs, clear_readonly, long_path, path_contains, read_attrs, reject_overlap,
-    scratch_path, ATTR_KEEP, CASE_INSENSITIVE_FS,
+    apply_attrs, blocking, clear_readonly, finish_copy, long_path, mirror_dir_attrs,
+    path_contains, read_attrs, reject_overlap, scratch_path, CASE_INSENSITIVE_FS,
 };
 use crate::glob;
 use crate::persist;
@@ -8,7 +8,6 @@ use crate::ratelimit;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
-use filetime::FileTime;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -956,7 +955,7 @@ async fn recase_dirs_phase<R: Runtime>(
         let dest = ctx.target.join(rel);
         // Not created yet (empty source dirs only materialize in
         // mirror_dir_attrs_phase) — nothing to re-spell.
-        let Some(actual) = names.on_disk_name(&dest) else {
+        let Some(actual) = names.on_disk_name_async(&dest).await else {
             continue;
         };
         if actual == want {
@@ -1109,23 +1108,15 @@ async fn mirror_dir_attrs_phase<R: Runtime>(
             warn!("could not ensure destination dir {}: {}", rel, e);
             continue;
         }
-        let Some(src_attrs) = read_attrs(src_dir) else {
-            continue;
-        };
-        let want = src_attrs & ATTR_KEEP;
-        apply_attrs(&dest_dir, src_attrs);
-        if want == 0 {
-            continue;
-        }
-        if let Some(got_full) = read_attrs(&dest_dir) {
-            let got = got_full & ATTR_KEEP;
-            if got != want {
-                stats.attr_drift += 1;
-                warn!(
-                    "destination folder attrs at {} did not stick: want={:#x} got={:#x} (filesystem may not support these bits)",
-                    rel, want, got
-                );
-            }
+        // Four synchronous calls per directory, made in one hop: read the
+        // source's bits, put them on the destination, and read them back to
+        // see whether the filesystem kept them.
+        if let Some((want, got)) = mirror_dir_attrs(src_dir.clone(), dest_dir).await {
+            stats.attr_drift += 1;
+            warn!(
+                "destination folder attrs at {} did not stick: want={:#x} got={:#x} (filesystem may not support these bits)",
+                rel, want, got
+            );
         }
     }
     if stats.attr_drift > 0 {
@@ -1599,7 +1590,8 @@ async fn prune_destination(
                         // A destination file that inherited READONLY from a
                         // source file that has since been deleted would
                         // otherwise be un-prunable forever.
-                        clear_readonly(&path);
+                        let outgoing = path.clone();
+                        blocking(move || clear_readonly(&outgoing)).await;
                         if fs::remove_file(&path).await.is_ok() {
                             stats.deleted += 1;
                         }
@@ -1623,11 +1615,17 @@ async fn prune_destination(
         // out on cancellation: pressing Stop then left the whole destination
         // rendering with default folder icons. Strip it only when a removal
         // actually needs it, and put it back if the directory stays.
-        let attrs = read_attrs(&d);
-        clear_readonly(&d);
+        let probe = d.clone();
+        let attrs = blocking(move || {
+            let attrs = read_attrs(&probe);
+            clear_readonly(&probe);
+            attrs
+        })
+        .await;
         if fs::remove_dir(&d).await.is_err() {
             if let Some(a) = attrs {
-                apply_attrs(&d, a);
+                let restore = d.clone();
+                blocking(move || apply_attrs(&restore, a)).await;
             }
         }
     }
@@ -1672,7 +1670,7 @@ async fn recase_entry(
     // cached one can outlive a deletion this pass performed. The only effect
     // is a re-spelling refused this run that succeeds on the next: the pass is
     // idempotent and converges, which is worth more than invalidation would be.
-    if names.on_disk_name(&target).as_deref() == Some(name) {
+    if names.on_disk_name_async(&target).await.as_deref() == Some(name) {
         warn!(
             "not restoring source casing for {}: a separate entry is already spelled {}",
             path.display(),
@@ -2016,7 +2014,8 @@ async fn copy_file<F: FnMut(i64)>(
     // was already copied. Opening the source first also means a locked file
     // fails before anything at the destination has been disturbed.
     // A scratch file left by a killed run may still carry +R.
-    clear_readonly(&tmp_l);
+    let leftover = tmp_l.clone();
+    blocking(move || clear_readonly(&leftover)).await;
     let mut writer = fs::File::create(&tmp_l)
         .await
         .context("create destination")?;
@@ -2075,21 +2074,21 @@ async fn copy_file<F: FnMut(i64)>(
         return Err(e);
     }
 
-    if settings.preserve_mtime() {
-        if let Ok(ft) = src_meta.modified() {
-            let ft = FileTime::from_system_time(ft);
-            let _ = filetime::set_file_mtime(&tmp_l, ft);
-        }
-    }
-    // Preserve Hidden / System / ReadOnly so things like `desktop.ini`
-    // (which drives custom Windows folder icons) keep their attributes.
-    if let Some(attrs) = read_attrs(src) {
-        apply_attrs(&tmp, attrs);
-    }
-    // MoveFileEx will not replace a +R file, so the bit has to come off the
-    // outgoing copy. Not off the scratch file: it may legitimately carry the
-    // attribute forward from the source.
-    clear_readonly(&dest_l);
+    // The source's mtime, the source's kept attribute bits, and the read-only
+    // bit off the file the rename is about to replace — one hop onto the
+    // blocking pool instead of four synchronous calls on a worker that is also
+    // serving the UI and the scheduler. `preserveMtime: false` is spelled here
+    // as no mtime at all.
+    //
+    // Preserving Hidden / System / ReadOnly is what keeps things like
+    // `desktop.ini` — which drives custom Windows folder icons — working at
+    // the destination; and MoveFileEx will not replace a +R file, so without
+    // the clear the rename below fails outright.
+    let mtime = settings
+        .preserve_mtime()
+        .then(|| src_meta.modified().ok())
+        .flatten();
+    finish_copy(src.to_path_buf(), tmp, dest_l.clone(), mtime).await;
     fs::rename(&tmp_l, &dest_l)
         .await
         .context("commit destination")?;

@@ -312,6 +312,120 @@ pub fn apply_attrs(_p: &Path, _attrs: u32) {}
 pub fn clear_readonly(_p: &Path) {}
 
 // ─────────────────────────────────────────────────────────────────────
+// Getting the synchronous calls off the async workers
+// ─────────────────────────────────────────────────────────────────────
+
+/// Run a synchronous filesystem call off the async workers.
+///
+/// Every syscall in this module is synchronous, and against a network
+/// destination — supported since 1.7.2, "one that lives at a friend's house" —
+/// any of them can take seconds. On an async worker that is worse than slow:
+/// the workers also serve Tauri's IPC and the scheduler, and `copy_phase` runs
+/// `parallelCopies` copies at once, so a handful of them against a stalled
+/// share can occupy every worker the runtime has. The Stop button then stops
+/// being answered, which is precisely when the user is reaching for it.
+///
+/// Callers group the calls that already sit together into one hop rather than
+/// wrapping each syscall: one task handoff per file beats six, and on a
+/// 100k-file tree the difference is not small.
+///
+/// Two synchronous callers are deliberately left as they are, so that nobody
+/// reads them as an oversight: `path_contains` canonicalises a handful of
+/// times when a run starts rather than once per file, and `main`'s startup
+/// `create_dir_all` calls run before the runtime has anything else to do.
+pub async fn blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        // A blocking task cannot be cancelled once it has started and this
+        // always awaits it, so the only JoinError reachable here is a panic
+        // inside `f`. Re-raise rather than invent a value: a panicking
+        // attribute call is a bug, and swallowing it would hide it behind a
+        // run that reports success.
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+/// The metadata a freshly written scratch file needs before it can be renamed
+/// into place: the source's mtime, the source's kept attribute bits, and the
+/// read-only bit off whatever it is about to replace.
+///
+/// Both pipelines made these four calls inline and identically. `mtime: None`
+/// is how the backup side spells `preserveMtime: false`; the restore side
+/// always passes one, because without the round-trip every following sync
+/// re-copies every file.
+///
+/// The `clear_readonly` is not optional housekeeping: MoveFileEx will not
+/// replace a `+R` file, so the rename that follows fails outright without it.
+/// It is deliberately *not* applied to the scratch file, which may legitimately
+/// be carrying the attribute forward from the source.
+pub async fn finish_copy(
+    src: PathBuf,
+    tmp: PathBuf,
+    dest: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+) {
+    blocking(move || {
+        if let Some(t) = mtime {
+            let _ = filetime::set_file_mtime(
+                long_path(&tmp),
+                filetime::FileTime::from_system_time(t),
+            );
+        }
+        if let Some(attrs) = read_attrs(&src) {
+            apply_attrs(&tmp, attrs);
+        }
+        clear_readonly(&dest);
+    })
+    .await
+}
+
+/// Mirror one directory's attributes onto its destination counterpart, and
+/// report whether they stuck: the bits wanted against the bits observed, or
+/// None when they matched, when the source had none worth mirroring, or when
+/// the source could not be read.
+///
+/// The mismatch is worth reporting because it is what surfaces filesystem
+/// limits rather than letting them pass silently — exFAT drops `+R` on
+/// directories, and a custom folder icon then renders as a default one.
+pub async fn mirror_dir_attrs(src_dir: PathBuf, dest_dir: PathBuf) -> Option<(u32, u32)> {
+    blocking(move || {
+        let src_attrs = read_attrs(&src_dir)?;
+        let want = src_attrs & ATTR_KEEP;
+        apply_attrs(&dest_dir, src_attrs);
+        if want == 0 {
+            return None;
+        }
+        let got = read_attrs(&dest_dir)? & ATTR_KEEP;
+        (got != want).then_some((want, got))
+    })
+    .await
+}
+
+impl NameResolver {
+    /// `on_disk_name`, off the async workers.
+    ///
+    /// The resolver travels into the blocking task and back out again because
+    /// its memoized listings have to survive the hop — losing them would put
+    /// `recase_dirs_phase` back to listing each parent once per child, which
+    /// is quadratic in the width of the tree.
+    pub async fn on_disk_name_async(&mut self, p: &Path) -> Option<std::ffi::OsString> {
+        let mut owned = std::mem::take(self);
+        let path = p.to_path_buf();
+        let (owned, answer) = blocking(move || {
+            let answer = owned.on_disk_name(&path);
+            (owned, answer)
+        })
+        .await;
+        *self = owned;
+        answer
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Source / destination overlap rejection
 // ─────────────────────────────────────────────────────────────────────
 
@@ -614,5 +728,98 @@ mod tests {
         assert!(reject_overlap(&a, &b).is_ok());
         let _ = std::fs::remove_dir(&a);
         let _ = std::fs::remove_dir(&b);
+    }
+
+    /// A panic inside a blocking call must reach the caller. Swallowing it
+    /// would leave a run reporting success over metadata that was never
+    /// applied — the failure mode the whole module exists to prevent.
+    #[tokio::test]
+    #[should_panic(expected = "attribute call blew up")]
+    async fn a_panic_on_the_blocking_pool_reaches_the_caller() {
+        blocking(|| panic!("attribute call blew up")).await
+    }
+
+    /// The mtime round-trip both pipelines depend on: without it every sync
+    /// re-copies every file, because the destination's timestamp never
+    /// matches the source's.
+    #[tokio::test]
+    async fn finish_copy_carries_the_source_mtime_to_the_scratch_file() {
+        let root = make_test_dir("finish-copy-mtime");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("src.txt");
+        let tmp = root.join("dest.txt.driveby-tmp");
+        let dest = root.join("dest.txt");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&tmp, b"source").unwrap();
+
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        finish_copy(src, tmp.clone(), dest, Some(when)).await;
+
+        let got = std::fs::metadata(&tmp).unwrap().modified().unwrap();
+        assert_eq!(got, when, "the scratch file must carry the source's mtime");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other three calls, which only Windows can observe: the source's
+    /// kept attribute bits land on the scratch file, and the read-only bit
+    /// comes off the file the rename is about to replace — MoveFileEx will
+    /// not replace a `+R` file, so without that last part the copy fails.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn finish_copy_mirrors_attrs_and_frees_the_outgoing_file() {
+        let root = make_test_dir("finish-copy-attrs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("src.txt");
+        let tmp = root.join("dest.txt.driveby-tmp");
+        let dest = root.join("dest.txt");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&tmp, b"source").unwrap();
+        std::fs::write(&dest, b"stale").unwrap();
+        apply_attrs(&src, 0x2); // HIDDEN
+        apply_attrs(&dest, 0x1); // the +R that would block the rename
+
+        finish_copy(src, tmp.clone(), dest.clone(), None).await;
+
+        assert_eq!(
+            read_attrs(&tmp).unwrap() & ATTR_KEEP,
+            0x2,
+            "the source's kept bits must be mirrored onto the scratch file"
+        );
+        assert_eq!(
+            read_attrs(&dest).unwrap() & 0x1,
+            0,
+            "the outgoing file must no longer be read-only"
+        );
+        assert!(
+            std::fs::rename(&tmp, &dest).is_ok(),
+            "the rename this exists to make possible must work"
+        );
+        clear_readonly(&dest);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory whose attributes take needs no report; one whose bits do
+    /// not stick reports what was wanted against what the filesystem kept —
+    /// exFAT silently drops `+R` on directories, and a custom folder icon
+    /// then renders as a default one.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mirror_dir_attrs_is_quiet_when_the_bits_take() {
+        let root = make_test_dir("mirror-dir-attrs");
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let dst = root.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        apply_attrs(&src, 0x1); // a custom-icon folder carries +R
+
+        assert_eq!(mirror_dir_attrs(src.clone(), dst.clone()).await, None);
+        assert_eq!(read_attrs(&dst).unwrap() & ATTR_KEEP, 0x1);
+
+        clear_readonly(&src);
+        clear_readonly(&dst);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

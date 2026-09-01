@@ -1,8 +1,8 @@
 use crate::fsutil::{
-    apply_attrs, clear_readonly, long_path, read_attrs, reject_overlap, scratch_path,
+    apply_attrs, blocking, clear_readonly, finish_copy, long_path, read_attrs, reject_overlap,
+    scratch_path,
 };
 use anyhow::{anyhow, Context, Result};
-use filetime::FileTime;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -337,9 +337,14 @@ async fn restore_dirs(
             warn!("could not recreate directory {}: {}", rel, e);
             continue;
         }
-        if let Some(attrs) = read_attrs(src_dir) {
-            apply_attrs(&dst_dir, attrs);
-        }
+        let src_dir = src_dir.clone();
+        let dst = dst_dir.clone();
+        blocking(move || {
+            if let Some(attrs) = read_attrs(&src_dir) {
+                apply_attrs(&dst, attrs);
+            }
+        })
+        .await;
     }
 }
 
@@ -374,7 +379,8 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
     // neither their own copy nor ours. Nothing at `dst` is touched until
     // the rename at the bottom.
     // A scratch file left by a killed run may still carry +R.
-    clear_readonly(tmp);
+    let leftover = tmp.to_path_buf();
+    blocking(move || clear_readonly(&leftover)).await;
     let mut w = fs::File::create(tmp).await.context("create destination")?;
     let streamed = async {
         let mut buf = vec![0u8; 256 * 1024];
@@ -404,26 +410,28 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
     if let Err(e) = streamed {
         // Only the scratch file goes. Whatever the user already had at the
         // destination is still exactly as they left it.
-        clear_readonly(tmp);
+        let leftover = tmp.to_path_buf();
+        blocking(move || clear_readonly(&leftover)).await;
         let _ = fs::remove_file(tmp).await;
         return Err(e);
     }
-    // Round-trip mtime so a follow-up sync doesn't re-copy everything (#6).
-    if let Ok(t) = src_meta.modified() {
-        let _ = filetime::set_file_mtime(tmp, FileTime::from_system_time(t));
-    }
-    // Mirror Hidden/System/ReadOnly the way the backup pipeline does — a
-    // restored `desktop.ini` without its attributes leaves the folder
-    // rendering with a default icon, which is precisely the thing the
-    // backup side goes to some length to preserve.
-    if let Some(attrs) = read_attrs(src) {
-        apply_attrs(tmp, attrs);
-    }
-    // A read-only file already sitting in the chosen destination would make
-    // the replace fail outright on Windows, so the bit comes off the
-    // outgoing file only — never off the scratch copy, which may carry the
+    // The mtime round-trip so a follow-up sync doesn't re-copy everything
+    // (#6); Hidden/System/ReadOnly mirrored the way the backup pipeline does,
+    // because a restored `desktop.ini` without its attributes leaves the
+    // folder rendering with a default icon; and the read-only bit off the
+    // outgoing file, which would otherwise make the replace fail outright on
+    // Windows. Never off the scratch copy, which may legitimately carry the
     // attribute forward from the backup.
-    clear_readonly(dst);
+    //
+    // One hop onto the blocking pool for all four, rather than four
+    // synchronous calls on a worker that is also answering the UI.
+    finish_copy(
+        src.to_path_buf(),
+        tmp.to_path_buf(),
+        dst.to_path_buf(),
+        src_meta.modified().ok(),
+    )
+    .await;
     fs::rename(tmp, dst).await.context("commit destination")?;
     Ok(())
 }
