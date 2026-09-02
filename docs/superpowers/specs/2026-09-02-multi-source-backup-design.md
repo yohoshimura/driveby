@@ -36,11 +36,16 @@ The layout never depends on how many sources a task has, so nothing in the
 code is conditional on the count and there is nothing to explain to the user.
 
 **Accepted cost:** every backup written by 1.7.4 or earlier changes shape. On
-the first run after the upgrade, prune no longer finds the root-level files in
-the keep set (which now says `Photos/…`), deletes them, and the copy phase
-rewrites them one level down. The final state is correct and the code path
-already exists — but it is a full delete-and-recopy, and **between the two the
-destination does not hold the backup**.
+the first run after the upgrade the copy phase writes every file into
+`dest/<Folder>/`, and prune — which runs *after* it (`execute_one`: copy,
+recase-dirs, prune, verify-icons, mirror-attrs) — then finds the old root-level
+files absent from the keep set, which now says `Photos/…`, and deletes them.
+
+So the order is copy-then-delete, not delete-then-copy: **there is no window
+during which the destination holds no backup.** What it does cost is room for
+both copies at once, and moving every byte a second time. An earlier draft of
+this document had the order backwards and warned of a gap that cannot occur;
+the phases are the authority.
 
 Chosen deliberately over a rename-based migration. No migration code is
 written.
@@ -185,16 +190,20 @@ deleted for it".
 
 ## Behaviour changes worth naming
 
-1. **Existing backups are reshaped** on the first run after the upgrade — a
-   full delete-and-recopy, with a window during which the destination does not
-   hold the backup. Accepted; see *The layout decision*. It goes in the
-   CHANGELOG.
+1. **Existing backups are reshaped** on the first run after the upgrade — every
+   byte re-copied one level down, then the old flat mirror pruned. It needs
+   room for both copies at once. Accepted; see *The layout decision*. It goes
+   in the CHANGELOG.
 2. **A source-root `desktop.ini` becomes the subfolder's icon descriptor.**
-   `is_root_icon_marker` matches only a `desktop.ini` whose rel has no `/`;
-   after prefixing, a source-root one is `Photos/desktop.ini` and no longer
-   qualifies. This is more correct than today — the destination root now
-   belongs to the user rather than to whichever source happened to own it —
-   but it is a change, not a neutral consequence.
+   This does **not** fall out of prefixing, as an earlier draft claimed. `walk`
+   carried an explicit suppression — a source-root `desktop.ini` was dropped
+   and recorded as excluded — and it is keyed on the *unprefixed* source rel,
+   so `walk_all` cannot reach it. Removing that block is what relocates the
+   descriptor, and it is safe because the effect that mattered survives
+   elsewhere: `ProtectedSet::covers` tests `is_root_icon_marker(rel)` before it
+   consults `excluded` at all, so an existing destination-root `desktop.ini` is
+   still protected from prune. The suppression existed only because a source
+   root used to map onto the destination root. It no longer does.
 
 ## Interface
 
