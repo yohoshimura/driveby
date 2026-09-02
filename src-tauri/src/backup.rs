@@ -719,13 +719,52 @@ pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
         }
         validate_folder_name(&source.folder)?;
     }
+    // Fully qualified: backup.rs imports HashSet, not HashMap, and `KeepSet`
+    // right below already spells this type out the same way.
+    let mut claimed: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for source in &sources {
+        // Folded, because two names differing only in case are one folder on
+        // the filesystems this app is mostly pointed at.
+        if let Some(first) = claimed.insert(fold_rel(&source.folder), &source.path) {
+            return Err(anyhow!(
+                "Two sources cannot write to the same folder \"{}\": {} and {}",
+                source.folder,
+                first,
+                source.path
+            ));
+        }
+    }
     Ok(sources)
 }
 
-/// Filled in by the folder-name rules in the guards task.
+/// A source's destination subfolder is a folder *name*, not a path.
+///
+/// A separator would invent a hierarchy the user did not ask for, and `..`
+/// would climb out of the destination altogether — both write outside the
+/// folder the task was pointed at, which is the one thing a destination is
+/// supposed to bound.
 fn validate_folder_name(folder: &str) -> Result<()> {
-    if folder.trim().is_empty() {
+    let name = folder.trim();
+    if name.is_empty() {
         return Err(anyhow!("A source's destination folder cannot be empty"));
+    }
+    if name == "." || name == ".." {
+        return Err(anyhow!("\"{}\" is not a folder name", name));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(anyhow!(
+            "A source's destination folder is a name, not a path: \"{}\"",
+            name
+        ));
+    }
+    // The set Windows refuses outright. Checked on every platform so that a
+    // task written on Linux does not fail only once it reaches a Windows
+    // machine through a synced tasks.json.
+    if name.contains(|c: char| "<>:\"|?*".contains(c) || (c as u32) < 0x20) {
+        return Err(anyhow!(
+            "A source's destination folder cannot contain <>:\"|?* : \"{}\"",
+            name
+        ));
     }
     Ok(())
 }
@@ -819,19 +858,38 @@ pub(crate) fn reject_destination_overlaps(
     sources: &[PathBuf],
     destinations: &[PathBuf],
 ) -> Result<()> {
-    for source in sources {
-        for (i, dest) in destinations.iter().enumerate() {
+    for (i, source) in sources.iter().enumerate() {
+        // Nesting one source in another backs the inner one up twice, into
+        // two subfolders, and every run copies it twice for ever.
+        for other in &sources[i + 1..] {
+            if path_contains(source, other) || path_contains(other, source) {
+                return Err(anyhow!(
+                    "Sources cannot be inside one another: {} and {}",
+                    source.display(),
+                    other.display()
+                ));
+            }
+        }
+        for dest in destinations {
             reject_overlap(source, dest)?;
-            for other in &destinations[i + 1..] {
-                // path_contains is reflexive, so this also catches the same
-                // folder listed twice under two spellings.
-                if path_contains(dest, other) || path_contains(other, dest) {
-                    return Err(anyhow!(
-                        "Destinations cannot overlap: {} and {}",
-                        dest.display(),
-                        other.display()
-                    ));
-                }
+        }
+    }
+    // A pass of its own, not nested under the sources loop above: this check
+    // is entirely about `destinations`, and its meaning should not depend on
+    // `sources` happening to be non-empty. Both current callers preflight a
+    // non-empty source list first, so this was never reachable with zero
+    // sources — but a safety check earning its keep only by accident of a
+    // caller it cannot see is the wrong kind of correct.
+    for (j, dest) in destinations.iter().enumerate() {
+        for other in &destinations[j + 1..] {
+            // path_contains is reflexive, so this also catches the same
+            // folder listed twice under two spellings.
+            if path_contains(dest, other) || path_contains(other, dest) {
+                return Err(anyhow!(
+                    "Destinations cannot overlap: {} and {}",
+                    dest.display(),
+                    other.display()
+                ));
             }
         }
     }
@@ -2657,6 +2715,81 @@ mod tests {
             !backed_up(&dests[0], &source).join("a.txt").exists(),
             "nothing may be written when the configuration is unsafe"
         );
+    }
+
+    /// Nesting one source inside another backs the inner one up twice, into
+    /// two different subfolders. Refuse it the way every other overlap in
+    /// this crate is refused, rather than quietly doing the work twice.
+    #[test]
+    fn nested_sources_are_refused() {
+        let outer = PathBuf::from("/data");
+        let inner = PathBuf::from("/data/photos");
+        let dest = PathBuf::from("/backup");
+        assert!(reject_destination_overlaps(&[outer, inner], &[dest]).is_err());
+    }
+
+    /// Two sources claiming the same subfolder would interleave at the
+    /// destination and have prune fight itself. The comparison folds case
+    /// where the filesystem does, so `Photos` and `photos` collide on NTFS
+    /// and APFS — the same rule `KeepSet` uses.
+    #[test]
+    fn two_sources_cannot_claim_the_same_folder() {
+        let task = Task {
+            id: "t".into(),
+            name: "t".into(),
+            source: None,
+            sources: Some(vec![
+                Source { path: "/work/photos".into(), folder: "Photos".into() },
+                Source { path: "/home/photos".into(), folder: "Photos".into() },
+            ]),
+            destination: None,
+            destinations: None,
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+        assert!(preflight_sources(&task).is_err());
+    }
+
+    /// A folder name is a name, not a path. `..` would climb out of the
+    /// destination entirely and a separator would invent a hierarchy the
+    /// user did not ask for — both write outside where the task was pointed.
+    #[test]
+    fn a_folder_name_that_is_really_a_path_is_refused() {
+        for bad in ["", "   ", ".", "..", "a/b", "a\\b", "../escape"] {
+            assert!(
+                validate_folder_name(bad).is_err(),
+                "{:?} should not be usable as a folder name",
+                bad
+            );
+        }
+        for good in ["Photos", "Photos-Work", "Mes documents", "2024.backup"] {
+            assert!(validate_folder_name(good).is_ok(), "{:?} should be fine", good);
+        }
+    }
+
+    /// The cross-task guard has to see every source, not just the first.
+    /// A destination sitting on another task's second source would have this
+    /// run prune away the files that task backs up from.
+    #[test]
+    fn a_destination_over_another_tasks_second_source_is_refused() {
+        let other = Task {
+            id: "other".into(),
+            name: "other".into(),
+            source: None,
+            sources: Some(vec![
+                Source { path: "/a".into(), folder: "A".into() },
+                Source { path: "/b".into(), folder: "B".into() },
+            ]),
+            destination: None,
+            destinations: Some(vec!["/elsewhere".into()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+        assert!(reject_foreign_overlaps("mine", &[PathBuf::from("/b")], &[other]).is_err());
     }
 
     /// A tasks.json written before 1.7.2 has a single `destination` string
