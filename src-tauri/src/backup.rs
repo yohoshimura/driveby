@@ -2016,6 +2016,96 @@ pub(crate) async fn walk(
     })
 }
 
+/// Walk every source and merge the results into the single `WalkResult` the
+/// rest of the pipeline already expects.
+///
+/// `FileEntry.rel` is the only thing that decides where a file lands —
+/// `copy_one` writes `target.join(&file.rel)` — so putting each source in its
+/// own destination subfolder is entirely a matter of prefixing `rel`. `walk`
+/// itself stays single-source and knows nothing about any of this.
+///
+/// A source that cannot be read does not fail the run: it contributes no
+/// files and records its folder as unreadable, which is what makes
+/// `ProtectedSet::covers` have prune walk around that subtree instead of
+/// deleting the only copy of a folder whose drive is merely unplugged.
+/// Failing every source *is* fatal — an empty walk would otherwise report
+/// success and stamp `lastBackup` over a run that did nothing.
+///
+/// Not called outside tests yet — the pipeline wiring lands separately.
+/// Gated to non-test builds: under `cfg(test)` this module's tests already
+/// call it, so `expect` would be unfulfilled there. In a plain build it is
+/// genuinely dead for now, and `expect` over `allow` means the moment
+/// something calls this for real, the lint stops firing and the attribute
+/// itself becomes a build error — the prompt to delete it.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) async fn walk_all(
+    sources: &[Source],
+    patterns: &glob::PatternSet,
+    token: &CancellationToken,
+) -> Result<WalkResult> {
+    let mut merged = WalkResult {
+        files: Vec::new(),
+        dirs: Vec::new(),
+        total_bytes: 0,
+        skipped: 0,
+        excluded: HashSet::new(),
+        unreadable: HashSet::new(),
+    };
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut walked_any = false;
+
+    for source in sources {
+        if token.is_cancelled() {
+            return Err(anyhow!(CANCELLED_MSG));
+        }
+        let root = PathBuf::from(&source.path);
+        let prefix = source.folder.as_str();
+
+        // The folder itself, so a source with no files still materialises at
+        // the destination — `mirror_dir_attrs_phase` is what creates it.
+        merged.dirs.push((root.clone(), prefix.to_string()));
+
+        let walked = match walk(&root, patterns, token).await {
+            Ok(w) => w,
+            Err(e) if token.is_cancelled() => return Err(e),
+            Err(e) => {
+                warn!(source = %root.display(), "source could not be read: {}", e);
+                merged.unreadable.insert(prefix.to_string());
+                merged.skipped += 1;
+                last_error = Some(e);
+                continue;
+            }
+        };
+        walked_any = true;
+
+        let join = |rel: &str| {
+            if rel.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{}/{}", prefix, rel)
+            }
+        };
+        merged.total_bytes += walked.total_bytes;
+        merged.skipped += walked.skipped;
+        merged
+            .files
+            .extend(walked.files.into_iter().map(|f| FileEntry { rel: join(&f.rel), ..f }));
+        merged
+            .dirs
+            .extend(walked.dirs.into_iter().map(|(p, rel)| (p, join(&rel))));
+        merged.excluded.extend(walked.excluded.iter().map(|r| join(r)));
+        merged.unreadable.extend(walked.unreadable.iter().map(|r| join(r)));
+    }
+
+    if !walked_any {
+        return Err(match last_error {
+            Some(e) => e,
+            None => anyhow!("No source folder set for this task"),
+        });
+    }
+    Ok(merged)
+}
+
 /// `on_progress` receives signed byte deltas: positive for streamed chunks,
 /// one negative correction when an attempt fails or is cancelled (the
 /// worker takes its own bytes back out of the shared counter). On success,
@@ -3431,6 +3521,138 @@ mod tests {
         assert!(walk(&missing, &glob::PatternSet::new(&[]), &CancellationToken::new())
             .await
             .is_err());
+    }
+
+    /// The feature's central property: two sources land in two subtrees and
+    /// never interleave, and the absolute path each entry was read from is
+    /// untouched — only where it is written changes.
+    #[tokio::test]
+    async fn walk_all_prefixes_each_source_with_its_folder() {
+        let root = scratch("walk-all-two");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/one.txt"), b"1").unwrap();
+        std::fs::write(root.join("b/two.txt"), b"22").unwrap();
+
+        let sources = vec![
+            Source { path: root.join("a").to_string_lossy().into(), folder: "Alpha".into() },
+            Source { path: root.join("b").to_string_lossy().into(), folder: "Beta".into() },
+        ];
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let mut rels: Vec<&str> = walked.files.iter().map(|f| f.rel.as_str()).collect();
+        rels.sort();
+        assert_eq!(rels, vec!["Alpha/one.txt", "Beta/two.txt"]);
+        assert_eq!(walked.total_bytes, 3, "sizes are summed across sources");
+        assert!(
+            walked.files.iter().all(|f| f.path.is_absolute()),
+            "the read side keeps the real source path"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A source with no files still has to materialise its folder, or it
+    /// vanishes from the destination without anything saying so.
+    #[tokio::test]
+    async fn walk_all_lists_every_source_folder_even_an_empty_one() {
+        let root = scratch("walk-all-empty");
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+
+        let sources = vec![Source {
+            path: root.join("empty").to_string_lossy().into(),
+            folder: "Empty".into(),
+        }];
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(walked.files.is_empty());
+        assert!(
+            walked.dirs.iter().any(|(_, rel)| rel == "Empty"),
+            "the folder itself must be in dirs, got {:?}",
+            walked.dirs
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The one that matters. A source on an unplugged drive contributes no
+    /// files, so prune would find its whole subfolder missing from the keep
+    /// set and delete the only copy of it that exists. Recording the folder
+    /// as unreadable is what makes ProtectedSet::covers skip that subtree.
+    #[tokio::test]
+    async fn a_source_that_cannot_be_read_protects_its_own_subfolder() {
+        let root = scratch("walk-all-missing");
+        std::fs::create_dir_all(root.join("here")).unwrap();
+        std::fs::write(root.join("here/kept.txt"), b"k").unwrap();
+
+        let sources = vec![
+            Source { path: root.join("here").to_string_lossy().into(), folder: "Here".into() },
+            Source { path: root.join("gone").to_string_lossy().into(), folder: "Gone".into() },
+        ];
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(walked.files.len(), 1, "the reachable source still backs up");
+        assert!(walked.unreadable.contains("Gone"));
+        let patterns = glob::PatternSet::new(&[]);
+        let protected = ProtectedSet::new(&walked, &patterns);
+        assert!(protected.covers("Gone"), "prune must walk around the missing source");
+        assert!(!protected.covers("Here"));
+        assert!(
+            !protected.source_root_unreadable(),
+            "one source failing must not stop prune for the others"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// When nothing at all could be read, failing is the only honest answer.
+    /// Returning an empty walk would have the run report success, stamp
+    /// lastBackup, and leave the scheduler believing the task ran — while a
+    /// single missing source fails the run outright today.
+    #[tokio::test]
+    async fn walk_all_fails_when_no_source_can_be_read() {
+        let root = scratch("walk-all-all-missing");
+        let sources = vec![
+            Source { path: root.join("gone-a").to_string_lossy().into(), folder: "A".into() },
+            Source { path: root.join("gone-b").to_string_lossy().into(), folder: "B".into() },
+        ];
+        assert!(
+            walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Exclusions are recorded as relative paths and consulted by prune, so
+    /// they have to move into the subfolder with everything else — otherwise
+    /// prune looks up "node_modules" while the destination holds
+    /// "Alpha/node_modules" and deletes what the user asked to keep.
+    #[tokio::test]
+    async fn walk_all_prefixes_the_excluded_set_too() {
+        let root = scratch("walk-all-excluded");
+        std::fs::create_dir_all(root.join("a/skipme")).unwrap();
+        std::fs::write(root.join("a/skipme/x.txt"), b"x").unwrap();
+        std::fs::write(root.join("a/keep.txt"), b"k").unwrap();
+
+        let sources = vec![Source {
+            path: root.join("a").to_string_lossy().into(),
+            folder: "Alpha".into(),
+        }];
+        let patterns = glob::PatternSet::new(&["skipme".to_string()]);
+        let walked = walk_all(&sources, &patterns, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            walked.excluded.iter().all(|e| e.starts_with("Alpha/")),
+            "got {:?}",
+            walked.excluded
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `read_dir` on the root failing is fatal, but the sibling case — the
