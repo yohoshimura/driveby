@@ -2734,13 +2734,24 @@ mod tests {
     /// and APFS — the same rule `KeepSet` uses.
     #[test]
     fn two_sources_cannot_claim_the_same_folder() {
+        // Real (if uncreated) paths under a tempdir, not literal "/work/..."
+        // strings: preflight_sources' own absolute-path check runs before
+        // the duplicate-folder check below, and a leading-slash string has
+        // `has_root()` but no drive/UNC prefix, so it fails that first check
+        // on Windows without ever reaching the one this test means to
+        // exercise. preflight_sources never touches the filesystem beyond
+        // Path::is_absolute, so `work`/`home` need not exist — only
+        // root.path() does, and it is absolute on every platform.
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work").join("photos").to_string_lossy().to_string();
+        let home = root.path().join("home").join("photos").to_string_lossy().to_string();
         let task = Task {
             id: "t".into(),
             name: "t".into(),
             source: None,
             sources: Some(vec![
-                Source { path: "/work/photos".into(), folder: "Photos".into() },
-                Source { path: "/home/photos".into(), folder: "Photos".into() },
+                Source { path: work, folder: "Photos".into() },
+                Source { path: home, folder: "Photos".into() },
             ]),
             destination: None,
             destinations: None,
