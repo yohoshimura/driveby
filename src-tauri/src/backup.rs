@@ -701,20 +701,33 @@ struct PhaseStats {
     errors: Vec<String>,
 }
 
-/// Validate the source, once for the whole run. Fatal on failure: with no
-/// readable source there is nothing to write to any destination.
-pub(crate) async fn preflight_source(task: &Task) -> Result<PathBuf> {
-    let source = PathBuf::from(&task.sources().first().map(|s| s.path.clone()).unwrap_or_default());
-    if !source.is_absolute() {
-        return Err(anyhow!("Paths must be absolute"));
+/// The sources this task will read, with their *configuration* validated.
+///
+/// Existence is not checked here on purpose. A source whose drive is
+/// unplugged must not fail the task — `walk_all` records it and prune walks
+/// around its subfolder. What is fatal is a configuration no disk could make
+/// right: no sources at all, a relative path, or a `folder` that is not a
+/// usable folder name.
+pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
+    let sources = task.sources();
+    if sources.is_empty() {
+        return Err(anyhow!("No source folder set for this task"));
     }
-    let src_meta = fs::metadata(long_path(&source))
-        .await
-        .map_err(|_| anyhow!("Source folder not found"))?;
-    if !src_meta.is_dir() {
-        return Err(anyhow!("Source is not a directory"));
+    for source in &sources {
+        if !Path::new(&source.path).is_absolute() {
+            return Err(anyhow!("Paths must be absolute"));
+        }
+        validate_folder_name(&source.folder)?;
     }
-    Ok(source)
+    Ok(sources)
+}
+
+/// Filled in by the folder-name rules in the guards task.
+fn validate_folder_name(folder: &str) -> Result<()> {
+    if folder.trim().is_empty() {
+        return Err(anyhow!("A source's destination folder cannot be empty"));
+    }
+    Ok(())
 }
 
 /// Validate one destination. Deliberately *not* fatal to the run: a task
@@ -802,18 +815,23 @@ pub(crate) fn reject_foreign_overlaps(
     Ok(())
 }
 
-pub(crate) fn reject_destination_overlaps(source: &Path, destinations: &[PathBuf]) -> Result<()> {
-    for (i, dest) in destinations.iter().enumerate() {
-        reject_overlap(source, dest)?;
-        for other in &destinations[i + 1..] {
-            // path_contains is reflexive, so this also catches the same
-            // folder listed twice under two spellings.
-            if path_contains(dest, other) || path_contains(other, dest) {
-                return Err(anyhow!(
-                    "Destinations cannot overlap: {} and {}",
-                    dest.display(),
-                    other.display()
-                ));
+pub(crate) fn reject_destination_overlaps(
+    sources: &[PathBuf],
+    destinations: &[PathBuf],
+) -> Result<()> {
+    for source in sources {
+        for (i, dest) in destinations.iter().enumerate() {
+            reject_overlap(source, dest)?;
+            for other in &destinations[i + 1..] {
+                // path_contains is reflexive, so this also catches the same
+                // folder listed twice under two spellings.
+                if path_contains(dest, other) || path_contains(other, dest) {
+                    return Err(anyhow!(
+                        "Destinations cannot overlap: {} and {}",
+                        dest.display(),
+                        other.display()
+                    ));
+                }
             }
         }
     }
@@ -1206,11 +1224,16 @@ async fn verify_phase<R: Runtime>(
 /// share one read stream anyway, because whether a given file needs copying
 /// is a question each destination answers for itself.
 ///
-/// The source walk *is* shared: it depends only on the source and the
+/// The source walk *is* shared: it depends only on the sources and the
 /// exclude patterns, so walking once per destination would repeat the same
 /// traversal for nothing. It also means the three copies are made from one
 /// snapshot of the tree rather than three snapshots taken minutes apart,
 /// which is rather the point of writing to three places.
+///
+/// Every source is merged into that one walk by `walk_all`, each under its
+/// own folder, so everything downstream — copy, prune, verify — goes on
+/// seeing a single tree of relative paths and needs to know nothing about
+/// how many sources there were.
 async fn execute_all<R: Runtime>(
     app: &AppHandle<R>,
     backup_id: &str,
@@ -1219,12 +1242,13 @@ async fn execute_all<R: Runtime>(
     token: &CancellationToken,
 ) -> Result<CompletePayload> {
     let started = Instant::now();
-    let source = preflight_source(task).await?;
+    let sources = preflight_sources(task)?;
+    let source_paths: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(&s.path)).collect();
     let destinations: Vec<PathBuf> = task.destinations().iter().map(PathBuf::from).collect();
     if destinations.is_empty() {
         return Err(anyhow!("No destination set for this task"));
     }
-    reject_destination_overlaps(&source, &destinations)?;
+    reject_destination_overlaps(&source_paths, &destinations)?;
 
     // One `backup-started` per run, not per destination: the UI opens a
     // single progress slot keyed by task id, and which destination is being
@@ -1237,9 +1261,9 @@ async fn execute_all<R: Runtime>(
         },
     );
 
-    info!(task = %task.name, "walking source");
+    info!(task = %task.name, sources = sources.len(), "walking source");
     let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    let mut walked = walk(&source, &patterns, token).await?;
+    let mut walked = walk_all(&sources, &patterns, token).await?;
     if !walked.unreadable.is_empty() {
         warn!(
             "{} source path(s) could not be read — their destination copies are left untouched",
@@ -1248,8 +1272,11 @@ async fn execute_all<R: Runtime>(
     }
 
     // Built once from the walk: what prune must leave alone is a property
-    // of the source side, identical for every destination.
-    let protected = ProtectedSet::new(&walked, &patterns);
+    // of the source side, identical for every destination. The folder names
+    // go in too, because a destination path now leads with one and the
+    // user's exclude patterns do not.
+    let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+    let protected = ProtectedSet::new(&walked, &patterns, &folders);
 
     // Folded once for the run, for the same reason as the ProtectedSet above
     // and the way preview.rs already does it: which destination we happen to
@@ -1479,7 +1506,10 @@ fn fold_outcomes(
 ///   permission error would read as "deleted at source" and take the whole
 ///   subtree with it.
 /// - **patterns** — the same exclude globs, applied to destination paths
-///   that were never in the source walk at all.
+///   that were never in the source walk at all. Tried twice: as the path
+///   stands, and again with the leading source folder taken off, because the
+///   user wrote those globs against a source root while this side is a
+///   destination path (see `inside_a_source_folder`).
 ///
 /// The first two sets are keyed by the *source's* spelling while the prune
 /// pass walks the *destination's*. On a case-preserving filesystem those
@@ -1490,24 +1520,47 @@ pub(crate) struct ProtectedSet<'a> {
     excluded: HashSet<String>,
     unreadable: HashSet<String>,
     patterns: &'a glob::PatternSet,
+    /// The destination subfolder each source writes into, folded. A
+    /// destination rel starting with one of these is a source's own subtree,
+    /// and the rest of it is the path the user's patterns were written
+    /// against — see `covers`.
+    folders: HashSet<String>,
     /// The source root itself could not be enumerated.
     source_root_unreadable: bool,
 }
 
 impl<'a> ProtectedSet<'a> {
-    pub(crate) fn new(walked: &WalkResult, patterns: &'a glob::PatternSet) -> Self {
-        Self::from_parts(&walked.excluded, &walked.unreadable, patterns)
+    pub(crate) fn new(
+        walked: &WalkResult,
+        patterns: &'a glob::PatternSet,
+        folders: &[String],
+    ) -> Self {
+        Self::from_parts_with_folders(&walked.excluded, &walked.unreadable, patterns, folders)
     }
 
+    /// The by-hand constructor the prune tests build their fixtures with,
+    /// for a set with no source folder in play. Test-only: a run always has
+    /// a walk to build from, and folder names to go with it.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         excluded: &HashSet<String>,
         unreadable: &HashSet<String>,
         patterns: &'a glob::PatternSet,
     ) -> Self {
+        Self::from_parts_with_folders(excluded, unreadable, patterns, &[])
+    }
+
+    pub(crate) fn from_parts_with_folders(
+        excluded: &HashSet<String>,
+        unreadable: &HashSet<String>,
+        patterns: &'a glob::PatternSet,
+        folders: &[String],
+    ) -> Self {
         Self {
             excluded: excluded.iter().map(|s| fold_rel(s)).collect(),
             unreadable: unreadable.iter().map(|s| fold_rel(s)).collect(),
             patterns,
+            folders: folders.iter().map(|f| fold_rel(f)).collect(),
             // An empty relative path is the root's own.
             source_root_unreadable: unreadable.contains(""),
         }
@@ -1522,6 +1575,30 @@ impl<'a> ProtectedSet<'a> {
             || self.excluded.contains(&probe)
             || self.unreadable.contains(&probe)
             || self.patterns.matches(rel)
+            || self
+                .inside_a_source_folder(rel)
+                .is_some_and(|within| self.patterns.matches(within))
+    }
+
+    /// `rel` as the source spelled it: the leading folder name removed, but
+    /// only when it is one this run actually writes into.
+    ///
+    /// The user writes exclude patterns against a source root, and prune asks
+    /// about a destination path that now leads with the source's folder.
+    /// `PatternSet::matches` tries the basename too, so a bare `node_modules`
+    /// still matches `Alpha/node_modules` — but a path-shaped `Photos/raw`
+    /// matches neither `Alpha/Photos/raw` nor the basename `raw`, and quietly
+    /// stopped protecting the folder the user had excluded (the same class of
+    /// failure as #R6). `walked.excluded` catches every such path the source
+    /// walk *saw*; this is for the ones it did not — a destination folder with
+    /// no source counterpart left over from an earlier run.
+    ///
+    /// Only for a known folder: stripping unconditionally would read every
+    /// destination subtree as if it were a source's, over-protect paths that
+    /// belong to nobody, and let genuine orphans accumulate for ever.
+    fn inside_a_source_folder<'r>(&self, rel: &'r str) -> Option<&'r str> {
+        let (first, rest) = rel.split_once('/')?;
+        self.folders.contains(&fold_rel(first)).then_some(rest)
     }
 
     /// Nothing in the destination can be shown to be orphaned when the
@@ -1968,14 +2045,15 @@ pub(crate) async fn walk(
                 continue;
             }
             let rel_str = rel_of(&root_canonical, &path);
-            // Don't propagate a source-root `desktop.ini` to the destination
-            // root — that would hijack the destination folder's icon. Treat
-            // it as if it were excluded by user pattern, so prune leaves any
-            // existing dest-root icon file alone too.
-            if is_root_icon_marker(&rel_str) {
-                excluded.insert(rel_str);
-                continue;
-            }
+            // A `desktop.ini` at the root is copied like any other file. It
+            // was dropped here for as long as a source root mapped onto the
+            // destination *root*, where its icon descriptor would have
+            // hijacked the backup drive's own. A source now writes into a
+            // folder of its own and that file is simply that folder's icon —
+            // the same one the source folder shows. Nothing is lost by
+            // dropping the guard: the destination root's own descriptor is
+            // protected where it is actually seen, by `ProtectedSet::covers`,
+            // which reads the destination entry rather than this set.
             if patterns.matches(&rel_str) {
                 excluded.insert(rel_str);
                 continue;
@@ -2031,13 +2109,6 @@ pub(crate) async fn walk(
 /// Failing every source *is* fatal — an empty walk would otherwise report
 /// success and stamp `lastBackup` over a run that did nothing.
 ///
-/// Not called outside tests yet — the pipeline wiring lands separately.
-/// Gated to non-test builds: under `cfg(test)` this module's tests already
-/// call it, so `expect` would be unfulfilled there. In a plain build it is
-/// genuinely dead for now, and `expect` over `allow` means the moment
-/// something calls this for real, the lint stops firing and the attribute
-/// itself becomes a build error — the prompt to delete it.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn walk_all(
     sources: &[Source],
     patterns: &glob::PatternSet,
@@ -2326,9 +2397,10 @@ mod tests {
         token: &CancellationToken,
     ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-        let source = task.sources().first().map(|s| s.path.clone()).unwrap_or_default();
-        let mut walked = walk(Path::new(&source), &patterns, token).await?;
-        let protected = ProtectedSet::new(&walked, &patterns);
+        let sources = preflight_sources(task)?;
+        let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+        let mut walked = walk_all(&sources, &patterns, token).await?;
+        let protected = ProtectedSet::new(&walked, &patterns, &folders);
         let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
         execute_one(
             app,
@@ -2429,11 +2501,16 @@ mod tests {
         assert_eq!(payload.total_files, Some(2));
         assert_eq!(payload.failed, Some(0));
         assert_eq!(payload.cleaned, Some(1), "orphan should be pruned");
-        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
         assert_eq!(
-            std::fs::read(dest.join("sub").join("b.txt")).unwrap(),
+            std::fs::read(backed_up(&dest, &source).join("a.txt")).unwrap(),
+            b"alpha"
+        );
+        assert_eq!(
+            std::fs::read(backed_up(&dest, &source).join("sub").join("b.txt")).unwrap(),
             b"beta"
         );
+        // Still at the destination root: a file no source accounts for is
+        // an orphan wherever it sits.
         assert!(!dest.join("stale.txt").exists());
     }
 
@@ -2499,8 +2576,9 @@ mod tests {
             assert_eq!(d.status, DestinationStatus::Success);
         }
         for dest in &dests {
-            assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
-            assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"beta");
+            let mirror = backed_up(dest, &source);
+            assert_eq!(std::fs::read(mirror.join("a.txt")).unwrap(), b"alpha");
+            assert_eq!(std::fs::read(mirror.join("sub/b.txt")).unwrap(), b"beta");
         }
         // The counts are sums: three copies of a two-file tree really did
         // move six files, and a row claiming two would describe a third of
@@ -2542,7 +2620,10 @@ mod tests {
             payload.destinations[1].status,
             DestinationStatus::Unreachable
         );
-        assert_eq!(std::fs::read(dests[0].join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(backed_up(&dests[0], &source).join("a.txt")).unwrap(),
+            b"alpha"
+        );
         assert!(!absent.exists(), "an absent destination is never created");
     }
 
@@ -2573,7 +2654,7 @@ mod tests {
 
         assert!(result.is_err(), "overlapping destinations must be refused");
         assert!(
-            !dests[0].join("a.txt").exists(),
+            !backed_up(&dests[0], &source).join("a.txt").exists(),
             "nothing may be written when the configuration is unsafe"
         );
     }
@@ -2611,7 +2692,10 @@ mod tests {
 
         assert!(payload.success);
         assert_eq!(payload.destinations.len(), 1);
-        assert_eq!(std::fs::read(dests[0].join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(backed_up(&dests[0], &source).join("a.txt")).unwrap(),
+            b"alpha"
+        );
     }
 
     #[tokio::test]
@@ -2926,8 +3010,11 @@ mod tests {
         let dest = root.path().join("dest");
         std::fs::create_dir_all(source.join("Docs")).unwrap();
         std::fs::write(source.join("Docs").join("readme.md"), b"hello").unwrap();
-        std::fs::create_dir_all(dest.join("docs")).unwrap();
-        std::fs::write(dest.join("docs").join("readme.md"), b"hello").unwrap();
+        // Last run's copy, with the casing the source has since changed —
+        // inside the source's own folder, which is where it now lives.
+        let mirror = backed_up(&dest, &source);
+        std::fs::create_dir_all(mirror.join("docs")).unwrap();
+        std::fs::write(mirror.join("docs").join("readme.md"), b"hello").unwrap();
 
         let app = tauri::test::mock_app();
         let task = Task {
@@ -2959,7 +3046,7 @@ mod tests {
             Some(0),
             "a case-only rename must not delete anything"
         );
-        let names: Vec<String> = std::fs::read_dir(&dest)
+        let names: Vec<String> = std::fs::read_dir(&mirror)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
@@ -2969,7 +3056,7 @@ mod tests {
             names
         );
         assert_eq!(
-            std::fs::read(dest.join("Docs").join("readme.md")).unwrap(),
+            std::fs::read(mirror.join("Docs").join("readme.md")).unwrap(),
             b"hello"
         );
     }
@@ -2984,8 +3071,9 @@ mod tests {
         let dest = root.path().join("dest");
         std::fs::create_dir_all(source.join("Alpha").join("Beta")).unwrap();
         std::fs::write(source.join("Alpha").join("Beta").join("c.txt"), b"x").unwrap();
-        std::fs::create_dir_all(dest.join("alpha").join("beta")).unwrap();
-        std::fs::write(dest.join("alpha").join("beta").join("c.txt"), b"x").unwrap();
+        let mirror = backed_up(&dest, &source);
+        std::fs::create_dir_all(mirror.join("alpha").join("beta")).unwrap();
+        std::fs::write(mirror.join("alpha").join("beta").join("c.txt"), b"x").unwrap();
 
         let app = tauri::test::mock_app();
         let task = Task {
@@ -3012,17 +3100,17 @@ mod tests {
         .unwrap();
         assert!(payload.success);
 
-        let top: Vec<String> = std::fs::read_dir(&dest)
+        let top: Vec<String> = std::fs::read_dir(&mirror)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert!(top.contains(&"Alpha".to_string()), "top level: {:?}", top);
-        let inner: Vec<String> = std::fs::read_dir(dest.join("Alpha"))
+        let inner: Vec<String> = std::fs::read_dir(mirror.join("Alpha"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert!(inner.contains(&"Beta".to_string()), "inner level: {:?}", inner);
-        assert!(dest.join("Alpha").join("Beta").join("c.txt").exists());
+        assert!(mirror.join("Alpha").join("Beta").join("c.txt").exists());
     }
 
     /// The parallel copy path must produce byte-identical results and the
@@ -3072,9 +3160,10 @@ mod tests {
                 .await
                 .unwrap();
             assert!(payload.success);
-            assert_eq!(std::fs::read(dest.join("f7.bin")).unwrap(), vec![7u8; 1007]);
+            let mirror = backed_up(&dest, &source);
+            assert_eq!(std::fs::read(mirror.join("f7.bin")).unwrap(), vec![7u8; 1007]);
             assert_eq!(
-                std::fs::read(dest.join("nested").join("n39.bin")).unwrap(),
+                std::fs::read(mirror.join("nested").join("n39.bin")).unwrap(),
                 vec![39u8; 49]
             );
             payloads.push(payload);
@@ -3153,8 +3242,10 @@ mod tests {
 
         // Last night's run already put a good copy in the destination.
         const PREVIOUS: &[u8] = b"the previous good backup";
+        let mirror = backed_up(&dest, &source);
+        std::fs::create_dir_all(&mirror).unwrap();
         std::fs::write(source.join("vm.bin"), b"newer contents").unwrap();
-        std::fs::write(dest.join("vm.bin"), PREVIOUS).unwrap();
+        std::fs::write(mirror.join("vm.bin"), PREVIOUS).unwrap();
         // Something else keeps a plain readable file alongside it, so the run
         // has real work to do and doesn't bail for unrelated reasons.
         std::fs::write(source.join("notes.txt"), b"readable").unwrap();
@@ -3190,12 +3281,12 @@ mod tests {
             run_one_destination(app.handle(), "locked-src", &task, &dest, &settings, &token).await;
 
         assert_eq!(
-            std::fs::read(dest.join("vm.bin")).unwrap(),
+            std::fs::read(mirror.join("vm.bin")).unwrap(),
             PREVIOUS,
             "an unreadable source destroyed the backup it could not replace"
         );
         // And no scratch file is left sitting in the destination.
-        let leftovers: Vec<String> = std::fs::read_dir(&dest)
+        let leftovers: Vec<String> = std::fs::read_dir(&mirror)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .filter(|n| n.ends_with(".driveby-tmp"))
@@ -3283,6 +3374,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Where a source's file actually lands now: every source writes into a
+    /// subfolder named after itself. Tests say this through the helper rather
+    /// than spelling the layout 50 times, so changing it again is one edit.
+    fn backed_up(dest: &Path, src: &Path) -> PathBuf {
+        dest.join(src.file_name().expect("a source has a name"))
     }
 
     /// The data-loss regression: a source subtree that `walk()` could not
@@ -3598,7 +3696,8 @@ mod tests {
         assert_eq!(walked.files.len(), 1, "the reachable source still backs up");
         assert!(walked.unreadable.contains("Gone"));
         let patterns = glob::PatternSet::new(&[]);
-        let protected = ProtectedSet::new(&walked, &patterns);
+        let folders = vec!["Here".to_string(), "Gone".to_string()];
+        let protected = ProtectedSet::new(&walked, &patterns, &folders);
         assert!(protected.covers("Gone"), "prune must walk around the missing source");
         assert!(!protected.covers("Here"));
         assert!(
@@ -3653,6 +3752,155 @@ mod tests {
             walked.excluded
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two sources, one destination, two subtrees — and nothing of either
+    /// source at the destination root, which is now the user's.
+    #[tokio::test]
+    async fn two_sources_land_in_two_subfolders_of_one_destination() {
+        let root = scratch("two-sources-e2e");
+        let a = root.join("Alpha");
+        let b = root.join("Beta");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(a.join("one.txt"), b"1").unwrap();
+        std::fs::write(b.join("two.txt"), b"2").unwrap();
+
+        let task = Task {
+            id: "t".into(),
+            name: "two sources".into(),
+            source: None,
+            sources: Some(vec![
+                Source { path: a.to_string_lossy().into(), folder: "Alpha".into() },
+                Source { path: b.to_string_lossy().into(), folder: "Beta".into() },
+            ]),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+
+        let app = tauri::test::mock_app();
+        let payload = execute_all(
+            app.handle(),
+            "backup-two-sources",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert_eq!(std::fs::read(dest.join("Alpha/one.txt")).unwrap(), b"1");
+        assert_eq!(std::fs::read(dest.join("Beta/two.txt")).unwrap(), b"2");
+        assert!(!dest.join("one.txt").exists(), "nothing lands at the destination root");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `desktop.ini` at a source root used to be the destination root's own
+    /// icon marker, protected from prune on the grounds that the root's
+    /// identity belongs to the user. After prefixing it is `Alpha/desktop.ini`
+    /// and becomes that subfolder's icon descriptor instead — which is more
+    /// correct, since the destination root now belongs to no single source,
+    /// but it is a change and this is what pins it.
+    #[tokio::test]
+    async fn a_source_root_desktop_ini_becomes_the_subfolders_icon() {
+        let root = scratch("source-icon");
+        let a = root.join("Alpha");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(a.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
+
+        let task = Task {
+            id: "icon".into(),
+            name: "icon".into(),
+            source: None,
+            sources: Some(vec![Source {
+                path: a.to_string_lossy().into(),
+                folder: "Alpha".into(),
+            }]),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+        let app = tauri::test::mock_app();
+        execute_all(
+            app.handle(),
+            "backup-icon",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dest.join("Alpha/desktop.ini").exists(),
+            "it is copied like any other file, into its source's folder"
+        );
+        assert!(
+            !is_root_icon_marker("Alpha/desktop.ini"),
+            "and it no longer claims to be the destination root's marker"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Removing a source from a task must remove its subfolder on the next
+    /// run — that is exactly what a per-source prune could not have done.
+    #[tokio::test]
+    async fn dropping_a_source_prunes_its_subfolder() {
+        let root = scratch("drop-a-source");
+        let a = root.join("Alpha");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(dest.join("Beta")).unwrap();
+        std::fs::write(a.join("one.txt"), b"1").unwrap();
+        std::fs::write(dest.join("Beta/stale.txt"), b"old").unwrap();
+
+        let keep = KeepSet::new(["Alpha/one.txt".to_string()].into_iter());
+        let empty: HashSet<String> = HashSet::new();
+        let mut stats = PhaseStats::default();
+        prune_destination(
+            &dest,
+            &keep,
+            &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
+            &CancellationToken::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(!dest.join("Beta").exists(), "the dropped source's folder goes");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path-shaped exclude pattern is written against the source root, but
+    /// prune consults it with a destination path that now carries the source's
+    /// folder in front. Without stripping that prefix, `Photos/raw` stopped
+    /// matching `Alpha/Photos/raw` — and prune deleted a folder the user had
+    /// excluded, which is the same failure #R6 was about.
+    #[test]
+    fn a_path_shaped_exclude_still_protects_inside_a_source_folder() {
+        let empty: HashSet<String> = HashSet::new();
+        let patterns = glob::PatternSet::new(&["Photos/raw".to_string()]);
+        let protected = ProtectedSet::from_parts_with_folders(
+            &empty,
+            &empty,
+            &patterns,
+            &["Alpha".to_string()],
+        );
+        assert!(protected.covers("Alpha/Photos/raw"), "the source's own folder is stripped");
+        assert!(!protected.covers("Beta/Photos/raw"), "an unknown first component is not");
+        assert!(protected.covers("Photos/raw"), "an unprefixed path still matches");
     }
 
     /// `read_dir` on the root failing is fatal, but the sibling case — the

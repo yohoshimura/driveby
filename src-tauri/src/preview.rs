@@ -11,7 +11,7 @@
 //! so the preview cannot promise one thing and the run do another.
 
 use crate::backup::{
-    preflight_source, reject_destination_overlaps, rel_of, same_mtime, walk, KeepSet, KeepStatus,
+    preflight_sources, reject_destination_overlaps, rel_of, same_mtime, walk, KeepSet, KeepStatus,
     ProtectedSet, Settings, Task, WalkResult, CANCELLED_MSG,
 };
 use crate::fsutil::long_path;
@@ -129,7 +129,8 @@ pub async fn plan_backup(
 }
 
 async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Result<PreviewPayload> {
-    let source = preflight_source(task).await?;
+    let sources = preflight_sources(task)?;
+    let source_paths: Vec<PathBuf> = sources.iter().map(|s| PathBuf::from(&s.path)).collect();
     let destinations: Vec<PathBuf> = task.destinations().iter().map(PathBuf::from).collect();
     if destinations.is_empty() {
         return Err(anyhow!("No destination set for this task"));
@@ -137,11 +138,15 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     // Refused here for the same reason the run refuses it: a preview that
     // showed comfortable numbers for a configuration the run will not touch
     // would be worse than no preview at all.
-    reject_destination_overlaps(&source, &destinations)?;
+    reject_destination_overlaps(&source_paths, &destinations)?;
 
     let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    let walked = walk(&source, &patterns, token).await?;
-    let protected = ProtectedSet::new(&walked, &patterns);
+    // Interim: the preview still walks only the first source, so its rels
+    // carry no folder prefix and `ProtectedSet` is told of no folders.
+    // Moving this to `walk_all` is the preview's own task; until then a
+    // multi-source task previews as its first source.
+    let walked = walk(&source_paths[0], &patterns, token).await?;
+    let protected = ProtectedSet::new(&walked, &patterns, &[]);
     let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
 
     let mut previews = Vec::with_capacity(destinations.len());
