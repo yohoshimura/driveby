@@ -47,6 +47,27 @@ both copies at once, and moving every byte a second time. An earlier draft of
 this document had the order backwards and warned of a gap that cannot occur;
 the phases are the authority.
 
+**There is one real loss case, and it is narrower than that.** `continueOnError`
+defaults to true, so a run where some files fail to copy still reaches prune
+with `stats.failed > 0`. On the reshape run only, a file whose copy fails is in
+neither place the destination is checked against: the new `dest/<Folder>/a.txt`
+was never written, and the old flat `dest/a.txt` is absent from the keep set —
+which now says `<Folder>/a.txt` — so prune deletes it. Before this change the
+same failure was harmless, because the failed file's destination path *was* the
+keep entry.
+
+Accepted rather than guarded, because there is no clean general fix: the old
+flat rel is not derivable from the new one, and the alternatives are worse.
+Skipping prune whenever a copy fails would disable it for any run with one bad
+file, forever, and let orphans accumulate; detecting a "pre-reshape layout"
+would put a heuristic over user data inside the delete path.
+
+What bounds it: one run per task per destination, steady state unaffected once
+the keep set and the destination share the prefix, and **the source still holds
+the file** — a later successful run restores the backup. A true loss needs the
+source to die inside that window too. The CHANGELOG says this in these terms
+rather than the vaguer "it moves every byte".
+
 Chosen deliberately over a rename-based migration. No migration code is
 written.
 
