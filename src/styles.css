@@ -830,6 +830,10 @@ input, textarea { user-select: text; }
 }
 .field--compact { height: 24px; font-size: 12px; }
 .field--narrow { width: 80px; }
+/* A source's destination folder name, beside the path it belongs to. */
+.field--folder { flex: 0 0 9rem; }
+.field[aria-invalid='true'] { box-shadow: inset 0 0 0 1px var(--system-red); }
+.field[aria-invalid='true']:focus { box-shadow: inset 0 0 0 1px var(--system-red), var(--shadow-focus); }
 
 .field-row { display: flex; gap: 8px; align-items: center; }
 /* Stacked destination rows in the task form, plus the button that adds one. */

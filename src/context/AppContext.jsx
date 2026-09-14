@@ -13,7 +13,7 @@ import { useSystemTheme } from '../hooks/useSystemTheme';
 import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
 import { DEFAULT_HISTORY_RETENTION, trimHistory } from '../lib/history';
-import { migrateTasks, taskDestinations } from '../lib/task';
+import { migrateTasks, taskDestinations, taskSources } from '../lib/task';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
 
 const AppContext = createContext(null);
@@ -94,9 +94,10 @@ export function AppProvider({ children }) {
         const merged = { ...DEFAULT_SETTINGS, ...stored };
         setSettings(merged);
         // A tasks.json written before 1.7.2 holds one `destination` per
-        // task. Rewrite it into the plural shape on first load — and only
-        // then: migrateTasks hands back the same array when there was
-        // nothing to do, so an ordinary launch doesn't rewrite the file.
+        // task, and one written before sources had folders one `source`.
+        // Rewrite it into the plural shapes on first load — and only then:
+        // migrateTasks hands back the same array when there was nothing to
+        // do, so an ordinary launch doesn't rewrite the file.
         const storedTasks = Array.isArray(t) ? t : [];
         const live = migrateTasks(storedTasks);
         if (live !== storedTasks) tasksDirty.current = true;
@@ -330,7 +331,7 @@ export function AppProvider({ children }) {
     const destinations = listed.length > 0
       ? listed
       : taskDestinations({ destination: settings.defaultDestination });
-    if (!taskDraft.name || !taskDraft.source || destinations.length === 0) return false;
+    if (!taskDraft.name || taskSources(taskDraft).length === 0 || destinations.length === 0) return false;
     // Built outside the updater: StrictMode calls the updater twice, and
     // minting the id inside it produced two different tasks.
     const created = { id: uuidv4(), ...taskDraft, destinations, lastBackup: null };

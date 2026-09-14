@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+**A task can back up several folders.** Add as many sources as you like. Each
+is copied into a folder of its own at the destination, named after the source
+unless you give it another name, and every destination receives all of them.
+A source on a drive that is not plugged in is reported, and its folder at the
+destination is left exactly as it was while the others back up as usual.
+Remove a source from a task and its folder leaves the destination on the next
+run.
+
+**Every existing backup moves one level down.** The folder-per-source layout
+applies to a task with a single source too, so the first run after updating
+copies each backup into a folder named after its source and then removes the
+old copy from the destination root. The preview says so before it happens:
+every file counted once as new and once as deleted. That run takes about as
+long as the very first backup did, and it needs room for both copies at once.
+Without that room it takes several runs instead — and until a file's new copy
+has been written, its old one stays where it was, so nothing already backed up
+goes missing in between.
+
+**A task that backs up a whole drive asks for a folder name.** A drive root
+has no name of its own to give its folder, so that task stops, with a message
+naming the drive, until you edit it and type one.
+
+A custom folder icon on a source now shows on that source's folder at the
+destination.
+
 ## 1.7.4
 
 Every defect below was already in 1.7.3, and not one of them announced itself.

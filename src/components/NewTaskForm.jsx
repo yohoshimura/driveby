@@ -4,7 +4,16 @@ import FormField from './common/FormField';
 import { bridge } from '../lib/tauri';
 import { useT } from '../hooks/useT';
 import { useFormat } from '../hooks/useFormat';
-import { findForeignOverlap, findOverlap, pathContains, taskDestinations } from '../lib/task';
+import {
+  findDuplicateFolder,
+  findForeignOverlap,
+  findOverlap,
+  folderNameError,
+  pathContains,
+  sourceFolderName,
+  taskDestinations,
+  taskSources,
+} from '../lib/task';
 import {
   DEFAULT_SCHEDULE_TIME,
   WEEKDAY_INDEXES,
@@ -14,7 +23,7 @@ import {
 
 const INITIAL = {
   name: '',
-  source: '',
+  sources: [],
   destinations: [],
   schedule: 'manual',
   scheduleDays: [],
@@ -29,7 +38,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     initialTask
       ? {
           name: initialTask.name || '',
-          source: initialTask.source || '',
+          sources: taskSources(initialTask),
           destinations: taskDestinations(initialTask),
           schedule: initialTask.schedule || 'manual',
           scheduleDays: normalizeDays(initialTask.scheduleDays),
@@ -38,9 +47,52 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       : INITIAL
   );
 
-  const pickSource = async () => {
-    const p = await bridge.selectDirectory(t('form.dialog.select_source'));
-    if (p) setTask((prev) => ({ ...prev, source: p }));
+  /// Pick a folder into source slot `index`, or append it when `index` is
+  /// null, named after itself.
+  ///
+  /// Refused at the moment of picking for the same reason destinations are:
+  /// the message can then name what is wrong while it is still a choice. The
+  /// backend refuses the same pairs on its own — a source nested in another
+  /// would be backed up twice, into two folders.
+  const pickSource = async (index) => {
+    const picked = await bridge.selectDirectory(t('form.dialog.select_source'));
+    if (!picked) return;
+    const others = task.sources.filter((_, i) => i !== index);
+    if (others.some((s) => pathContains(s.path, picked) || pathContains(picked, s.path))) {
+      showToast?.(t('form.error.source_overlap'), 'error');
+      return;
+    }
+    if (task.destinations.some((d) => pathContains(d, picked) || pathContains(picked, d))) {
+      showToast?.(t('form.error.dest_in_source'), 'error');
+      return;
+    }
+    setTask((prev) => {
+      const sources = [...prev.sources];
+      const next = { path: picked, folder: sourceFolderName(picked) };
+      if (index === null || index >= sources.length) sources.push(next);
+      else sources[index] = next;
+      return { ...prev, sources };
+    });
+  };
+
+  const setSourceFolder = (index, folder) =>
+    setTask((prev) => ({
+      ...prev,
+      sources: prev.sources.map((s, i) => (i === index ? { ...s, folder } : s)),
+    }));
+
+  const removeSource = (index) =>
+    setTask((prev) => ({
+      ...prev,
+      sources: prev.sources.filter((_, i) => i !== index),
+    }));
+
+  // Marked on the row as well as refused at submit: the folder name is the
+  // one thing here typed by hand, and a drive root arrives with it empty.
+  const folderInvalid = (index) => {
+    const source = task.sources[index];
+    return !!folderNameError(source.folder)
+      || task.sources.some((other, i) => i !== index && findDuplicateFolder([source, other]));
   };
 
   /// Pick a folder into slot `index`, or append it when `index` is null.
@@ -57,7 +109,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       showToast?.(t('form.error.dest_overlap'), 'error');
       return;
     }
-    if (task.source && (pathContains(task.source, picked) || pathContains(picked, task.source))) {
+    if (task.sources.some((s) => pathContains(s.path, picked) || pathContains(picked, s.path))) {
       showToast?.(t('form.error.dest_in_source'), 'error');
       return;
     }
@@ -92,7 +144,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
 
   const submit = () => {
     if (!task.name.trim()) return showToast?.(t('form.error.name'), 'error');
-    if (!task.source) return showToast?.(t('form.error.source'), 'error');
+    if (task.sources.length === 0) return showToast?.(t('form.error.source'), 'error');
     // A custom schedule that cannot fire would leave a task looking
     // scheduled and never running. Refuse it here rather than let the
     // scheduler quietly treat it as manual.
@@ -102,12 +154,28 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     if (task.destinations.length === 0 && !defaultDestination) {
       return showToast?.(t('form.error.dest'), 'error');
     }
-    // Re-checked at submit as well as at picking: the source can be chosen
+    // Re-checked at submit as well as at picking: the sources can be chosen
     // after the destinations, and an edited task can arrive here carrying a
     // pair an older version accepted.
     if (findOverlap(task.destinations)) return showToast?.(t('form.error.dest_overlap'), 'error');
-    if (task.destinations.some((d) => pathContains(task.source, d) || pathContains(d, task.source))) {
+    if (findOverlap(task.sources.map((s) => s.path))) {
+      return showToast?.(t('form.error.source_overlap'), 'error');
+    }
+    if (task.destinations.some((d) => task.sources.some((s) => pathContains(s.path, d) || pathContains(d, s.path)))) {
       return showToast?.(t('form.error.dest_in_source'), 'error');
+    }
+    // The folder names the backend would refuse, with the message naming the
+    // row: an empty name has nothing to quote but its path.
+    const misnamed = task.sources.find((s) => folderNameError(s.folder));
+    if (misnamed) {
+      const key = folderNameError(misnamed.folder) === 'empty'
+        ? 'form.error.source_folder_empty'
+        : 'form.error.source_folder_invalid';
+      return showToast?.(t(key, { path: misnamed.path, folder: misnamed.folder.trim() }), 'error');
+    }
+    const duplicate = findDuplicateFolder(task.sources);
+    if (duplicate) {
+      return showToast?.(t('form.error.source_folder_duplicate', { folder: duplicate }), 'error');
     }
     // Sharing a folder with another task is not sharing: each run mirror-prunes
     // the folder against its own source and deletes what the other just wrote,
@@ -118,13 +186,16 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       const key = foreign.kind === 'source' ? 'form.error.dest_holds_source' : 'form.error.dest_foreign';
       return showToast?.(t(key, { name: foreign.name, path: foreign.path }), 'error');
     }
+    // Folder names are stored trimmed, the way both sides read them, so
+    // tasks.json says what the run will write.
+    const named = { ...task, sources: task.sources.map((s) => ({ ...s, folder: s.folder.trim() })) };
     // Resolve the default here rather than leaving the list empty: an edit
     // saved with nothing picked used to store a blank destination, and the
     // task then failed at the next run instead of quietly using the default
     // the field was showing all along.
-    const resolved = task.destinations.length > 0
-      ? task
-      : { ...task, destinations: defaultDestination ? [defaultDestination] : [] };
+    const resolved = named.destinations.length > 0
+      ? named
+      : { ...named, destinations: defaultDestination ? [defaultDestination] : [] };
     if (isEdit) {
       onSave(resolved);
       return;
@@ -158,17 +229,65 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         />
       </FormField>
 
-      <FormField label={t('form.label.source')}>
-        <div className="field-row">
-          <input
-            className="field field--readonly"
-            readOnly
-            value={task.source}
-            placeholder={t('form.placeholder.choose')}
-            autoComplete="off"
-            name="driveby-task-source"
-          />
-          <Button size="small" onClick={pickSource}>{t('common.choose')}</Button>
+      <FormField label={t('form.label.sources')} hint={t('form.hint.sources')}>
+        <div className="dest-list">
+          {task.sources.length === 0 ? (
+            <div className="field-row">
+              <input
+                className="field field--readonly"
+                readOnly
+                value=""
+                placeholder={t('form.placeholder.choose')}
+                aria-label={t('form.label.sources')}
+                autoComplete="off"
+                name="driveby-task-source"
+              />
+              <Button size="small" onClick={() => pickSource(null)}>{t('common.choose')}</Button>
+            </div>
+          ) : (
+            task.sources.map((source, i) => (
+              <div className="field-row" key={`${i}-${source.path}`}>
+                <input
+                  className="field field--readonly"
+                  readOnly
+                  value={source.path}
+                  title={source.path}
+                  aria-label={t('form.aria.source', { n: i + 1 })}
+                  autoComplete="off"
+                  name={`driveby-task-source-${i}`}
+                />
+                <Button size="small" onClick={() => pickSource(i)}>{t('common.choose')}</Button>
+                <input
+                  type="text"
+                  className="field field--folder"
+                  value={source.folder}
+                  onChange={(e) => setSourceFolder(i, e.target.value)}
+                  placeholder={t('form.placeholder.source_folder')}
+                  aria-label={t('form.aria.source_folder', { n: i + 1 })}
+                  aria-invalid={folderInvalid(i)}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  name={`driveby-task-source-folder-${i}`}
+                />
+                <Button
+                  size="small"
+                  variant="borderless"
+                  destructive
+                  onClick={() => removeSource(i)}
+                  ariaLabel={t('form.aria.remove_source', { path: source.path })}
+                >
+                  {t('form.action.remove_source')}
+                </Button>
+              </div>
+            ))
+          )}
+          {task.sources.length > 0 && (
+            <Button size="small" variant="borderless" onClick={() => pickSource(null)}>
+              {t('form.action.add_source')}
+            </Button>
+          )}
         </div>
       </FormField>
 

@@ -2,7 +2,7 @@ import React from 'react';
 import Button from './common/Button';
 import { useFormat } from '../hooks/useFormat';
 import { useT } from '../hooks/useT';
-import { taskDestinations } from '../lib/task';
+import { taskDestinations, taskSources } from '../lib/task';
 import { useScheduleLabel } from '../hooks/useScheduleLabel';
 
 export default function TaskCard({ task, backup, missing, onRun, onCancel, onModify, onDelete, index = 0 }) {
@@ -11,7 +11,7 @@ export default function TaskCard({ task, backup, missing, onRun, onCancel, onMod
   const isRunning = !!backup;
   const scheduleLabel = useScheduleLabel()(task);
   const lastRun = task.lastBackup ? formatTime(task.lastBackup) : t('common.never');
-  const paths = `${task.source} → ${taskDestinations(task).join(', ')}`;
+  const paths = `${taskSources(task).map((s) => s.path).join(', ')} → ${taskDestinations(task).join(', ')}`;
   // Destinations are written one after another, so the bar restarts at zero
   // for each of them. The counter is what explains that; it goes on the meta
   // line because the running card deliberately has nothing under the bar.
