@@ -706,6 +706,9 @@ struct PhaseStats {
     icon_resyncs: u64,
     attr_drift: u64,
     errors: Vec<String>,
+    /// The rels behind `failed`, so prune can spare what the destination
+    /// already held of them.
+    failed_rels: Vec<String>,
 }
 
 /// The sources this task will read, with their *configuration* validated.
@@ -979,6 +982,7 @@ async fn copy_phase<R: Runtime>(
                     first_error = Some(error);
                     abort.cancel();
                 }
+                stats.failed_rels.push(rel);
             }
             FileOutcome::Aborted => {}
         }
@@ -1448,6 +1452,16 @@ async fn execute_one<R: Runtime>(
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
     #[cfg(any(windows, target_os = "macos"))]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
+    // A file this destination could not write keeps the copy it already
+    // held. Rebuilt only when something failed; a clean run prunes with the
+    // set every destination shares.
+    let spared;
+    let protected = if stats.failed_rels.is_empty() {
+        protected
+    } else {
+        spared = protected.sparing_previous_copies_of(&stats.failed_rels);
+        &spared
+    };
     prune_phase(&ctx, keep, protected, &mut stats).await?;
     verify_icons_phase(&ctx, &walked.files, &mut stats).await?;
     mirror_dir_attrs_phase(&ctx, &mut walked.dirs, &mut stats).await;
@@ -1572,7 +1586,7 @@ fn fold_outcomes(
 /// says about them, in one place so that the preview and the prune itself
 /// cannot come to different conclusions about what is safe.
 ///
-/// Three kinds of protection, and they exist for different reasons:
+/// Four kinds of protection, and they exist for different reasons:
 ///
 /// - **excluded** — the user said "don't copy this". Deleting it from the
 ///   destination would be the opposite of what they asked (#2).
@@ -1585,12 +1599,17 @@ fn fold_outcomes(
 ///   stands, and again with the leading source folder taken off, because the
 ///   user wrote those globs against a source root while this side is a
 ///   destination path (see `inside_a_source_folder`).
+/// - **previous copies** — where the layout before per-source folders kept a
+///   file this destination failed to write this run. Only known once the
+///   copy phase is over, so the preview never has any, and the run adds them
+///   one destination at a time (see `sparing_previous_copies_of`).
 ///
 /// The first two sets are keyed by the *source's* spelling while the prune
 /// pass walks the *destination's*. On a case-preserving filesystem those
 /// differ the moment a folder is re-cased, and a literal comparison then
 /// misses the protection — which deleted precisely what the user asked to
 /// keep (#R6). Both sides are folded once, here.
+#[derive(Clone)]
 pub(crate) struct ProtectedSet<'a> {
     excluded: HashSet<String>,
     unreadable: HashSet<String>,
@@ -1600,6 +1619,9 @@ pub(crate) struct ProtectedSet<'a> {
     /// and the rest of it is the path the user's patterns were written
     /// against — see `covers`.
     folders: HashSet<String>,
+    /// Folded, like the sets above. Empty but for the set
+    /// `sparing_previous_copies_of` builds.
+    previous_copies: HashSet<String>,
     /// The source root itself could not be enumerated.
     source_root_unreadable: bool,
 }
@@ -1636,9 +1658,38 @@ impl<'a> ProtectedSet<'a> {
             unreadable: unreadable.iter().map(|s| fold_rel(s)).collect(),
             patterns,
             folders: folders.iter().map(|f| fold_rel(f)).collect(),
+            previous_copies: HashSet::new(),
             // An empty relative path is the root's own.
             source_root_unreadable: unreadable.contains(""),
         }
+    }
+
+    /// This set, also sparing the previous copy of every file in `failed` —
+    /// the rels one destination could not write this run.
+    ///
+    /// The first run after sources got folders writes each file under its
+    /// source's folder and only then prunes the old flat mirror. A file whose
+    /// new copy fails is in neither place prune checks: not at its new path,
+    /// and absent from a keep set that spells it with the folder in front. So
+    /// prune deleted the only copy the backup still had. The likely cause is
+    /// a full disk, since that run needs room for both copies, which made it
+    /// every file that did not fit rather than one unlucky one.
+    ///
+    /// The previous copy is the rel with its folder taken off, which is
+    /// exactly where the flat layout put it. It stays only while writing the
+    /// new one keeps failing; the run that manages it leaves the old copy an
+    /// ordinary orphan, so a full destination converges over a few runs
+    /// instead of losing what did not fit. Once the layout has moved, nothing
+    /// lives at those paths any more and sparing them costs nothing.
+    pub(crate) fn sparing_previous_copies_of(&self, failed: &[String]) -> Self {
+        let mut spared = self.clone();
+        spared.previous_copies.extend(
+            failed
+                .iter()
+                .filter_map(|rel| self.inside_a_source_folder(rel))
+                .map(fold_rel),
+        );
+        spared
     }
 
     /// Whether this destination path is protected — and therefore must not
@@ -1649,6 +1700,7 @@ impl<'a> ProtectedSet<'a> {
         is_root_icon_marker(rel)
             || self.excluded.contains(&probe)
             || self.unreadable.contains(&probe)
+            || self.previous_copies.contains(&probe)
             || self.patterns.matches(rel)
             || self
                 .inside_a_source_folder(rel)
@@ -4080,6 +4132,76 @@ mod tests {
 
         assert!(!dest.join("Beta").exists(), "the dropped source's folder goes");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The first run after sources got folders writes every file under its
+    /// source's folder, then prunes the old flat mirror. A file whose new
+    /// copy fails is in neither place prune checks — not at the new path,
+    /// and absent from a keep set that now spells it with the folder in
+    /// front — so prune deleted the only copy the backup had. The likely
+    /// failure is a full disk, the reshape needing room for both copies,
+    /// which made that every file that did not fit rather than one unlucky
+    /// one.
+    ///
+    /// Staged with a folder where the new copy has to land: the final rename
+    /// cannot replace a folder on any platform, and what is under test is
+    /// that the copy failed, not why.
+    #[tokio::test]
+    async fn a_file_whose_new_copy_fails_keeps_its_old_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        let mirror = backed_up(&dest, &source);
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("stuck.txt"), b"current").unwrap();
+        std::fs::write(source.join("moved.txt"), b"current").unwrap();
+
+        // The layout every run before per-source folders wrote.
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("stuck.txt"), b"previous").unwrap();
+        std::fs::write(dest.join("moved.txt"), b"previous").unwrap();
+        std::fs::create_dir_all(mirror.join("stuck.txt")).unwrap();
+        std::fs::write(mirror.join("stuck.txt").join("in-the-way"), b"x").unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "reshape-fail".into(),
+            name: "reshape-fail".into(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+        let settings = Settings {
+            continue_on_error: Some(true),
+            ..Default::default()
+        };
+        let outcome = run_one_destination(
+            app.handle(),
+            "reshape-fail",
+            &task,
+            &dest,
+            &settings,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.failed, Some(1), "the staged failure has to have happened");
+        assert_eq!(
+            std::fs::read(dest.join("stuck.txt")).ok().as_deref(),
+            Some(&b"previous"[..]),
+            "prune deleted the only copy of a file it had just failed to write"
+        );
+        assert_eq!(std::fs::read(mirror.join("moved.txt")).unwrap(), b"current");
+        assert!(
+            !dest.join("moved.txt").exists(),
+            "an old copy whose new one landed is an ordinary orphan"
+        );
     }
 
     /// A path-shaped exclude pattern is written against the source root, but
