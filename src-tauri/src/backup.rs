@@ -27,7 +27,8 @@ use xxhash_rust::xxh3::Xxh3;
 pub struct Source {
     pub path: String,
     /// A folder *name*, not a path: no separators, no `.` or `..`. Validated
-    /// by `preflight_sources` before anything is written.
+    /// by `preflight_sources` before anything is written. Empty for a source
+    /// with no name of its own to take, until the user gives it one.
     pub folder: String,
 }
 
@@ -67,29 +68,35 @@ pub struct Task {
 
 impl Task {
     /// Every source this task reads, in the order the user listed them,
-    /// blanks dropped and exact repeats collapsed.
+    /// blank paths dropped and exact repeats collapsed.
     ///
     /// Only exact repeats, for the same reason `destinations()` gives: two
     /// spellings of one folder are a filesystem question, and
     /// `reject_destination_overlaps` has to ask it anyway.
+    ///
+    /// A blank *folder* is kept. It is a source the user listed and nobody
+    /// has named, and `preflight_sources` refuses it by its path; dropping it
+    /// here backed up the other sources and reported success while this one
+    /// was never read.
     pub fn sources(&self) -> Vec<Source> {
         let listed = match &self.sources {
             Some(list) if !list.is_empty() => list.clone(),
             // A legacy task's subfolder is the source path's own name. A path
-            // with no final component — a bare drive root — cannot supply one,
-            // and is dropped rather than given an invented name.
+            // with no final component — a drive root — has none to give and
+            // gets no invented one: it keeps an empty folder and waits for the
+            // user to name it, rather than being dropped and taking its path
+            // out of tasks.json with it at the next save.
             _ => self
                 .source
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .and_then(|s| {
-                    Path::new(s)
+                .map(|s| Source {
+                    path: s.to_string(),
+                    folder: Path::new(s)
                         .file_name()
-                        .map(|n| Source {
-                            path: s.to_string(),
-                            folder: n.to_string_lossy().to_string(),
-                        })
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                 })
                 .into_iter()
                 .collect(),
@@ -98,7 +105,7 @@ impl Task {
         listed
             .into_iter()
             .map(|s| Source { path: s.path.trim().to_string(), folder: s.folder.trim().to_string() })
-            .filter(|s| !s.path.is_empty() && !s.folder.is_empty())
+            .filter(|s| !s.path.is_empty())
             .filter(|s| seen.insert(s.path.clone()))
             .collect()
     }
@@ -716,6 +723,16 @@ pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
     for source in &sources {
         if !Path::new(&source.path).is_absolute() {
             return Err(anyhow!("Paths must be absolute"));
+        }
+        // Ahead of the name rules, because an empty name gives the message
+        // nothing to quote — and this is the case a user actually meets: a
+        // drive root carried over from a task written before sources had
+        // folders, which has no name of its own to take.
+        if source.folder.is_empty() {
+            return Err(anyhow!(
+                "The source {} has no destination folder name. Edit the task to give it one.",
+                source.path
+            ));
         }
         validate_folder_name(&source.folder)?;
     }
@@ -2996,7 +3013,7 @@ mod tests {
         assert_eq!(plural.sources()[1].folder, "Photos-Work");
     }
 
-    /// Blanks and exact repeats go, the way `destinations()` drops them.
+    /// Blank paths and exact repeats go, the way `destinations()` drops them.
     /// Two spellings of one folder are left in on purpose: deciding they are
     /// the same folder means asking the filesystem, which is the overlap
     /// guard's job and it runs anyway.
@@ -3025,9 +3042,15 @@ mod tests {
     }
 
     /// A legacy path with a trailing separator still yields a usable folder
-    /// name: `file_name()` on "C:/Photos/" answers "Photos", but on a bare
-    /// root like "D:/" it answers nothing, and a source with no name of its
-    /// own cannot be given a subfolder automatically.
+    /// name: `file_name()` on "C:/Photos/" answers "Photos". A root answers
+    /// nothing, having no name of its own, and it is kept with an empty
+    /// folder rather than dropped: dropping it erased the path from
+    /// tasks.json the moment the frontend migrated the file, and the run then
+    /// reported that no source was set at all.
+    ///
+    /// The root is this platform's own, taken off the temp dir. `Path` parses
+    /// by the rules of the OS it is built for, and "D:/" is a root only on
+    /// Windows — everywhere else "D:" is an ordinary folder name.
     #[test]
     fn a_legacy_source_folder_comes_from_the_paths_own_name() {
         let with_slash: Task = serde_json::from_value(serde_json::json!({
@@ -3036,11 +3059,43 @@ mod tests {
         .unwrap();
         assert_eq!(with_slash.sources()[0].folder, "Photos");
 
+        let root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("a path has a root")
+            .to_string_lossy()
+            .to_string();
         let bare_root: Task = serde_json::from_value(serde_json::json!({
-            "id": "1", "name": "t", "source": "D:/"
+            "id": "1", "name": "t", "source": root
         }))
         .unwrap();
-        assert!(bare_root.sources().is_empty(), "a root has no name to become a folder");
+        assert_eq!(
+            bare_root.sources(),
+            vec![Source { path: root.clone(), folder: String::new() }],
+            "a root keeps its path and waits for a name"
+        );
+    }
+
+    /// A source with no folder name is refused, by its path. Dropping it, as
+    /// `sources()` used to, backed up the task's other sources and reported
+    /// success while one the user listed was never read at all.
+    #[test]
+    fn a_source_without_a_folder_name_is_refused_by_its_path() {
+        let root = tempfile::tempdir().unwrap();
+        let named = root.path().join("named").to_string_lossy().to_string();
+        let unnamed = root.path().join("unnamed").to_string_lossy().to_string();
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "t",
+            "sources": [
+                { "path": named, "folder": "Named" },
+                { "path": unnamed, "folder": "  " }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(task.sources().len(), 2, "a listed source never silently goes");
+        let error = preflight_sources(&task).unwrap_err().to_string();
+        assert!(error.contains(&unnamed), "the message must say which source: {}", error);
     }
 
     /// A folder the user re-cased at source keeps the destination's stale
