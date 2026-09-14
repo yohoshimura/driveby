@@ -11,8 +11,8 @@
 //! so the preview cannot promise one thing and the run do another.
 
 use crate::backup::{
-    preflight_sources, reject_destination_overlaps, rel_of, same_mtime, walk, KeepSet, KeepStatus,
-    ProtectedSet, Settings, Task, WalkResult, CANCELLED_MSG,
+    preflight_sources, reject_destination_overlaps, rel_of, same_mtime, walk_all, KeepSet,
+    KeepStatus, ProtectedSet, Settings, Task, WalkResult, CANCELLED_MSG,
 };
 use crate::fsutil::long_path;
 use crate::glob;
@@ -141,12 +141,15 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     reject_destination_overlaps(&source_paths, &destinations)?;
 
     let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
-    // Interim: the preview still walks only the first source, so its rels
-    // carry no folder prefix and `ProtectedSet` is told of no folders.
-    // Moving this to `walk_all` is the preview's own task; until then a
-    // multi-source task previews as its first source.
-    let walked = walk(&source_paths[0], &patterns, token).await?;
-    let protected = ProtectedSet::new(&walked, &patterns, &[]);
+    // The merged walk the run makes, so every rel already carries its
+    // source's folder and a source that cannot be read protects that folder
+    // instead of failing the preview.
+    let walked = walk_all(&sources, &patterns, token).await?;
+    // And the folder names the run gives its `ProtectedSet`. Without them a
+    // path-shaped exclusion inside a source's folder is protected by the run
+    // but counted here as a deletion.
+    let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+    let protected = ProtectedSet::new(&walked, &patterns, &folders);
     let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
 
     let mut previews = Vec::with_capacity(destinations.len());
@@ -306,7 +309,12 @@ fn check_cancelled(token: &CancellationToken) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Here rather than in the list at the top: only the tests name the type,
+    // and the library build would flag an import it never uses.
+    use crate::backup::Source;
 
+    /// A task in the shape every tasks.json from before multi-source holds,
+    /// so these tests also cover the name its one source's folder is given.
     fn task_for(source: &Path, destinations: &[&Path]) -> Task {
         Task {
             id: "preview".into(),
@@ -327,28 +335,63 @@ mod tests {
         }
     }
 
+    fn task_with_sources(sources: &[(&Path, &str)], destinations: &[&Path]) -> Task {
+        Task {
+            id: "preview".into(),
+            name: "preview".into(),
+            source: None,
+            sources: Some(
+                sources
+                    .iter()
+                    .map(|(p, folder)| Source {
+                        path: p.to_string_lossy().to_string(),
+                        folder: (*folder).to_string(),
+                    })
+                    .collect(),
+            ),
+            destination: None,
+            destinations: Some(
+                destinations
+                    .iter()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .collect(),
+            ),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        }
+    }
+
+    /// Where the run writes a `task_for` source: into a folder named after
+    /// it. Spelled once, the way `backup.rs`'s tests spell it.
+    fn backed_up(dest: &Path, src: &Path) -> PathBuf {
+        dest.join(src.file_name().expect("a source has a name"))
+    }
+
     /// The four numbers the dialog shows, on a tree that has one of each.
     #[tokio::test]
     async fn counts_new_modified_unchanged_and_deleted() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let dest = root.path().join("dest");
+        let mirror = backed_up(&dest, &source);
         std::fs::create_dir_all(&source).unwrap();
-        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::create_dir_all(&mirror).unwrap();
 
         // Unchanged on both sides: same bytes, and the same mtime, which is
         // what the run compares.
         std::fs::write(source.join("same.txt"), b"identical").unwrap();
-        std::fs::copy(source.join("same.txt"), dest.join("same.txt")).unwrap();
+        std::fs::copy(source.join("same.txt"), mirror.join("same.txt")).unwrap();
         let mtime = filetime::FileTime::from_last_modification_time(
             &std::fs::metadata(source.join("same.txt")).unwrap(),
         );
-        filetime::set_file_mtime(dest.join("same.txt"), mtime).unwrap();
+        filetime::set_file_mtime(mirror.join("same.txt"), mtime).unwrap();
 
         std::fs::write(source.join("new.txt"), b"brand new").unwrap();
         std::fs::write(source.join("changed.txt"), b"the new contents").unwrap();
-        std::fs::write(dest.join("changed.txt"), b"old").unwrap();
-        std::fs::write(dest.join("removed.txt"), b"gone from source").unwrap();
+        std::fs::write(mirror.join("changed.txt"), b"old").unwrap();
+        std::fs::write(mirror.join("removed.txt"), b"gone from source").unwrap();
 
         let payload = plan(
             &task_for(&source, &[&dest]),
@@ -375,11 +418,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let dest = root.path().join("dest");
+        let mirror = backed_up(&dest, &source);
         std::fs::create_dir_all(source.join("node_modules")).unwrap();
-        std::fs::create_dir_all(dest.join("node_modules")).unwrap();
+        std::fs::create_dir_all(mirror.join("node_modules")).unwrap();
         std::fs::write(source.join("keep.txt"), b"kept").unwrap();
         std::fs::write(source.join("node_modules/lib.js"), b"ignored").unwrap();
-        std::fs::write(dest.join("node_modules/lib.js"), b"ignored").unwrap();
+        std::fs::write(mirror.join("node_modules/lib.js"), b"ignored").unwrap();
 
         let settings = Settings {
             exclude_patterns: "node_modules".into(),
@@ -422,6 +466,92 @@ mod tests {
         assert_eq!(payload.destinations[0].new_files, 1);
         assert!(!payload.destinations[1].reachable);
         assert_eq!(payload.destinations[1].new_files, 0);
+    }
+
+    /// The preview has to describe the layout the run will actually produce,
+    /// or the numbers in the confirmation dialog are about a different backup
+    /// than the one about to happen.
+    #[tokio::test]
+    async fn a_preview_counts_every_source() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("Alpha");
+        let b = root.path().join("Beta");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(a.join("one.txt"), b"1").unwrap();
+        std::fs::write(b.join("two.txt"), b"2").unwrap();
+
+        let task = task_with_sources(&[(&a, "Alpha"), (&b, "Beta")], &[&dest]);
+        let payload = plan(&task, &Settings::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(payload.source_files, 2, "both sources counted");
+        assert_eq!(payload.destinations[0].new_files, 2);
+    }
+
+    /// A source on an unplugged drive is reported, not counted. The run
+    /// leaves that source's folder at the destination alone, so the preview
+    /// must neither fail over it nor show the only copy of its files as
+    /// deletions — and it has to say the backup would be incomplete.
+    #[tokio::test]
+    async fn an_absent_source_is_reported_not_counted_as_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let here = root.path().join("here");
+        let gone = root.path().join("gone");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::write(here.join("a.txt"), b"alpha").unwrap();
+        // What an earlier run copied from the source that is now unplugged.
+        std::fs::create_dir_all(dest.join("Gone")).unwrap();
+        std::fs::write(dest.join("Gone/only-copy.txt"), b"precious").unwrap();
+
+        let payload = plan(
+            &task_with_sources(&[(&here, "Here"), (&gone, "Gone")], &[&dest]),
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.unreadable, 1, "the backup would be knowingly incomplete");
+        assert_eq!(payload.source_files, 1, "the source that is there still counts");
+        assert_eq!(payload.destinations[0].deleted_files, 0);
+    }
+
+    /// The run protects a path-shaped exclusion inside a source's folder by
+    /// taking the folder off before asking the patterns, which it can only do
+    /// because it is told the folder names. A preview not told them would
+    /// count `Alpha/Photos/raw` as a deletion the run then declines to make:
+    /// the dialog would be asking for approval of something that never
+    /// happens.
+    #[tokio::test]
+    async fn a_path_shaped_exclusion_inside_a_source_folder_is_not_a_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("keep.txt"), b"kept").unwrap();
+        // Copied by an earlier run, then excluded, then removed from the
+        // source: the walk never meets it, so only the pattern protects it.
+        std::fs::create_dir_all(dest.join("Alpha/Photos/raw")).unwrap();
+        std::fs::write(dest.join("Alpha/Photos/raw/a.cr2"), b"raw bytes").unwrap();
+
+        let settings = Settings {
+            exclude_patterns: "Photos/raw".into(),
+            ..Default::default()
+        };
+        let payload = plan(
+            &task_with_sources(&[(&source, "Alpha")], &[&dest]),
+            &settings,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(payload.destinations[0].deleted_files, 0);
     }
 
     #[tokio::test]
