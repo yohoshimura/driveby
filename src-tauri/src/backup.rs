@@ -4224,6 +4224,59 @@ mod tests {
         assert!(protected.covers("Photos/raw"), "an unprefixed path still matches");
     }
 
+    /// The same protection, through a whole run. The test above pins what
+    /// `covers` does with the folder names; this pins that `execute_all`
+    /// hands them over at all. Without them the run deletes a folder the
+    /// user excluded, and nothing else in the suite would notice.
+    #[tokio::test]
+    async fn a_run_keeps_a_path_shaped_exclusion_inside_a_source_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("keep.txt"), b"kept").unwrap();
+        // Copied by an earlier run, then excluded, then removed from the
+        // source: the walk never meets it, so only the pattern protects it.
+        std::fs::create_dir_all(dest.join("Alpha/Photos/raw")).unwrap();
+        std::fs::write(dest.join("Alpha/Photos/raw/a.cr2"), b"raw bytes").unwrap();
+
+        let task = Task {
+            id: "path-exclusion".into(),
+            name: "path-exclusion".into(),
+            source: None,
+            sources: Some(vec![Source {
+                path: source.to_string_lossy().into(),
+                folder: "Alpha".into(),
+            }]),
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+        };
+        let settings = Settings {
+            exclude_patterns: "Photos/raw".into(),
+            ..Default::default()
+        };
+        let app = tauri::test::mock_app();
+        let payload = execute_all(
+            app.handle(),
+            "backup-path-exclusion",
+            &task,
+            &settings,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert!(
+            dest.join("Alpha/Photos/raw/a.cr2").exists(),
+            "the run deleted a folder the user excluded"
+        );
+    }
+
     /// `read_dir` on the root failing is fatal, but the sibling case — the
     /// listing being cut short part-way through — used to fall into the
     /// generic "record it and carry on" branch. There is nothing to record
