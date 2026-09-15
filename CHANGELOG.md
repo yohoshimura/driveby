@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.7.6
 
 **A task can back up several folders.** Add as many sources as you like. Each
 is copied into a folder of its own at the destination, named after the source
