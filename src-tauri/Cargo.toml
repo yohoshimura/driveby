@@ -1,6 +1,6 @@
 [package]
 name = "driveby"
-version = "1.7.6"
+version = "1.7.7"
 edition = "2021"
 description = "Desktop backup application"
 authors = ["ysh"]
@@ -47,6 +47,9 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[bin]]
 name = "driveby"

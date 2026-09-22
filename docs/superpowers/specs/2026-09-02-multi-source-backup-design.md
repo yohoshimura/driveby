@@ -1,7 +1,51 @@
 # Multi-source backup — design
 
 **Status:** approved 2026-09-02. Extends the plural `destinations` model
-introduced in 1.7.2.
+introduced in 1.7.2. **Amended 2026-09-22:** a single source is mirrored
+straight into the destination again — see below. The layout decision that
+follows now holds for tasks with two or more sources only.
+
+## Amendment — one source mirrors straight in (2026-09-22)
+
+The "accepted cost" below did not hold up on real data. On a 476 GB
+destination holding five single-source backups totalling about 400 GB, 1.7.6
+started re-copying each source in full into `dest/<Folder>/` beside the copy
+already there. The destination needed room for both copies at once and did not
+have it. The runs that finished moved their backup one level down. The others
+filled the disk and failed. With `continueOnError` off, they failed before
+prune, so the promised convergence never happened. Either way nothing was
+incremental: every file the destination already held counted as new.
+
+**Decision:** `uses_subfolders(sources)` is true only for two or more sources.
+A single source is mirrored straight into the destination: its rels carry no
+prefix, its root is not listed in `dirs`, and its `folder` is neither
+validated nor used. That is the 1.7.4 layout, so every backup written before
+1.7.6 is incremental again with no migration. Several sources keep one
+subfolder each, exactly as designed below. The layout depends on the count
+after all: the user-visible rule "one source syncs into the destination as it
+is" is worth more than having no conditional in the code.
+
+**Backups 1.7.6 already moved down** are moved back up, by rename, before the
+copy phase compares anything (`find_nested_copy` / `move_nested_copy_up`):
+
+- Only for a single source whose `folder` is a valid name, when
+  `dest/<folder>/` exists.
+- Skipped entirely when the source itself has a top-level entry of that name
+  (`C:\Pictures\Pictures\`). The flat copy then lives at the same path, and a
+  leftover cannot be told from the real thing.
+- An entry is moved only when nothing of its name exists at the root, and this
+  is checked again immediately before the rename, because `fs::rename`
+  replaces an existing file on Windows. The step renames and never deletes.
+  A skipped or failed entry falls back to the ordinary copy-and-prune.
+- The emptied subfolder is left to prune, which already removes emptied
+  directories, `+R` included.
+- The preview does not move anything. It counts as if the move had happened
+  (`NestedCopy::current_rel` / `rel_after_move`), so the dialog does not
+  announce the deletion of a copy that is about to be moved, not deleted.
+
+Going from one source to two is now the reshape the section below describes,
+with its copy-then-prune cost and `sparing_previous_copies_of`. The difference
+is that the user chose it, in the form.
 
 ## Problem
 

@@ -21,6 +21,7 @@ const DEST_MARK = {
   success: '✓',
   error: '✗',
   unreachable: '⚠',
+  nospace: '⚠',
   cancelled: '–',
 };
 
@@ -28,6 +29,7 @@ const DEST_STATUS_KEY = {
   success: 'history.dest.success',
   error: 'history.dest.error',
   unreachable: 'history.dest.unreachable',
+  nospace: 'history.dest.nospace',
   cancelled: 'history.dest.cancelled',
 };
 
@@ -154,7 +156,17 @@ export default function History() {
                             {t('common.reveal')}
                           </Button>
                         ) : <span />)}
-                        <span className="history-dest__error">{dest.error || ''}</span>
+                        {/* A refusal for room carries raw figures, formatted
+                            here in the reader's language; its `error` is the
+                            English fallback. */}
+                        <span className="history-dest__error">
+                          {status === 'nospace'
+                            ? t('backup.nospace.short', {
+                              needed: formatBytes(dest.neededBytes),
+                              free: formatBytes(dest.availableBytes),
+                            })
+                            : dest.error || ''}
+                        </span>
                         {/* The marker only earns its place when a row has
                             several destinations: there the Status badge says
                             "partial" without saying which drive missed out.

@@ -11,10 +11,11 @@
 //! so the preview cannot promise one thing and the run do another.
 
 use crate::backup::{
-    preflight_sources, reject_destination_overlaps, rel_of, same_mtime, walk_all, KeepSet,
-    KeepStatus, ProtectedSet, Settings, Task, WalkResult, CANCELLED_MSG,
+    destination_folders, find_nested_copy, plan_writes, preflight_sources,
+    reject_destination_overlaps, rel_of, walk_all, KeepSet, KeepStatus, NestedCopy,
+    ProtectedSet, Settings, Task, WalkResult, CANCELLED_MSG,
 };
-use crate::fsutil::long_path;
+use crate::fsutil::{available_space, blocking, long_path};
 use crate::glob;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
@@ -90,6 +91,12 @@ pub struct DestinationPreview {
     pub deleted_files: u64,
     pub deleted_bytes: u64,
     pub unchanged_files: u64,
+    /// The room the run needs on the destination's volume, counted exactly
+    /// as the run counts it before refusing a destination (`plan_writes`).
+    pub required_bytes: u64,
+    /// What the volume has free for this process, or none when it would not
+    /// say — in which case the run does not check either.
+    pub available_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -148,7 +155,7 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     // And the folder names the run gives its `ProtectedSet`. Without them a
     // path-shaped exclusion inside a source's folder is protected by the run
     // but counted here as a deletion.
-    let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+    let folders = destination_folders(&sources);
     let protected = ProtectedSet::new(&walked, &patterns, &folders);
     let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
 
@@ -167,7 +174,23 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
             });
             continue;
         }
-        previews.push(plan_one(destination, &walked, &keep, &protected, token).await?);
+        // The run moves a copy 1.7.6 left one level down back up before it
+        // compares anything. The preview does not move it — a dry run that
+        // renames is not dry — but counts as if it had, or it would show
+        // that whole copy as deleted and every file as new.
+        let nested = find_nested_copy(destination, &sources, &walked).await;
+        previews.push(
+            plan_one(
+                destination,
+                &walked,
+                &keep,
+                &protected,
+                nested.as_ref(),
+                settings.parallel_copies(),
+                token,
+            )
+            .await?,
+        );
     }
 
     info!(task = %task.name, "previewed {} destination(s)", previews.len());
@@ -185,17 +208,13 @@ async fn plan_one(
     walked: &WalkResult,
     keep: &KeepSet,
     protected: &ProtectedSet<'_>,
+    nested: Option<&NestedCopy>,
+    parallel: usize,
     token: &CancellationToken,
 ) -> Result<DestinationPreview> {
-    let mut preview = DestinationPreview {
-        path: destination.to_string_lossy().to_string(),
-        reachable: true,
-        ..Default::default()
-    };
-
     // New, modified or unchanged: the same question `copy_one` asks before
-    // deciding to stream a file, answered with the same size-and-mtime
-    // comparison.
+    // deciding to stream a file, answered by the very function the run asks
+    // before refusing a destination for room.
     //
     // One exception, deliberately not carried over: the copy loop always
     // re-copies `desktop.ini` regardless of what the destination holds. It
@@ -203,36 +222,22 @@ async fn plan_one(
     // nothing the user could observe — counting it as "modified" on every
     // single preview would be noise standing in front of the numbers that
     // matter.
-    for (i, file) in walked.files.iter().enumerate() {
-        // The cost here is one stat per file; checking the token every few
-        // hundred keeps a Cancel responsive without making the check itself
-        // the expensive part.
-        if i % 256 == 0 {
-            check_cancelled(token)?;
-        }
-        match fs::metadata(long_path(&destination.join(&file.rel))).await {
-            Err(_) => {
-                preview.new_files += 1;
-                preview.new_bytes += file.size;
-            }
-            Ok(meta)
-                if meta.is_file()
-                    && meta.len() == file.size
-                    && meta
-                        .modified()
-                        .ok()
-                        .is_some_and(|m| same_mtime(m, file.mtime)) =>
-            {
-                preview.unchanged_files += 1
-            }
-            Ok(_) => {
-                preview.modified_files += 1;
-                preview.modified_bytes += file.size;
-            }
-        }
-    }
+    let writes = plan_writes(destination, &walked.files, nested, parallel, token).await?;
+    let probe = destination.to_path_buf();
+    let mut preview = DestinationPreview {
+        path: destination.to_string_lossy().to_string(),
+        reachable: true,
+        new_files: writes.new_files,
+        new_bytes: writes.new_bytes,
+        modified_files: writes.modified_files,
+        modified_bytes: writes.modified_bytes,
+        unchanged_files: writes.unchanged_files,
+        required_bytes: writes.required_bytes,
+        available_bytes: blocking(move || available_space(&probe)).await,
+        ..Default::default()
+    };
 
-    count_deletions(destination, keep, protected, token, &mut preview).await?;
+    count_deletions(destination, keep, protected, nested, token, &mut preview).await?;
     Ok(preview)
 }
 
@@ -249,6 +254,7 @@ async fn count_deletions(
     destination: &Path,
     keep: &KeepSet,
     protected: &ProtectedSet<'_>,
+    nested: Option<&NestedCopy>,
     token: &CancellationToken,
     preview: &mut DestinationPreview,
 ) -> Result<()> {
@@ -281,16 +287,19 @@ async fn count_deletions(
             if file_type.is_symlink() {
                 continue;
             }
-            let rel = rel_of(&root, &path);
+            let found = rel_of(&root, &path);
+            // Judged at the path it will have when prune runs, which for an
+            // entry the run moves up is not the one it has now.
+            let rel = nested.map_or(found.as_str(), |n| n.rel_after_move(&found));
             // Protected entries are skipped without descending, so a
             // protected directory shields its whole subtree — exactly as in
             // the prune pass.
-            if protected.covers(&rel) {
+            if protected.covers(rel) {
                 continue;
             }
             if file_type.is_dir() {
                 stack.push(path);
-            } else if file_type.is_file() && matches!(keep.status(&rel), KeepStatus::Absent) {
+            } else if file_type.is_file() && matches!(keep.status(rel), KeepStatus::Absent) {
                 preview.deleted_files += 1;
                 preview.deleted_bytes += entry.metadata().await.map(|m| m.len()).unwrap_or(0);
             }
@@ -313,8 +322,8 @@ mod tests {
     // and the library build would flag an import it never uses.
     use crate::backup::Source;
 
-    /// A task in the shape every tasks.json from before multi-source holds,
-    /// so these tests also cover the name its one source's folder is given.
+    /// A task in the shape every tasks.json from before multi-source holds:
+    /// one source, mirrored straight into each destination.
     fn task_for(source: &Path, destinations: &[&Path]) -> Task {
         Task {
             id: "preview".into(),
@@ -363,10 +372,10 @@ mod tests {
         }
     }
 
-    /// Where the run writes a `task_for` source: into a folder named after
-    /// it. Spelled once, the way `backup.rs`'s tests spell it.
-    fn backed_up(dest: &Path, src: &Path) -> PathBuf {
-        dest.join(src.file_name().expect("a source has a name"))
+    /// Where the run writes a `task_for` source: straight into the
+    /// destination. Spelled once, the way `backup.rs`'s tests spell it.
+    fn backed_up(dest: &Path, _src: &Path) -> PathBuf {
+        dest.to_path_buf()
     }
 
     /// The four numbers the dialog shows, on a tree that has one of each.
@@ -531,8 +540,10 @@ mod tests {
     async fn a_path_shaped_exclusion_inside_a_source_folder_is_not_a_deletion() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
+        let other = root.path().join("other");
         let dest = root.path().join("dest");
         std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
         std::fs::write(source.join("keep.txt"), b"kept").unwrap();
         // Copied by an earlier run, then excluded, then removed from the
         // source: the walk never meets it, so only the pattern protects it.
@@ -544,7 +555,7 @@ mod tests {
             ..Default::default()
         };
         let payload = plan(
-            &task_with_sources(&[(&source, "Alpha")], &[&dest]),
+            &task_with_sources(&[(&source, "Alpha"), (&other, "Other")], &[&dest]),
             &settings,
             &CancellationToken::new(),
         )
@@ -552,6 +563,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload.destinations[0].deleted_files, 0);
+    }
+
+    /// A copy 1.7.6 left one level down is moved back up by the run before
+    /// anything is compared. The preview has to count it that way — the
+    /// files as already there, and only a genuine leftover as deleted — and
+    /// must not move anything itself: a preview is a dry run.
+    #[tokio::test]
+    async fn a_copy_left_one_level_down_previews_as_already_backed_up() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        let nested = dest.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("same.txt"), b"identical").unwrap();
+        std::fs::copy(source.join("same.txt"), nested.join("same.txt")).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(source.join("same.txt")).unwrap(),
+        );
+        filetime::set_file_mtime(nested.join("same.txt"), mtime).unwrap();
+        std::fs::write(nested.join("leftover.txt"), b"gone from source").unwrap();
+
+        let payload = plan(
+            &task_for(&source, &[&dest]),
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let d = &payload.destinations[0];
+        assert_eq!(d.unchanged_files, 1, "found where the move will put it");
+        assert_eq!(d.new_files, 0);
+        assert_eq!((d.deleted_files, d.deleted_bytes), (1, 16), "only the leftover goes");
+        assert!(nested.join("same.txt").exists(), "the preview moved nothing");
+        assert!(!dest.join("same.txt").exists());
+    }
+
+    /// The dialog has to be able to say a destination lacks the room before
+    /// the user confirms: what the run would need there, by the run's own
+    /// count, and what the volume has free.
+    #[tokio::test]
+    async fn a_preview_reports_the_room_a_destination_needs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("new.bin"), vec![0u8; 5000]).unwrap();
+
+        let payload = plan(
+            &task_for(&source, &[&dest]),
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let d = &payload.destinations[0];
+        assert_eq!(d.required_bytes, 8192, "one new file, in whole clusters");
+        assert!(d.available_bytes.is_some_and(|free| free > 0));
     }
 
     #[tokio::test]

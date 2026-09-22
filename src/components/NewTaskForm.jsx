@@ -13,6 +13,7 @@ import {
   sourceFolderName,
   taskDestinations,
   taskSources,
+  usesSubfolders,
 } from '../lib/task';
 import {
   DEFAULT_SCHEDULE_TIME,
@@ -86,6 +87,10 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       ...prev,
       sources: prev.sources.filter((_, i) => i !== index),
     }));
+
+  // Whether the sources get a folder each at the destination, which is what
+  // decides if their folder names are shown and checked at all.
+  const nested = usesSubfolders(task.sources);
 
   // Marked on the row as well as refused at submit: the folder name is the
   // one thing here typed by hand, and a drive root arrives with it empty.
@@ -165,17 +170,21 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       return showToast?.(t('form.error.dest_in_source'), 'error');
     }
     // The folder names the backend would refuse, with the message naming the
-    // row: an empty name has nothing to quote but its path.
-    const misnamed = task.sources.find((s) => folderNameError(s.folder));
-    if (misnamed) {
-      const key = folderNameError(misnamed.folder) === 'empty'
-        ? 'form.error.source_folder_empty'
-        : 'form.error.source_folder_invalid';
-      return showToast?.(t(key, { path: misnamed.path, folder: misnamed.folder.trim() }), 'error');
-    }
-    const duplicate = findDuplicateFolder(task.sources);
-    if (duplicate) {
-      return showToast?.(t('form.error.source_folder_duplicate', { folder: duplicate }), 'error');
+    // row: an empty name has nothing to quote but its path. Only asked of
+    // several sources — a single one is mirrored straight in and its name is
+    // never used.
+    if (nested) {
+      const misnamed = task.sources.find((s) => folderNameError(s.folder));
+      if (misnamed) {
+        const key = folderNameError(misnamed.folder) === 'empty'
+          ? 'form.error.source_folder_empty'
+          : 'form.error.source_folder_invalid';
+        return showToast?.(t(key, { path: misnamed.path, folder: misnamed.folder.trim() }), 'error');
+      }
+      const duplicate = findDuplicateFolder(task.sources);
+      if (duplicate) {
+        return showToast?.(t('form.error.source_folder_duplicate', { folder: duplicate }), 'error');
+      }
     }
     // Sharing a folder with another task is not sharing: each run mirror-prunes
     // the folder against its own source and deletes what the other just wrote,
@@ -229,7 +238,10 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         />
       </FormField>
 
-      <FormField label={t('form.label.sources')} hint={t('form.hint.sources')}>
+      <FormField
+        label={t('form.label.sources')}
+        hint={t(nested ? 'form.hint.sources' : 'form.hint.source_single')}
+      >
         <div className="dest-list">
           {task.sources.length === 0 ? (
             <div className="field-row">
@@ -257,20 +269,22 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
                   name={`driveby-task-source-${i}`}
                 />
                 <Button size="small" onClick={() => pickSource(i)}>{t('common.choose')}</Button>
-                <input
-                  type="text"
-                  className="field field--folder"
-                  value={source.folder}
-                  onChange={(e) => setSourceFolder(i, e.target.value)}
-                  placeholder={t('form.placeholder.source_folder')}
-                  aria-label={t('form.aria.source_folder', { n: i + 1 })}
-                  aria-invalid={folderInvalid(i)}
-                  autoComplete="off"
-                  autoCorrect="off"
-                  autoCapitalize="off"
-                  spellCheck={false}
-                  name={`driveby-task-source-folder-${i}`}
-                />
+                {nested && (
+                  <input
+                    type="text"
+                    className="field field--folder"
+                    value={source.folder}
+                    onChange={(e) => setSourceFolder(i, e.target.value)}
+                    placeholder={t('form.placeholder.source_folder')}
+                    aria-label={t('form.aria.source_folder', { n: i + 1 })}
+                    aria-invalid={folderInvalid(i)}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    name={`driveby-task-source-folder-${i}`}
+                  />
+                )}
                 <Button
                   size="small"
                   variant="borderless"

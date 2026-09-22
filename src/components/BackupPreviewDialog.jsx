@@ -3,6 +3,7 @@ import Button from './common/Button';
 import { useExitTransition } from '../hooks/useExitTransition';
 import { useFormat } from '../hooks/useFormat';
 import { useT } from '../hooks/useT';
+import { lacksRoom } from '../lib/space';
 
 /// The confirmation that replaces "From: … To: …" with what the run would
 /// actually do. It opens *before* the answer is known — the scan is a full
@@ -48,6 +49,11 @@ export default function BackupPreviewDialog({ state, onConfirm, onCancel }) {
   );
   const ready = status === 'ready';
   const nothingToDo = ready && totals.changes === 0;
+  // Every destination that could be written lacks the room: the run would
+  // refuse them all, so there is nothing to confirm. One with room is enough
+  // to go ahead — the others are refused and reported, as a partial run.
+  const reachable = destinations.filter((d) => d.reachable);
+  const noRoomAnywhere = ready && reachable.length > 0 && reachable.every(lacksRoom);
 
   return (
     <div
@@ -92,6 +98,14 @@ export default function BackupPreviewDialog({ state, onConfirm, onCancel }) {
                     <span className="preview-stat preview-stat--muted">
                       <b>{formatNumber(d.unchangedFiles)}</b> {t('preview.label.unchanged')}
                     </span>
+                    {lacksRoom(d) && (
+                      <div className="preview-dest__nospace">
+                        {t('backup.nospace.short', {
+                          needed: formatBytes(d.requiredBytes),
+                          free: formatBytes(d.availableBytes),
+                        })}
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="preview-dest__absent">{t('history.dest.unreachable')}</div>
@@ -112,7 +126,7 @@ export default function BackupPreviewDialog({ state, onConfirm, onCancel }) {
             variant="primary"
             destructive={totals.deletions > 0}
             onClick={onConfirm}
-            disabled={!ready}
+            disabled={!ready || noRoomAnywhere}
           >
             {nothingToDo ? t('preview.action.anyway') : t('task.confirm.backup.action')}
           </Button>

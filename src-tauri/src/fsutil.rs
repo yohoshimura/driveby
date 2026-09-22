@@ -312,6 +312,54 @@ pub fn apply_attrs(_p: &Path, _attrs: u32) {}
 pub fn clear_readonly(_p: &Path) {}
 
 // ─────────────────────────────────────────────────────────────────────
+// Free space
+// ─────────────────────────────────────────────────────────────────────
+
+/// Bytes this process may still write on the volume holding `dir`, or
+/// `None` when the question has no answer — `dir` missing, or a filesystem
+/// that will not say.
+///
+/// "Available to the caller", not "free": a disk quota, or the blocks ext4
+/// reserves for root, are room this process cannot use.
+#[cfg(windows)]
+pub fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    // A plain path rather than `long_path`: the verbatim prefix is not
+    // documented for this call, and a destination root is nowhere near
+    // MAX_PATH. The trailing separator is required for a share root.
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if !matches!(wide.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/')) {
+        wide.push(u16::from(b'\\'));
+    }
+    wide.push(0);
+    let mut available: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(unix)]
+// The field types differ by platform — `u64` on Linux, `u32` on macOS — so
+// the casts are needed on one and redundant on the other.
+#[allow(clippy::unnecessary_cast)]
+pub fn available_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Getting the synchronous calls off the async workers
 // ─────────────────────────────────────────────────────────────────────
 
@@ -565,6 +613,16 @@ mod tests {
         let p = std::env::temp_dir().join(format!("driveby-test-{}", name));
         let _ = std::fs::create_dir_all(&p);
         p
+    }
+
+    /// Any folder on a mounted volume has an answer, and a folder that does
+    /// not exist has none — which the room check reads as "cannot tell"
+    /// rather than as a volume with nothing free.
+    #[test]
+    fn free_space_is_read_off_the_folders_volume() {
+        let root = make_test_dir("free-space");
+        assert!(available_space(&root).is_some_and(|free| free > 0));
+        assert!(available_space(&root.join("does-not-exist/at-all")).is_none());
     }
 
     #[test]

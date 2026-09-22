@@ -26,6 +26,7 @@ fn default_settings() -> Value {
         "showNotifications": true,
         "accentColor": "blue",
         "theme": "system",
+        "uiStyle": "auto",
         "verify": false,
         "continueOnError": true,
         "preserveMtime": true,

@@ -155,6 +155,16 @@ export function findOverlap(paths, fold = FOLDS_CASE) {
   return null;
 }
 
+/// Whether each source writes into a folder of its own at the destination.
+///
+/// The rule of `uses_subfolders` in src-tauri/src/backup.rs: only several
+/// sources need keeping apart, so a single one is mirrored straight into the
+/// destination, as every version before multi-source mirrored it — and its
+/// folder name is neither shown nor checked.
+export function usesSubfolders(sources) {
+  return (sources?.length ?? 0) > 1;
+}
+
 /// The first folder name two sources share, or null.
 ///
 /// Compared as `preflight_sources` compares them: folded where the

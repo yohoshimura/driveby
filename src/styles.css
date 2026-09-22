@@ -988,11 +988,12 @@ input, textarea { user-select: text; }
   max-width: min(320px, 80vw);
   padding: 10px 14px;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--bg-primary) 78%, var(--accent) 12%);
+  /* Translucent without a backdrop blur, so the rows and group edges behind
+     the bubble stay visible through it. A blur would smear them away, and
+     WebView2 only applied it to some bubbles, which made them inconsistent. */
+  background: color-mix(in srgb, var(--bg-content) 80%, transparent);
   border: 0.5px solid color-mix(in srgb, var(--accent) 25%, var(--separator));
   color: var(--label-primary);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  backdrop-filter: saturate(180%) blur(20px);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
   font-style: normal;
   font-weight: 400;
@@ -1106,15 +1107,22 @@ input, textarea { user-select: text; }
   margin-top: 2px;
 }
 .history-dest > * { justify-self: start; }
-.history-dest .history-path { margin-top: 0; max-width: 340px; }
+/* Capped at its column as well as at 340px. `justify-self: start` sizes the
+   path to its own text rather than to the column, so when the table left the
+   column narrower than the path, the path spilled into the next cell and the
+   error or the Restore link was drawn on top of it — `overflow: hidden` only
+   clips at the path's own box, which was the too-wide one. */
+.history-dest .history-path { margin-top: 0; max-width: min(340px, 100%); }
 /* The state marker sits at the far end of the column rather than in front
    of the path: leading with it indented every path away from the task name
    above it, and pinned right it lines up down the table instead. */
 .history-dest__mark { justify-self: end; }
 /* A single destination has its actions at the end of the row and no marker
    of its own — the Status badge two columns over already says how it went —
-   so the line is the path and whatever went wrong with it. */
-.history-dest--plain { grid-template-columns: minmax(0, max-content) 1fr; }
+   so the line is the path, with whatever went wrong with it underneath.
+   Beside it, the two shared a cell the table rarely has room for: the error
+   broke onto two lines and landed on the end of the path. */
+.history-dest--plain { grid-template-columns: minmax(0, 1fr); row-gap: 1px; }
 
 /* Restore, Reveal and Delete, in that order, pinned to the right. Right-
    aligned rather than laid out on a fixed grid: Delete is on every row, so
@@ -1125,6 +1133,7 @@ input, textarea { user-select: text; }
 .history-dest__mark--success { color: var(--system-green); }
 .history-dest__mark--error { color: var(--system-red); }
 .history-dest__mark--unreachable { color: var(--system-orange); }
+.history-dest__mark--nospace { color: var(--system-orange); }
 .history-dest__mark--cancelled { color: var(--system-gray); }
 .history-dest__error { font-size: 11px; color: var(--label-secondary); }
 
@@ -1193,6 +1202,9 @@ input, textarea { user-select: text; }
   font-size: 12px; color: var(--label-secondary);
 }
 .preview-dest__absent { font-size: 12px; color: var(--system-orange); }
+/* Under the figures rather than instead of them: the counts are still what
+   the run would write, and they are what the missing room is made of. */
+.preview-dest__nospace { flex-basis: 100%; font-size: 12px; color: var(--system-red); margin-top: 2px; }
 .preview-stat b { color: var(--label-primary); font-weight: 600; }
 .preview-stat em { font-style: normal; margin-left: 5px; opacity: 0.7; }
 .preview-stat--danger b { color: var(--system-red); }

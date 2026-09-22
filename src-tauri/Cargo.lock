@@ -872,13 +872,14 @@ dependencies = [
 
 [[package]]
 name = "driveby"
-version = "1.7.6"
+version = "1.7.7"
 dependencies = [
  "anyhow",
  "chrono",
  "dashmap",
  "filetime",
  "futures-util",
+ "libc",
  "regex",
  "serde",
  "serde_json",

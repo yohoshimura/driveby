@@ -12,9 +12,11 @@ import { bridge } from '../lib/tauri';
 import { useSystemTheme } from '../hooks/useSystemTheme';
 import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
+import { DEFAULT_UI_STYLE, resolveUiStyle } from '../lib/uiStyle';
 import { DEFAULT_HISTORY_RETENTION, trimHistory } from '../lib/history';
 import { migrateTasks, taskDestinations, taskSources } from '../lib/task';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
+import { makeFormatters } from '../lib/format';
 
 const AppContext = createContext(null);
 
@@ -25,6 +27,7 @@ const DEFAULT_SETTINGS = {
   showNotifications: true,
   accentColor: DEFAULT_ACCENT,
   theme: 'system',
+  uiStyle: DEFAULT_UI_STYLE,
   language: DEFAULT_LANGUAGE,
   verify: false,
   continueOnError: true,
@@ -70,14 +73,18 @@ export function AppProvider({ children }) {
   // useT() hook because it *is* the provider, so it goes through translate()
   // directly. Reads from the ref so async callbacks (event listeners) pick
   // up the active language without re-binding.
-  const tr = useCallback((key, params) => {
-    const lang = SUPPORTED_LANGUAGES.includes(settingsRef.current.language)
+  const currentLanguage = useCallback(() => (
+    SUPPORTED_LANGUAGES.includes(settingsRef.current.language)
       ? settingsRef.current.language
-      : DEFAULT_LANGUAGE;
-    return translate(lang, key, params);
-  }, []);
+      : DEFAULT_LANGUAGE
+  ), []);
+  const tr = useCallback(
+    (key, params) => translate(currentLanguage(), key, params),
+    [currentLanguage],
+  );
 
   const { resolved: resolvedTheme } = useSystemTheme(settings.theme);
+  const resolvedStyle = resolveUiStyle(settings.uiStyle, navigator.userAgent);
 
   useEffect(() => {
     (async () => {
@@ -137,6 +144,13 @@ export function AppProvider({ children }) {
     // Accent is fixed to the default — picker was removed from Settings.
     document.documentElement.setAttribute('data-accent', DEFAULT_ACCENT);
   }, [resolvedTheme]);
+
+  // Separate from data-theme on purpose: the style (iOS, Windows 11, GNOME)
+  // and the light/dark mode are two independent axes, and each stylesheet in
+  // src/themes/ keys its dark variant off both attributes together.
+  useEffect(() => {
+    document.documentElement.setAttribute('data-style', resolvedStyle);
+  }, [resolvedStyle]);
 
   useEffect(() => {
     const unlisten = [];
@@ -203,7 +217,25 @@ export function AppProvider({ children }) {
             'error',
           );
         } else {
-          showToast(tr('backup.toast.failed', { error: data.error }), 'error');
+          // A destination refused for room is said in so many words, with
+          // the figures in the reader's language, and notified as well: a
+          // scheduled run is refused with the window closed, and nothing else
+          // would tell the user their backups have stopped.
+          const short = (data.destinations || []).find((d) => d.status === 'nospace');
+          if (short) {
+            const { formatBytes } = makeFormatters(currentLanguage());
+            const message = tr('backup.nospace', {
+              path: short.path,
+              needed: formatBytes(short.neededBytes),
+              free: formatBytes(short.availableBytes),
+            });
+            showToast(message, 'error');
+            if (settingsRef.current.showNotifications) {
+              bridge.notify(tr('backup.notification.title'), message);
+            }
+          } else {
+            showToast(tr('backup.toast.failed', { error: data.error }), 'error');
+          }
         }
       });
       const offTaskUpdated = await bridge.onTaskUpdated((data) => {

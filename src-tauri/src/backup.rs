@@ -1,6 +1,7 @@
 use crate::fsutil::{
-    apply_attrs, blocking, clear_readonly, finish_copy, long_path, mirror_dir_attrs,
-    path_contains, read_attrs, reject_overlap, scratch_path, CASE_INSENSITIVE_FS,
+    apply_attrs, available_space, blocking, clear_readonly, finish_copy, long_path,
+    mirror_dir_attrs, path_contains, read_attrs, reject_overlap, scratch_path,
+    CASE_INSENSITIVE_FS,
 };
 use crate::glob;
 use crate::persist;
@@ -166,7 +167,7 @@ impl Settings {
     /// that reproduces the historical sequential behavior exactly (spinning
     /// disks can prefer it); the cap keeps us from turning a USB drive into
     /// a seek storm.
-    fn parallel_copies(&self) -> usize {
+    pub(crate) fn parallel_copies(&self) -> usize {
         self.parallel_copies.unwrap_or(4).clamp(1, 8) as usize
     }
     /// The copy ceiling in bytes per second, 0 meaning none.
@@ -286,6 +287,13 @@ pub enum DestinationStatus {
     /// failure the user can fix by plugging something in, and the one we
     /// deliberately do not turn into a red history row every 24 hours.
     Unreachable,
+    /// Refused before a byte was written: what the run would write does not
+    /// fit in the room left on the destination's volume. Its own state, with
+    /// both figures in the outcome, because the fix is the user's to make —
+    /// free some space, or pick a bigger drive — and they need to know how
+    /// much. Letting the run fill the disk instead failed it half-way, having
+    /// moved hours of data it then could not finish.
+    NoSpace,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -313,6 +321,13 @@ pub struct DestinationOutcome {
     pub verified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<u64>,
+    /// With `NoSpace`: the room the run needed on the destination's volume,
+    /// and the room it had. Raw bytes, so the UI formats them in its own
+    /// language rather than showing the English `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
 }
 
 impl DestinationOutcome {
@@ -331,8 +346,33 @@ impl DestinationOutcome {
             failed: None,
             verified: None,
             unreadable: None,
+            needed_bytes: None,
+            available_bytes: None,
         }
     }
+
+    /// A destination refused for room, before anything was written to it.
+    pub(crate) fn no_space(path: &Path, short: Shortfall) -> Self {
+        Self {
+            needed_bytes: Some(short.needed),
+            available_bytes: Some(short.available),
+            ..Self::stillborn(
+                path,
+                DestinationStatus::NoSpace,
+                Some(format!(
+                    "not enough space: {} needed, {} free",
+                    gigabytes(short.needed),
+                    gigabytes(short.available)
+                )),
+            )
+        }
+    }
+}
+
+/// A size for a log line or the English fallback message. The UI formats the
+/// raw figures itself.
+fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -711,13 +751,38 @@ struct PhaseStats {
     failed_rels: Vec<String>,
 }
 
+/// Whether each source writes into a subfolder of its own, or the task's one
+/// source is mirrored straight into the destination.
+///
+/// Subfolders exist to keep several sources apart, and that is the only case
+/// that gets them. A single source is mirrored the way every version before
+/// multi-source mirrored it, which is what lets a run over an existing backup
+/// copy only what changed. 1.7.6 gave a lone source a subfolder too, and every
+/// backup it met changed shape: the whole source was copied again beside the
+/// copy already there, a destination sized for one copy filled up, and the
+/// run failed before prune could free anything.
+pub(crate) fn uses_subfolders(sources: &[Source]) -> bool {
+    sources.len() > 1
+}
+
+/// The subfolder names this task writes into, for `ProtectedSet` — none for a
+/// single source, whose paths carry no folder in front.
+pub(crate) fn destination_folders(sources: &[Source]) -> Vec<String> {
+    if uses_subfolders(sources) {
+        sources.iter().map(|s| s.folder.clone()).collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// The sources this task will read, with their *configuration* validated.
 ///
 /// Existence is not checked here on purpose. A source whose drive is
 /// unplugged must not fail the task — `walk_all` records it and prune walks
 /// around its subfolder. What is fatal is a configuration no disk could make
-/// right: no sources at all, a relative path, or a `folder` that is not a
-/// usable folder name.
+/// right: no sources at all, a relative path, or — with several sources — a
+/// `folder` that is not a usable folder name. A single source's folder is
+/// never used, so it is not checked.
 pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
     let sources = task.sources();
     if sources.is_empty() {
@@ -727,10 +792,15 @@ pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
         if !Path::new(&source.path).is_absolute() {
             return Err(anyhow!("Paths must be absolute"));
         }
+    }
+    if !uses_subfolders(&sources) {
+        return Ok(sources);
+    }
+    for source in &sources {
         // Ahead of the name rules, because an empty name gives the message
         // nothing to quote — and this is the case a user actually meets: a
-        // drive root carried over from a task written before sources had
-        // folders, which has no name of its own to take.
+        // drive root, which has no name of its own to take, added beside
+        // another source.
         if source.folder.is_empty() {
             return Err(anyhow!(
                 "The source {} has no destination folder name. Edit the task to give it one.",
@@ -755,6 +825,164 @@ pub(crate) fn preflight_sources(task: &Task) -> Result<Vec<Source>> {
         }
     }
     Ok(sources)
+}
+
+/// A single source's backup that 1.7.6 wrote one level down, in
+/// `destination/<folder>/`, and which of its top-level entries can move back
+/// up to where the flat layout keeps them.
+///
+/// Moving is a rename on the destination's own volume: instant, and no room
+/// needed. The alternative is what 1.7.6 did the other way round — copy
+/// every byte again and prune the old copy afterwards — which needs space for
+/// both, and is exactly what failed on a destination sized for one.
+pub(crate) struct NestedCopy {
+    /// The subfolder's name, spelled as the source's `folder` spells it.
+    folder: String,
+    /// The subfolder's top-level entries with nothing of the same name at
+    /// the destination root. Folded.
+    movable: HashSet<String>,
+}
+
+impl NestedCopy {
+    /// Where the file the flat layout puts at `rel` lives until the move:
+    /// inside the subfolder when its top-level entry is one that moves.
+    pub(crate) fn current_rel(&self, rel: &str) -> Option<String> {
+        let top = rel.split('/').next()?;
+        self.movable
+            .contains(&fold_rel(top))
+            .then(|| format!("{}/{}", self.folder, rel))
+    }
+
+    /// The path a destination entry at `rel` has once the move is done.
+    pub(crate) fn rel_after_move<'r>(&self, rel: &'r str) -> &'r str {
+        match rel.split_once('/') {
+            Some((first, rest)) if fold_rel(first) == fold_rel(&self.folder) => {
+                let top = rest.split('/').next().unwrap_or(rest);
+                if self.movable.contains(&fold_rel(top)) {
+                    rest
+                } else {
+                    rel
+                }
+            }
+            _ => rel,
+        }
+    }
+}
+
+/// Whether `destination` holds a copy 1.7.6 left one level down for this
+/// task's single source, and what of it can move up.
+///
+/// Three things have to hold. The task has one source, since several really
+/// do write into subfolders. The source has no top-level entry of the
+/// folder's name — `C:\Pictures\Pictures\` has its flat copy at
+/// `dest/Pictures/` too, and a leftover cannot be told from the real thing.
+/// And at least one entry of the subfolder has nothing of its name at the
+/// root; an entry at both levels keeps the root one and is not movable.
+pub(crate) async fn find_nested_copy(
+    destination: &Path,
+    sources: &[Source],
+    walked: &WalkResult,
+) -> Option<NestedCopy> {
+    let [source] = sources else {
+        return None;
+    };
+    let folder = source.folder.trim();
+    if validate_folder_name(folder).is_err() {
+        return None;
+    }
+
+    let name = fold_rel(folder);
+    let top_level = |rel: &str| fold_rel(rel.split('/').next().unwrap_or(rel));
+    let namesake = walked
+        .files
+        .iter()
+        .map(|f| f.rel.as_str())
+        .chain(walked.dirs.iter().map(|(_, rel)| rel.as_str()))
+        .chain(walked.excluded.iter().map(String::as_str))
+        .chain(walked.unreadable.iter().map(String::as_str))
+        .any(|rel| !rel.is_empty() && top_level(rel) == name);
+    if namesake {
+        info!(
+            dest = %destination.display(),
+            "the source holds a folder named {} itself; not treating it as a per-source folder",
+            folder
+        );
+        return None;
+    }
+
+    let nested = destination.join(folder);
+    match fs::symlink_metadata(long_path(&nested)).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return None,
+    }
+    let mut movable = HashSet::new();
+    for entry_name in entry_names(&nested).await {
+        if is_absent(&destination.join(&entry_name)).await {
+            movable.insert(fold_rel(&entry_name));
+        }
+    }
+    (!movable.is_empty()).then(|| NestedCopy {
+        folder: folder.to_string(),
+        movable,
+    })
+}
+
+/// Move every movable entry of `nested` up to the destination root, and
+/// return how many moved.
+///
+/// Renames only: nothing here deletes, so the worst a failure can do is
+/// leave an entry where it was, for the run to copy afresh and prune to
+/// remove as before. The emptied subfolder is left to prune too, which
+/// already knows how to take a directory that carries `+R`.
+pub(crate) async fn move_nested_copy_up(destination: &Path, nested: &NestedCopy) -> u64 {
+    let from = destination.join(&nested.folder);
+    let mut moved = 0;
+    // Listed before anything moves: renaming out of a directory while its
+    // listing is still being read can skip entries.
+    for entry_name in entry_names(&from).await {
+        if !nested.movable.contains(&fold_rel(&entry_name)) {
+            continue;
+        }
+        let to = destination.join(&entry_name);
+        // Asked again at the last moment. `fs::rename` replaces an existing
+        // file on Windows, and what it would replace is the root copy this
+        // step promises to keep.
+        if !is_absent(&to).await {
+            continue;
+        }
+        match fs::rename(long_path(&from.join(&entry_name)), long_path(&to)).await {
+            Ok(()) => moved += 1,
+            Err(e) => warn!(
+                entry = %entry_name,
+                "could not move {} back up to the destination root: {}", entry_name, e
+            ),
+        }
+    }
+    moved
+}
+
+/// The names in `dir`, symlinks left out — prune never follows one either.
+async fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(mut entries) = fs::read_dir(long_path(dir)).await else {
+        return names;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_type().await.is_ok_and(|t| !t.is_symlink()) {
+            names.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    names
+}
+
+/// Nothing at `path` — and known to be nothing. An error that is not
+/// "not found" (a permission problem, say) answers false: this is the check
+/// that stands between a rename and a file it would replace.
+async fn is_absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(long_path(path)).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 /// A source's destination subfolder is a folder *name*, not a path.
@@ -914,6 +1142,147 @@ pub(crate) fn reject_destination_overlaps(
         }
     }
     Ok(())
+}
+
+/// What one destination is about to receive: the question `copy_one` asks of
+/// each file before streaming it, asked of all of them up front. Byte counts
+/// are the source's sizes, as the preview shows them.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct WritePlan {
+    pub(crate) new_files: u64,
+    pub(crate) new_bytes: u64,
+    pub(crate) modified_files: u64,
+    pub(crate) modified_bytes: u64,
+    pub(crate) unchanged_files: u64,
+    /// The room the copy phase needs on the destination's volume — see
+    /// `plan_writes` for how it is counted.
+    pub(crate) required_bytes: u64,
+}
+
+/// The room a file of `size` bytes takes on disk: whole 4 KiB clusters,
+/// the NTFS and ext4 default. Rounding every file up is what keeps a tree
+/// of many small files from fitting on paper and not on the disk.
+fn on_disk(size: u64) -> u64 {
+    size.div_ceil(4096) * 4096
+}
+
+/// Compare every walked file with what the destination holds, by the size
+/// and mtime `copy_one` compares, and count what the copy phase would write.
+///
+/// The room it needs is counted from how the copy works:
+/// - a new file takes its whole size;
+/// - a modified file is written to a scratch file beside the old copy and
+///   renamed over it, so once committed it takes only what it grew by — but
+///   while it is being written both copies are on disk, so the `parallel`
+///   largest ones are counted in full on top, being the worst that can be in
+///   flight at once;
+/// - an unchanged file takes nothing;
+/// - and nothing is credited for deletions, because prune runs after the
+///   copy phase and frees nothing while it needs the room.
+///
+/// `nested`, from the preview, says where a file lives until the run moves a
+/// 1.7.6 subfolder back up. The run itself has already moved it and passes
+/// `None`.
+pub(crate) async fn plan_writes(
+    destination: &Path,
+    files: &[FileEntry],
+    nested: Option<&NestedCopy>,
+    parallel: usize,
+    token: &CancellationToken,
+) -> Result<WritePlan> {
+    let mut plan = WritePlan::default();
+    let mut rewritten: Vec<u64> = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        // One stat per file; checking the token every few hundred keeps a
+        // Cancel responsive without making the check the expensive part.
+        if i % 256 == 0 && token.is_cancelled() {
+            return Err(anyhow!(CANCELLED_MSG));
+        }
+        let at = nested.and_then(|n| n.current_rel(&file.rel));
+        match fs::metadata(long_path(&destination.join(at.as_deref().unwrap_or(&file.rel)))).await {
+            Err(_) => {
+                plan.new_files += 1;
+                plan.new_bytes += file.size;
+                plan.required_bytes += on_disk(file.size);
+            }
+            Ok(meta)
+                if meta.is_file()
+                    && meta.len() == file.size
+                    && meta
+                        .modified()
+                        .ok()
+                        .is_some_and(|m| same_mtime(m, file.mtime)) =>
+            {
+                plan.unchanged_files += 1
+            }
+            Ok(meta) => {
+                plan.modified_files += 1;
+                plan.modified_bytes += file.size;
+                // A directory in the way takes no room of its own to speak of.
+                let old = if meta.is_file() { on_disk(meta.len()) } else { 0 };
+                plan.required_bytes += on_disk(file.size).saturating_sub(old);
+                rewritten.push(on_disk(file.size));
+            }
+        }
+    }
+    plan.required_bytes += largest(rewritten, parallel);
+    Ok(plan)
+}
+
+/// The sum of the `n` largest sizes.
+fn largest(mut sizes: Vec<u64>, n: usize) -> u64 {
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    sizes.iter().take(n).sum()
+}
+
+/// A destination whose volume cannot take what the run would write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shortfall {
+    pub(crate) needed: u64,
+    pub(crate) available: u64,
+}
+
+/// Whether `available` bytes are enough for what the copy phase would write
+/// to `destination`.
+///
+/// The per-file comparison is one stat per file, so it is skipped whenever
+/// the answer is plain without it: if the volume could take every file as
+/// new, and the largest twice over, no plan can need more. On a destination
+/// with room to spare — the usual case — the run costs nothing extra.
+pub(crate) async fn decide_room(
+    destination: &Path,
+    files: &[FileEntry],
+    parallel: usize,
+    available: u64,
+    token: &CancellationToken,
+) -> Result<Option<Shortfall>> {
+    let sizes: Vec<u64> = files.iter().map(|f| on_disk(f.size)).collect();
+    let most = sizes.iter().sum::<u64>() + largest(sizes, parallel);
+    if most <= available {
+        return Ok(None);
+    }
+    let plan = plan_writes(destination, files, None, parallel, token).await?;
+    Ok((plan.required_bytes > available).then_some(Shortfall {
+        needed: plan.required_bytes,
+        available,
+    }))
+}
+
+/// `decide_room` against what the destination's volume actually has free.
+/// A volume that will not say is not checked: refusing a backup because the
+/// free space could not be read would stop backups that work today.
+async fn room_check(
+    destination: &Path,
+    files: &[FileEntry],
+    parallel: usize,
+    token: &CancellationToken,
+) -> Result<Option<Shortfall>> {
+    let probe = destination.to_path_buf();
+    let Some(available) = blocking(move || available_space(&probe)).await else {
+        warn!(dest = %destination.display(), "free space could not be read; not checking room");
+        return Ok(None);
+    };
+    decide_room(destination, files, parallel, available, token).await
 }
 
 /// Outcome of one file's trip through the copy loop, folded into
@@ -1352,9 +1721,9 @@ async fn execute_all<R: Runtime>(
 
     // Built once from the walk: what prune must leave alone is a property
     // of the source side, identical for every destination. The folder names
-    // go in too, because a destination path now leads with one and the
-    // user's exclude patterns do not.
-    let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+    // go in too, because with several sources a destination path leads with
+    // one and the user's exclude patterns do not.
+    let folders = destination_folders(&sources);
     let protected = ProtectedSet::new(&walked, &patterns, &folders);
 
     // Folded once for the run, for the same reason as the ProtectedSet above
@@ -1449,6 +1818,36 @@ async fn execute_one<R: Runtime>(
     };
     let mut stats = PhaseStats::default();
 
+    // Before the copy compares anything: a single source whose backup 1.7.6
+    // wrote one level down gets it back where this layout keeps it, so the
+    // run finds its files in place instead of copying all of them again.
+    let sources = task.sources();
+    if let Some(nested) = find_nested_copy(destination, &sources, walked).await {
+        let moved = move_nested_copy_up(destination, &nested).await;
+        info!(
+            dest = %destination.display(),
+            "moved {} entries back up from the per-source folder {}", moved, nested.folder
+        );
+    }
+
+    // After the move, so a backup that is merely one level down is not
+    // counted as a full copy to make; before the copy, so a destination that
+    // cannot take it is refused with nothing written, instead of filling up
+    // hours in and failing with half a copy. Checked per destination, just
+    // before its turn: an earlier destination on the same volume has used
+    // its share by then.
+    if let Some(short) =
+        room_check(destination, &walked.files, settings.parallel_copies(), token).await?
+    {
+        warn!(
+            dest = %destination.display(),
+            "not enough space: {} needed, {} free — nothing copied",
+            gigabytes(short.needed),
+            gigabytes(short.available)
+        );
+        return Ok(DestinationOutcome::no_space(destination, short));
+    }
+
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
     #[cfg(any(windows, target_os = "macos"))]
     recase_dirs_phase(&ctx, &walked.dirs, &mut stats).await;
@@ -1497,6 +1896,8 @@ async fn execute_one<R: Runtime>(
         failed: Some(stats.failed),
         verified: Some(verified),
         unreadable: Some(walked.unreadable.len() as u64),
+        needed_bytes: None,
+        available_bytes: None,
     })
 }
 
@@ -1529,7 +1930,9 @@ fn fold_outcomes(
         .filter(|d| {
             matches!(
                 d.status,
-                DestinationStatus::Error | DestinationStatus::Unreachable
+                DestinationStatus::Error
+                    | DestinationStatus::Unreachable
+                    | DestinationStatus::NoSpace
             )
         })
         .map(|d| match &d.error {
@@ -2251,17 +2654,24 @@ pub(crate) async fn walk_all(
     };
     let mut last_error: Option<anyhow::Error> = None;
     let mut walked_any = false;
+    let nested = uses_subfolders(sources);
 
     for source in sources {
         if token.is_cancelled() {
             return Err(anyhow!(CANCELLED_MSG));
         }
         let root = PathBuf::from(&source.path);
-        let prefix = source.folder.as_str();
+        // Empty for a single source: its rels stay as the source spells
+        // them, and an unreadable root is recorded as "" — the one value
+        // that makes prune leave the whole destination alone.
+        let prefix = if nested { source.folder.as_str() } else { "" };
 
         // The folder itself, so a source with no files still materialises at
-        // the destination — `mirror_dir_attrs_phase` is what creates it.
-        merged.dirs.push((root.clone(), prefix.to_string()));
+        // the destination — `mirror_dir_attrs_phase` is what creates it. A
+        // single source's folder is the destination, which already exists.
+        if nested {
+            merged.dirs.push((root.clone(), prefix.to_string()));
+        }
 
         let walked = match walk(&root, patterns, token).await {
             Ok(w) => w,
@@ -2277,7 +2687,9 @@ pub(crate) async fn walk_all(
         walked_any = true;
 
         let join = |rel: &str| {
-            if rel.is_empty() {
+            if prefix.is_empty() {
+                rel.to_string()
+            } else if rel.is_empty() {
                 prefix.to_string()
             } else {
                 format!("{}/{}", prefix, rel)
@@ -2525,7 +2937,7 @@ mod tests {
     ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
         let sources = preflight_sources(task)?;
-        let folders: Vec<String> = sources.iter().map(|s| s.folder.clone()).collect();
+        let folders = destination_folders(&sources);
         let mut walked = walk_all(&sources, &patterns, token).await?;
         let protected = ProtectedSet::new(&walked, &patterns, &folders);
         let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
@@ -2948,6 +3360,8 @@ mod tests {
             failed: Some(0),
             verified: Some(true),
             unreadable: Some(5),
+            needed_bytes: None,
+            available_bytes: None,
         };
         let task = task_with("fold", Path::new("C:/src"), &[]);
 
@@ -3627,11 +4041,12 @@ mod tests {
         p
     }
 
-    /// Where a source's file actually lands now: every source writes into a
-    /// subfolder named after itself. Tests say this through the helper rather
-    /// than spelling the layout 50 times, so changing it again is one edit.
-    fn backed_up(dest: &Path, src: &Path) -> PathBuf {
-        dest.join(src.file_name().expect("a source has a name"))
+    /// Where a single-source task's files land: straight into the
+    /// destination, the source's own name nowhere in the path (see
+    /// `uses_subfolders`). Tests say this through the helper rather than
+    /// spelling the layout 50 times, so changing it again is one edit.
+    fn backed_up(dest: &Path, _src: &Path) -> PathBuf {
+        dest.to_path_buf()
     }
 
     /// The data-loss regression: a source subtree that `walk()` could not
@@ -3908,16 +4323,18 @@ mod tests {
     async fn walk_all_lists_every_source_folder_even_an_empty_one() {
         let root = scratch("walk-all-empty");
         std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("full")).unwrap();
+        std::fs::write(root.join("full/one.txt"), b"1").unwrap();
 
-        let sources = vec![Source {
-            path: root.join("empty").to_string_lossy().into(),
-            folder: "Empty".into(),
-        }];
+        let sources = vec![
+            Source { path: root.join("empty").to_string_lossy().into(), folder: "Empty".into() },
+            Source { path: root.join("full").to_string_lossy().into(), folder: "Full".into() },
+        ];
         let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
             .await
             .unwrap();
 
-        assert!(walked.files.is_empty());
+        assert_eq!(walked.files.len(), 1, "only the other source has files");
         assert!(
             walked.dirs.iter().any(|(_, rel)| rel == "Empty"),
             "the folder itself must be in dirs, got {:?}",
@@ -3987,11 +4404,12 @@ mod tests {
         std::fs::create_dir_all(root.join("a/skipme")).unwrap();
         std::fs::write(root.join("a/skipme/x.txt"), b"x").unwrap();
         std::fs::write(root.join("a/keep.txt"), b"k").unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
 
-        let sources = vec![Source {
-            path: root.join("a").to_string_lossy().into(),
-            folder: "Alpha".into(),
-        }];
+        let sources = vec![
+            Source { path: root.join("a").to_string_lossy().into(), folder: "Alpha".into() },
+            Source { path: root.join("b").to_string_lossy().into(), folder: "Beta".into() },
+        ];
         let patterns = glob::PatternSet::new(&["skipme".to_string()]);
         let walked = walk_all(&sources, &patterns, &CancellationToken::new())
             .await
@@ -4053,18 +4471,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A `desktop.ini` at a source root used to be the destination root's own
-    /// icon marker, protected from prune on the grounds that the root's
-    /// identity belongs to the user. After prefixing it is `Alpha/desktop.ini`
-    /// and becomes that subfolder's icon descriptor instead — which is more
-    /// correct, since the destination root now belongs to no single source,
-    /// but it is a change and this is what pins it.
+    /// With several sources, a `desktop.ini` at a source root is no longer
+    /// the destination root's own icon marker, protected from prune on the
+    /// grounds that the root's identity belongs to the user. After prefixing
+    /// it is `Alpha/desktop.ini` and becomes that subfolder's icon descriptor
+    /// instead — which is more correct, since the destination root belongs
+    /// to no single source, but it is a change and this is what pins it.
     #[tokio::test]
     async fn a_source_root_desktop_ini_becomes_the_subfolders_icon() {
         let root = scratch("source-icon");
         let a = root.join("Alpha");
+        let b = root.join("Beta");
         let dest = root.join("dest");
         std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(a.join("desktop.ini"), b"[.ShellClassInfo]").unwrap();
 
@@ -4072,10 +4492,10 @@ mod tests {
             id: "icon".into(),
             name: "icon".into(),
             source: None,
-            sources: Some(vec![Source {
-                path: a.to_string_lossy().into(),
-                folder: "Alpha".into(),
-            }]),
+            sources: Some(vec![
+                Source { path: a.to_string_lossy().into(), folder: "Alpha".into() },
+                Source { path: b.to_string_lossy().into(), folder: "Beta".into() },
+            ]),
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -4134,14 +4554,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The first run after sources got folders writes every file under its
-    /// source's folder, then prunes the old flat mirror. A file whose new
-    /// copy fails is in neither place prune checks — not at the new path,
-    /// and absent from a keep set that now spells it with the folder in
-    /// front — so prune deleted the only copy the backup had. The likely
-    /// failure is a full disk, the reshape needing room for both copies,
-    /// which made that every file that did not fit rather than one unlucky
-    /// one.
+    /// Adding a second source to a task moves the first one's backup into a
+    /// subfolder: the run writes every file under its source's folder, then
+    /// prunes the flat mirror the single source kept. A file whose new copy
+    /// fails is in neither place prune checks — not at the new path, and
+    /// absent from a keep set that now spells it with the folder in front —
+    /// so prune deleted the only copy the backup had. The likely failure is a
+    /// full disk, the reshape needing room for both copies, which made that
+    /// every file that did not fit rather than one unlucky one.
     ///
     /// Staged with a folder where the new copy has to land: the final rename
     /// cannot replace a folder on any platform, and what is under test is
@@ -4150,13 +4570,15 @@ mod tests {
     async fn a_file_whose_new_copy_fails_keeps_its_old_copy() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
+        let added = root.path().join("added");
         let dest = root.path().join("dest");
-        let mirror = backed_up(&dest, &source);
+        let mirror = dest.join("source");
         std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&added).unwrap();
         std::fs::write(source.join("stuck.txt"), b"current").unwrap();
         std::fs::write(source.join("moved.txt"), b"current").unwrap();
 
-        // The layout every run before per-source folders wrote.
+        // What the task wrote while `source` was its only source.
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("stuck.txt"), b"previous").unwrap();
         std::fs::write(dest.join("moved.txt"), b"previous").unwrap();
@@ -4167,8 +4589,11 @@ mod tests {
         let task = Task {
             id: "reshape-fail".into(),
             name: "reshape-fail".into(),
-            source: Some(source.to_string_lossy().to_string()),
-            sources: None,
+            source: None,
+            sources: Some(vec![
+                Source { path: source.to_string_lossy().into(), folder: "source".into() },
+                Source { path: added.to_string_lossy().into(), folder: "added".into() },
+            ]),
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -4232,8 +4657,10 @@ mod tests {
     async fn a_run_keeps_a_path_shaped_exclusion_inside_a_source_folder() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
+        let other = root.path().join("other");
         let dest = root.path().join("dest");
         std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
         std::fs::write(source.join("keep.txt"), b"kept").unwrap();
         // Copied by an earlier run, then excluded, then removed from the
         // source: the walk never meets it, so only the pattern protects it.
@@ -4244,10 +4671,10 @@ mod tests {
             id: "path-exclusion".into(),
             name: "path-exclusion".into(),
             source: None,
-            sources: Some(vec![Source {
-                path: source.to_string_lossy().into(),
-                folder: "Alpha".into(),
-            }]),
+            sources: Some(vec![
+                Source { path: source.to_string_lossy().into(), folder: "Alpha".into() },
+                Source { path: other.to_string_lossy().into(), folder: "Other".into() },
+            ]),
             destination: None,
             destinations: Some(vec![dest.to_string_lossy().to_string()]),
             schedule: None,
@@ -4387,5 +4814,320 @@ mod tests {
         );
         assert!(json.get("path").is_none());
         assert!(json.get("verified").is_none());
+    }
+
+    /// Copy `src` to `dst` the way an earlier run left it: the same bytes and
+    /// the same mtime, which is all the copy loop compares.
+    fn already_backed_up(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(src, dst).unwrap();
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(src).unwrap());
+        filetime::set_file_mtime(dst, mtime).unwrap();
+    }
+
+    /// The regression 1.7.6 shipped. A task with one source wrote into
+    /// `dest/<folder>/`, so the copy every earlier version kept at the
+    /// destination root matched nothing, and the run re-copied the whole
+    /// source beside it: twice the room, and a full disk on a destination
+    /// sized for one copy. One source is mirrored straight into the
+    /// destination again, and a destination that already holds it copies
+    /// nothing.
+    #[tokio::test]
+    async fn a_single_source_syncs_incrementally_over_the_copy_already_there() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Documents");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(source.join("sub/b.txt"), b"beta").unwrap();
+        already_backed_up(&source.join("a.txt"), &dest.join("a.txt"));
+        already_backed_up(&source.join("sub/b.txt"), &dest.join("sub/b.txt"));
+
+        let (src, dst) = (source.to_string_lossy().to_string(), dest.to_string_lossy().to_string());
+        let task = task_at("flat", &src, &[&dst]);
+        let app = tauri::test::mock_app();
+        let payload = execute_all(
+            app.handle(),
+            "backup-flat",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert_eq!(payload.unchanged, Some(2), "both files were already there");
+        assert_eq!(payload.cleaned, Some(0), "and nothing at the root is an orphan");
+        assert!(
+            !dest.join("Documents").exists(),
+            "a single source gets no subfolder of its own"
+        );
+    }
+
+    /// The same rule at the walk, where it is decided: one source keeps the
+    /// relative paths it has, and its root is not listed as a directory to
+    /// create — the destination itself is that directory.
+    #[tokio::test]
+    async fn walk_all_leaves_a_single_sources_paths_unprefixed() {
+        let root = scratch("walk-all-single");
+        std::fs::create_dir_all(root.join("a/sub")).unwrap();
+        std::fs::write(root.join("a/sub/one.txt"), b"1").unwrap();
+
+        let sources = vec![Source {
+            path: root.join("a").to_string_lossy().into(),
+            folder: "Alpha".into(),
+        }];
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rels: Vec<&str> = walked.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["sub/one.txt"]);
+        let dirs: Vec<&str> = walked.dirs.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(dirs, vec!["sub"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With one source the folder name is never used, so it is not asked
+    /// for: a drive root carried over from an old tasks.json has none, and
+    /// refusing it would stop a backup that worked before sources had names.
+    #[test]
+    fn a_single_source_needs_no_folder_name() {
+        let root = tempfile::tempdir().unwrap();
+        let only = root.path().join("only").to_string_lossy().to_string();
+        for folder in ["", "not/a/name"] {
+            let task: Task = serde_json::from_value(serde_json::json!({
+                "id": "1", "name": "t",
+                "sources": [{ "path": only, "folder": folder }]
+            }))
+            .unwrap();
+            assert_eq!(
+                preflight_sources(&task).expect("a single source's folder is unused").len(),
+                1
+            );
+        }
+    }
+
+    /// What 1.7.6 left on every destination it managed to reshape: the whole
+    /// backup one level down, in `dest/<folder>/`, and nothing at the root
+    /// but its icon marker. Moving it back up is one rename per top-level
+    /// entry, so no byte is copied and the run finds every file in place.
+    #[tokio::test]
+    async fn a_copy_left_one_level_down_is_moved_back_up_without_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Pictures");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("2024")).unwrap();
+        std::fs::write(source.join("cat.jpg"), b"meow").unwrap();
+        std::fs::write(source.join("2024/dog.jpg"), b"woof").unwrap();
+        let nested = dest.join("Pictures");
+        already_backed_up(&source.join("cat.jpg"), &nested.join("cat.jpg"));
+        already_backed_up(&source.join("2024/dog.jpg"), &nested.join("2024/dog.jpg"));
+
+        let (src, dst) = (source.to_string_lossy().to_string(), dest.to_string_lossy().to_string());
+        let task = task_at("moved-up", &src, &[&dst]);
+        let app = tauri::test::mock_app();
+        let payload = execute_all(
+            app.handle(),
+            "backup-moved-up",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert_eq!(payload.unchanged, Some(2), "moved, not copied");
+        assert_eq!(payload.cleaned, Some(0));
+        assert_eq!(std::fs::read(dest.join("cat.jpg")).unwrap(), b"meow");
+        assert_eq!(std::fs::read(dest.join("2024/dog.jpg")).unwrap(), b"woof");
+        assert!(!nested.exists(), "the emptied subfolder goes");
+    }
+
+    /// An entry at both levels — a reshape that stopped part-way — keeps the
+    /// one at the root, which is what the run then syncs against. The nested
+    /// one is not moved over it: that would be the first delete in a step
+    /// that must only ever rename. Prune removes it later as an orphan.
+    #[tokio::test]
+    async fn an_entry_already_at_the_root_is_not_replaced_by_the_nested_one() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Pictures");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("cat.jpg"), b"meow").unwrap();
+        std::fs::write(source.join("dog.jpg"), b"woof").unwrap();
+        std::fs::create_dir_all(dest.join("Pictures")).unwrap();
+        std::fs::write(dest.join("cat.jpg"), b"root copy").unwrap();
+        std::fs::write(dest.join("Pictures/cat.jpg"), b"nested copy").unwrap();
+        std::fs::write(dest.join("Pictures/dog.jpg"), b"nested dog").unwrap();
+
+        let (src, dst) = (source.to_string_lossy().to_string(), dest.to_string_lossy().to_string());
+        let sources = task_at("both", &src, &[&dst]).sources();
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        let nested = find_nested_copy(&dest, &sources, &walked)
+            .await
+            .expect("dog.jpg can still move up");
+        assert_eq!(move_nested_copy_up(&dest, &nested).await, 1);
+
+        assert_eq!(std::fs::read(dest.join("dog.jpg")).unwrap(), b"nested dog");
+        assert_eq!(std::fs::read(dest.join("cat.jpg")).unwrap(), b"root copy");
+        assert_eq!(std::fs::read(dest.join("Pictures/cat.jpg")).unwrap(), b"nested copy");
+    }
+
+    /// `C:\Pictures\Pictures\` — a source holding a folder named like its
+    /// own. Its flat copy lives at `dest/Pictures/` as well, so a 1.7.6
+    /// leftover cannot be told from the real thing, and nothing is moved.
+    #[tokio::test]
+    async fn a_source_with_a_folder_named_like_itself_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Pictures");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(source.join("Pictures")).unwrap();
+        std::fs::write(source.join("Pictures/inner.jpg"), b"in").unwrap();
+        std::fs::create_dir_all(dest.join("Pictures")).unwrap();
+        std::fs::write(dest.join("Pictures/inner.jpg"), b"in").unwrap();
+
+        let (src, dst) = (source.to_string_lossy().to_string(), dest.to_string_lossy().to_string());
+        let sources = task_at("namesake", &src, &[&dst]).sources();
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(find_nested_copy(&dest, &sources, &walked).await.is_none());
+    }
+
+    /// What the copy phase would write, and the room it needs for it. Sizes
+    /// are rounded up to the 4 KiB a file actually takes on disk. A modified
+    /// file needs only what it grows by once committed, but while it is being
+    /// written the old copy is still there, so the largest ones in flight are
+    /// counted in full on top. An unchanged file needs nothing.
+    #[tokio::test]
+    async fn plan_writes_counts_the_work_and_the_room_it_needs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("new.bin"), vec![0u8; 5000]).unwrap();
+        std::fs::write(source.join("grown.bin"), vec![1u8; 9000]).unwrap();
+        std::fs::write(dest.join("grown.bin"), vec![1u8; 100]).unwrap();
+        std::fs::write(source.join("same.txt"), b"same").unwrap();
+        already_backed_up(&source.join("same.txt"), &dest.join("same.txt"));
+
+        let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        let plan = plan_writes(&dest, &walked.files, None, 4, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!((plan.new_files, plan.new_bytes), (1, 5000));
+        assert_eq!((plan.modified_files, plan.modified_bytes), (1, 9000));
+        assert_eq!(plan.unchanged_files, 1);
+        // new: 8 KiB. grown: 12 KiB over its old 4 KiB, so 8 KiB once
+        // committed, plus its full 12 KiB while the old copy is still there.
+        assert_eq!(plan.required_bytes, 8192 + 8192 + 12288);
+    }
+
+    /// Too little room is refused with both figures, so the message can say
+    /// how much is missing — and before anything is written.
+    #[tokio::test]
+    async fn a_destination_without_room_is_refused_with_both_figures() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("new.bin"), vec![0u8; 5000]).unwrap();
+
+        let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        assert_eq!(
+            decide_room(&dest, &walked.files, 4, 100, &token).await.unwrap(),
+            Some(Shortfall { needed: 8192, available: 100 })
+        );
+        assert_eq!(
+            decide_room(&dest, &walked.files, 4, 1 << 40, &token).await.unwrap(),
+            None,
+            "plenty of room is not a shortfall"
+        );
+        assert!(!dest.join("new.bin").exists(), "deciding writes nothing");
+    }
+
+    /// A destination that already holds everything needs no room at all,
+    /// however full its volume is. This is the incremental run, and refusing
+    /// it on a full disk would be refusing the one run that fits.
+    #[tokio::test]
+    async fn a_destination_already_up_to_date_needs_no_room() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("same.bin"), vec![0u8; 5000]).unwrap();
+        already_backed_up(&source.join("same.bin"), &dest.join("same.bin"));
+
+        let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            decide_room(&dest, &walked.files, 4, 0, &CancellationToken::new())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A destination refused for room is a failure the run reports, with the
+    /// figures, and not a success — even though nothing was written to it.
+    #[test]
+    fn a_destination_without_room_fails_the_run_and_says_why() {
+        let short = DestinationOutcome::no_space(
+            Path::new("D:/Backup"),
+            Shortfall { needed: 300_000_000_000, available: 65_000_000_000 },
+        );
+        assert_eq!(short.status, DestinationStatus::NoSpace);
+        assert_eq!(short.needed_bytes, Some(300_000_000_000));
+        assert_eq!(short.available_bytes, Some(65_000_000_000));
+
+        let json = serde_json::to_value(&short).unwrap();
+        assert_eq!(json["status"], "nospace");
+        assert_eq!(json["neededBytes"], 300_000_000_000u64);
+        assert_eq!(json["availableBytes"], 65_000_000_000u64);
+
+        let task = task_at("t", "C:/src", &["D:/Backup"]);
+        let payload = fold_outcomes("b", &task, Instant::now(), vec![short]);
+        assert!(!payload.success && !payload.partial);
+        let error = payload.error.expect("a refused destination is reported");
+        assert!(error.contains("D:/Backup") && error.contains("space"), "{}", error);
+    }
+
+    /// Several sources do write into subfolders, so a subfolder named like
+    /// one of them is where it belongs and must stay there.
+    #[tokio::test]
+    async fn a_nested_copy_is_only_looked_for_with_a_single_source() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("Alpha");
+        let b = root.path().join("Beta");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("one.txt"), b"1").unwrap();
+        std::fs::create_dir_all(dest.join("Alpha")).unwrap();
+        std::fs::write(dest.join("Alpha/one.txt"), b"1").unwrap();
+
+        let sources = vec![
+            Source { path: a.to_string_lossy().into(), folder: "Alpha".into() },
+            Source { path: b.to_string_lossy().into(), folder: "Beta".into() },
+        ];
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(find_nested_copy(&dest, &sources, &walked).await.is_none());
     }
 }

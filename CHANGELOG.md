@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.7.7
+
+**Backups are incremental again.** 1.7.6 gave a task with a single source a
+folder of its own at the destination, so its first run copied every backup in
+full beside the one already there. That needed room for both copies, and on a
+drive sized for one it filled the drive and failed. A single source is
+mirrored straight into the destination again, exactly as it was up to 1.7.4,
+and a run copies only what changed. Folders per source are kept for tasks with
+several sources, which is what they were for.
+
+**A backup that 1.7.6 already moved down is moved back up.** Where 1.7.6
+finished moving a backup into a folder named after its source, the next run
+moves it back to the destination root by renaming it. That is instant, needs
+no copying and no extra room, and the run then syncs only what changed. The
+preview shows the result ahead of time: files already backed up, and nothing
+deleted.
+
+This withdraws two things 1.7.6 said. A task with a single source no longer
+moves its backup one level down, and a task that backs up a whole drive no
+longer asks for a folder name. Adding a second source to a task still moves
+the first source's backup into a folder of its own, and that run copies it
+again.
+
+**A backup that does not fit is refused before it starts.** Before writing to
+a destination, Driveby works out how much room the run needs and compares it
+with what the drive has free. When it does not fit, nothing is copied, and the
+message gives both figures: in the preview before you confirm, in a
+notification for a scheduled run, and in the history. Until now the run filled
+the drive hours in and failed with half a copy.
+
+**Three looks.** Settings › Appearance has a new Style choice: iOS (the look so
+far), Windows 11 and GNOME, each in light and dark. System, the default,
+matches your operating system, so on Windows Driveby now looks like Windows 11
+unless you choose otherwise.
+
+The info bubbles in Settings are translucent everywhere; before, only some of
+them were. In History, a destination's error now sits under its path instead
+of on top of it.
+
 ## 1.7.6
 
 **A task can back up several folders.** Add as many sources as you like. Each

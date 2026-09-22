@@ -1,0 +1,431 @@
+/* ─────────────────────────────────────────────────────────────
+   GNOME style — Adwaita, after the libadwaita widgets
+   Every rule is scoped to :root[data-style='gnome'], so styles.css stays the
+   base and this file only takes over when the style is chosen. The dark
+   block carries [data-theme='dark'] as well: one attribute more than the
+   light block, so it wins in dark mode whatever the source order.
+   ───────────────────────────────────────────────────────────── */
+
+:root[data-style='gnome'] {
+  --system-blue: #3584e4;
+  --system-green: #1b8553;
+  --system-red: #c01c28;
+  --system-orange: #9c6e03;
+  --system-gray: #77767b;
+
+  --bg-window: #fafafb;
+  --bg-window-solid: #fafafb;
+  --bg-content: #ffffff;
+  --bg-sidebar: #ebebed;
+  --bg-toolbar: #fafafb;
+  --bg-control: rgba(0, 0, 6, 0.08);
+  --bg-control-hover: rgba(0, 0, 6, 0.04);
+  --bg-control-pressed: rgba(0, 0, 6, 0.08);
+  --bg-selected: rgba(0, 0, 6, 0.1);
+
+  --label-primary: rgba(0, 0, 6, 0.8);
+  --label-secondary: rgba(0, 0, 6, 0.5);
+  --label-tertiary: rgba(0, 0, 6, 0.35);
+  --label-quaternary: rgba(0, 0, 6, 0.1);
+
+  --separator: rgba(0, 0, 6, 0.08);
+  --separator-opaque: #dedee1;
+
+  --accent: #3584e4;
+  --accent-hover: #4990e6;
+  --accent-label: #ffffff;
+
+  --shadow-sm: 0 0 transparent;
+  --shadow-md: 0 1px 5px 1px rgba(0, 0, 6, 0.09), 0 2px 14px 3px rgba(0, 0, 6, 0.05);
+  --shadow-lg: 0 4px 24px rgba(0, 0, 6, 0.18), 0 0 0 1px rgba(0, 0, 6, 0.05);
+  --shadow-focus: 0 0 0 2px color-mix(in srgb, var(--gnome-accent-text) 50%, transparent);
+
+  /* Buttons and entries at 6px, boxed lists and cards at 12px, dialogs
+     rounder still. */
+  --radius-sm: 6px;
+  --radius-md: 6px;
+  --radius-lg: 9px;
+  --radius-xl: 12px;
+  --radius-2xl: 18px;
+
+  /* Adwaita Sans since GNOME 48, Cantarell before it. Neither ships with
+     Windows or macOS, where this falls back to the system face. */
+  --gnome-font: 'Adwaita Sans', 'Cantarell', 'Inter', system-ui, sans-serif;
+  --gnome-mono: 'Adwaita Mono', 'Source Code Pro', 'DejaVu Sans Mono', ui-monospace, monospace;
+  --gnome-accent-text: #1c71d8;
+  --gnome-button: rgba(0, 0, 6, 0.08);
+  --gnome-button-hover: rgba(0, 0, 6, 0.12);
+  --gnome-button-active: rgba(0, 0, 6, 0.24);
+  --gnome-flat-hover: rgba(0, 0, 6, 0.07);
+  --gnome-destructive: #e01b24;
+  --gnome-sidebar-border: rgba(0, 0, 6, 0.07);
+  --gnome-card-shadow: 0 0 0 1px rgba(0, 0, 6, 0.03), 0 1px 3px 1px rgba(0, 0, 6, 0.07), 0 2px 6px 2px rgba(0, 0, 6, 0.03);
+  --gnome-toggle-checked: #ffffff;
+  --gnome-switch-off: rgba(0, 0, 6, 0.15);
+  --gnome-osd: rgba(0, 0, 6, 0.8);
+}
+
+:root[data-style='gnome'][data-theme='dark'] {
+  --system-blue: #3584e4;
+  --system-green: #8ff0a4;
+  --system-red: #ff938c;
+  --system-orange: #f8e45c;
+  --system-gray: #9a9996;
+
+  --bg-window: #222226;
+  --bg-window-solid: #36363a;
+  --bg-content: #343438;
+  --bg-sidebar: #2e2e32;
+  --bg-toolbar: #222226;
+  --bg-control: rgba(255, 255, 255, 0.1);
+  --bg-control-hover: rgba(255, 255, 255, 0.04);
+  --bg-control-pressed: rgba(255, 255, 255, 0.08);
+  --bg-selected: rgba(255, 255, 255, 0.1);
+
+  --label-primary: #ffffff;
+  --label-secondary: rgba(255, 255, 255, 0.55);
+  --label-tertiary: rgba(255, 255, 255, 0.35);
+  --label-quaternary: rgba(255, 255, 255, 0.1);
+
+  /* Rules inside a dark boxed list are darker than the rows, not lighter. */
+  --separator: rgba(0, 0, 6, 0.36);
+  --separator-opaque: #1f1f23;
+
+  --accent: #3584e4;
+  --accent-hover: #4990e6;
+  --accent-label: #ffffff;
+
+  --shadow-sm: 0 0 transparent;
+  --shadow-md: 0 1px 5px 1px rgba(0, 0, 6, 0.36), 0 2px 14px 3px rgba(0, 0, 6, 0.2);
+  --shadow-lg: 0 4px 24px rgba(0, 0, 6, 0.5), 0 0 0 1px rgba(0, 0, 6, 0.36);
+
+  --gnome-accent-text: #78aeed;
+  --gnome-button: rgba(255, 255, 255, 0.1);
+  --gnome-button-hover: rgba(255, 255, 255, 0.15);
+  --gnome-button-active: rgba(255, 255, 255, 0.3);
+  --gnome-flat-hover: rgba(255, 255, 255, 0.07);
+  --gnome-destructive: #c01c28;
+  --gnome-sidebar-border: rgba(0, 0, 6, 0.36);
+  --gnome-card-shadow: 0 0 0 1px rgba(0, 0, 6, 0.09), 0 1px 3px 1px rgba(0, 0, 6, 0.09), 0 2px 6px 2px rgba(0, 0, 6, 0.03);
+  --gnome-toggle-checked: rgba(255, 255, 255, 0.2);
+  --gnome-switch-off: rgba(255, 255, 255, 0.15);
+  --gnome-osd: rgba(0, 0, 6, 0.8);
+}
+
+/* ─── Type ─── */
+:root[data-style='gnome'] body {
+  font-family: var(--gnome-font);
+  font-size: 13px;
+  line-height: 1.4;
+}
+:root[data-style='gnome'] .mono,
+:root[data-style='gnome'] .task__paths,
+:root[data-style='gnome'] .history-path,
+:root[data-style='gnome'] .preview-dest__path,
+:root[data-style='gnome'] .field--textarea {
+  font-family: var(--gnome-mono);
+}
+:root[data-style='gnome'] .title-1 { font-size: 22px; font-weight: 800; letter-spacing: 0; }
+:root[data-style='gnome'] .title-2 { font-size: 17px; font-weight: 800; letter-spacing: 0; }
+
+/* A preferences group is headed by a bold line of body text, never caps. */
+:root[data-style='gnome'] .group-title {
+  font-size: 13px; font-weight: 700;
+  color: var(--label-primary);
+  text-transform: none; letter-spacing: 0;
+  padding: 18px 2px 10px;
+}
+:root[data-style='gnome'] .stat__head,
+:root[data-style='gnome'] .stat-block__head,
+:root[data-style='gnome'] .card__head {
+  font-size: 13px; font-weight: 700;
+  color: var(--label-primary);
+  text-transform: none; letter-spacing: 0;
+}
+:root[data-style='gnome'] .chart__label { text-transform: none; letter-spacing: 0; font-size: 11px; }
+
+/* ─── Sidebar (navigation sidebar) ─── */
+:root[data-style='gnome'] .sidebar { border-right: 1px solid var(--gnome-sidebar-border); }
+:root[data-style='gnome'] .sidebar__search { margin: 4px 10px 10px; }
+:root[data-style='gnome'] .sidebar__search-input {
+  height: 34px;
+  padding: 0 9px 0 30px;
+  font-size: 13px;
+  background: var(--gnome-button);
+  box-shadow: none;
+}
+:root[data-style='gnome'] .sidebar__search-input:focus { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--gnome-accent-text) 50%, transparent); }
+:root[data-style='gnome'] .sidebar__search-icon { left: 10px; width: 14px; height: 14px; }
+:root[data-style='gnome'] .sidebar__nav { padding: 0 6px; }
+:root[data-style='gnome'] .sidebar__group-title {
+  font-size: 12px; font-weight: 700;
+  color: var(--label-secondary);
+  text-transform: none; letter-spacing: 0;
+  padding: 8px 10px 4px;
+}
+:root[data-style='gnome'] .sidebar__item {
+  min-height: 38px;
+  padding: 0 10px;
+  gap: 12px;
+  font-size: 13px;
+  margin-bottom: 2px;
+}
+:root[data-style='gnome'] .sidebar__item:active { transform: none; }
+/* The selected row is a grey backplate; the label keeps its own colour. */
+:root[data-style='gnome'] .sidebar__item--active,
+:root[data-style='gnome'] .sidebar__item--active:hover {
+  background: var(--bg-selected);
+  color: var(--label-primary);
+  animation: none;
+}
+:root[data-style='gnome'] .sidebar__item-icon { width: 16px; height: 16px; opacity: 1; }
+:root[data-style='gnome'] .sidebar__item--active .sidebar__item-icon { transform: none; }
+:root[data-style='gnome'] .sidebar__footer { border-top-color: transparent; }
+
+/* ─── Toolbar (header bar) ─── */
+/* A flat header bar with its title centred and bold. */
+:root[data-style='gnome'] .toolbar {
+  height: 47px;
+  border-bottom-color: transparent;
+}
+:root[data-style='gnome'] .toolbar__title {
+  text-align: center;
+  font-size: 13px; font-weight: 700; letter-spacing: 0;
+}
+:root[data-style='gnome'] .toolbar__toggle { width: 34px; height: 34px; border-radius: var(--radius-md); }
+:root[data-style='gnome'] .toolbar__toggle:hover { background: var(--gnome-flat-hover); }
+
+/* ─── Boxed lists and cards ─── */
+:root[data-style='gnome'] .group,
+:root[data-style='gnome'] .stat,
+:root[data-style='gnome'] .stat-block,
+:root[data-style='gnome'] .card,
+:root[data-style='gnome'] .history-table {
+  background: var(--bg-content);
+  box-shadow: var(--gnome-card-shadow);
+}
+:root[data-style='gnome'] .setting-row {
+  min-height: 50px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--separator);
+}
+:root[data-style='gnome'] .setting-row:first-child { border-top: none; }
+:root[data-style='gnome'] .setting-row__label { font-size: 13px; font-weight: 400; }
+:root[data-style='gnome'] .setting-row__hint,
+:root[data-style='gnome'] .setting-row__sub { font-size: 11px; }
+:root[data-style='gnome'] .task { padding: 12px; border-top: 1px solid var(--separator); }
+:root[data-style='gnome'] .task:first-child { border-top: none; }
+:root[data-style='gnome'] .task:hover { background: var(--bg-control-hover); }
+:root[data-style='gnome'] .restore-overlay,
+:root[data-style='gnome'] .app-crash__detail {
+  border-color: transparent;
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-md);
+}
+
+/* ─── Buttons ─── */
+/* Borderless tinted buttons with bold labels. */
+:root[data-style='gnome'] .btn {
+  height: 34px;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--gnome-button);
+  box-shadow: none;
+}
+:root[data-style='gnome'] .btn:hover { background: var(--gnome-button-hover); transform: none; }
+:root[data-style='gnome'] .btn:active { background: var(--gnome-button-active); transform: none; }
+:root[data-style='gnome'] .btn:focus-visible { box-shadow: var(--shadow-focus); }
+
+/* suggested-action */
+:root[data-style='gnome'] .btn--primary {
+  background: var(--accent);
+  color: var(--accent-label);
+}
+:root[data-style='gnome'] .btn--primary:hover { background: var(--accent-hover); }
+:root[data-style='gnome'] .btn--primary:active { background: color-mix(in srgb, var(--accent) 80%, #000000); }
+
+:root[data-style='gnome'] .btn--destructive { color: var(--system-red); }
+/* destructive-action */
+:root[data-style='gnome'] .btn--destructive.btn--primary,
+:root[data-style='gnome'] .btn--destructive.btn--primary:hover {
+  background: var(--gnome-destructive);
+  color: #ffffff;
+}
+:root[data-style='gnome'] .btn--destructive.btn--primary:hover { background: color-mix(in srgb, var(--gnome-destructive) 90%, #ffffff); }
+
+/* flat: no backplate until hovered, and the ordinary text colour rather
+   than the accent — GNOME keeps the accent for the one suggested action. */
+:root[data-style='gnome'] .btn--borderless {
+  background: transparent;
+  color: var(--label-primary);
+  padding: 0 10px;
+}
+:root[data-style='gnome'] .btn--borderless:hover { background: var(--gnome-flat-hover); }
+:root[data-style='gnome'] .btn--borderless:active { background: var(--gnome-button-hover); }
+:root[data-style='gnome'] .btn--borderless.btn--destructive { color: var(--system-red); }
+
+:root[data-style='gnome'] .btn--large { height: 40px; padding: 0 18px; }
+:root[data-style='gnome'] .btn--small { height: 28px; padding: 0 8px; font-size: 12px; }
+/* The flat links that sit in rows — Restore, Reveal, Delete — as tight as
+   Adwaita keeps buttons inside a list. At 10px each, three of them made the
+   history's Actions column wider than the window has room for. */
+:root[data-style='gnome'] .btn--borderless.btn--small { padding: 0 6px; }
+:root[data-style='gnome'] .btn:disabled { opacity: 0.5; }
+
+/* ─── Toggle (switch) ─── */
+:root[data-style='gnome'] .toggle {
+  width: 48px; height: 26px;
+  border-radius: 13px;
+  background: var(--gnome-switch-off);
+  transition: background 0.2s;
+}
+:root[data-style='gnome'] .toggle__knob {
+  top: 3px; left: 3px;
+  width: 20px; height: 20px;
+  background: #ffffff;
+  box-shadow: 0 2px 4px rgba(0, 0, 6, 0.2);
+  transition: left 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+:root[data-style='gnome'] .toggle--on { background: var(--accent); }
+:root[data-style='gnome'] .toggle--on .toggle__knob { left: 25px; }
+:root[data-style='gnome'] .toggle--disabled { opacity: 0.5; }
+:root[data-style='gnome'] .toggle:focus-visible { box-shadow: var(--shadow-focus); }
+
+/* ─── Fields (entry) ─── */
+/* Filled rather than outlined; focus draws a ring inside the edge. */
+:root[data-style='gnome'] .field {
+  height: 34px;
+  padding: 0 9px;
+  font-size: 13px;
+  background: var(--gnome-button);
+  box-shadow: none;
+}
+:root[data-style='gnome'] .field:focus { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--gnome-accent-text) 50%, transparent); }
+:root[data-style='gnome'] .field[aria-invalid='true'],
+:root[data-style='gnome'] .field[aria-invalid='true']:focus {
+  color: var(--system-red);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--system-red) 50%, transparent);
+}
+:root[data-style='gnome'] .field--readonly { background: var(--bg-control-hover); }
+:root[data-style='gnome'] .field--textarea { height: auto; padding: 8px 9px; font-size: 12px; }
+:root[data-style='gnome'] .field--compact { height: 30px; font-size: 12px; }
+
+:root[data-style='gnome'] .form-field__label { font-size: 13px; font-weight: 700; color: var(--label-primary); }
+:root[data-style='gnome'] .form-field__hint { font-size: 11px; }
+
+:root[data-style='gnome'] .day-picker__day {
+  border: none;
+  background: var(--gnome-button);
+  font-size: 12px; font-weight: 700;
+  color: var(--label-primary);
+  cursor: default;
+}
+:root[data-style='gnome'] .day-picker__day:hover { background: var(--gnome-button-hover); }
+:root[data-style='gnome'] .day-picker__day--on,
+:root[data-style='gnome'] .day-picker__day--on:hover {
+  background: var(--accent);
+  color: var(--accent-label);
+}
+
+/* ─── Segmented (toggle group) ─── */
+:root[data-style='gnome'] .segmented {
+  gap: 3px;
+  padding: 3px;
+  border-radius: var(--radius-lg);
+  background: var(--gnome-button);
+  box-shadow: none;
+}
+:root[data-style='gnome'] .segmented__btn {
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  border-radius: var(--radius-md);
+}
+:root[data-style='gnome'] .segmented__btn:hover:not(.segmented__btn--active) { background: var(--gnome-flat-hover); }
+:root[data-style='gnome'] .segmented__btn--active {
+  background: var(--gnome-toggle-checked);
+  box-shadow: 0 1px 3px rgba(0, 0, 6, 0.12), 0 0 0 1px rgba(0, 0, 6, 0.03);
+}
+
+/* ─── Info tip (tooltip) ─── */
+:root[data-style='gnome'] .info-tip {
+  font-family: var(--gnome-font);
+  font-style: normal;
+  font-weight: 800;
+  font-size: 11px;
+  background: var(--gnome-button);
+  color: var(--label-primary);
+}
+:root[data-style='gnome'] .info-tip:hover,
+:root[data-style='gnome'] .info-tip:focus-visible {
+  background: var(--gnome-button-hover);
+  color: var(--label-primary);
+  transform: none;
+}
+/* Adwaita's tooltips are an on-screen-display: dark and see-through in both
+   modes, so the translucency every tip keeps comes for free here. */
+:root[data-style='gnome'] .info-tip::after {
+  font-family: var(--gnome-font);
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-lg);
+  background: var(--gnome-osd);
+  color: #ffffff;
+  border: none;
+  box-shadow: none;
+}
+
+/* ─── Modal (alert dialog) ─── */
+:root[data-style='gnome'] .modal__backdrop {
+  background: rgba(0, 0, 6, 0.25);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-style='gnome'] .modal__content {
+  background: var(--bg-window-solid);
+  padding: 32px 24px 24px;
+  box-shadow: var(--shadow-lg);
+}
+:root[data-style='gnome'] .modal__title { font-size: 16px; font-weight: 700; margin-bottom: 10px; }
+:root[data-style='gnome'] .modal__body { font-size: 13px; color: var(--label-primary); margin-bottom: 24px; }
+:root[data-style='gnome'] .modal__actions { gap: 12px; }
+:root[data-style='gnome'] .modal__actions .btn { height: 40px; border-radius: var(--radius-xl); }
+
+/* ─── Toast ─── */
+/* An on-screen-display pill, dark in both modes. */
+:root[data-style='gnome'] .toast {
+  background: var(--gnome-osd);
+  color: #ffffff;
+  font-size: 13px; font-weight: 400;
+  padding: 9px 18px;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+:root[data-style='gnome'] .toast--error { color: #ff938c; }
+
+/* ─── Progress ─── */
+:root[data-style='gnome'] .progressbar { height: 6px; border-radius: 99px; background: var(--gnome-switch-off); }
+:root[data-style='gnome'] .progressbar__fill { border-radius: 99px; }
+:root[data-style='gnome'] .progressbar__fill::after { display: none; }
+
+/* ─── History ─── */
+:root[data-style='gnome'] .history-table th {
+  font-size: 12px; font-weight: 700;
+  text-transform: none; letter-spacing: 0;
+  background: transparent;
+  border-bottom: 1px solid var(--separator);
+}
+:root[data-style='gnome'] .history-table td { border-top: 1px solid var(--separator); }
+:root[data-style='gnome'] .history-task-name { font-size: 13px; font-weight: 700; }
+
+:root[data-style='gnome'] .badge { font-size: 11px; font-weight: 700; }
+:root[data-style='gnome'] .badge--success { background: color-mix(in srgb, var(--system-green) 16%, transparent); }
+:root[data-style='gnome'] .badge--partial { background: color-mix(in srgb, var(--system-orange) 18%, transparent); }
+:root[data-style='gnome'] .badge--error { background: color-mix(in srgb, var(--system-red) 16%, transparent); }
+:root[data-style='gnome'] .badge--cancelled { background: color-mix(in srgb, var(--system-gray) 18%, transparent); }
+
+/* ─── Scrollbars ─── */
+:root[data-style='gnome'] ::-webkit-scrollbar-thumb { border-width: 4px; border-radius: 99px; background-color: rgba(0, 0, 6, 0.3); }
+:root[data-style='gnome'][data-theme='dark'] ::-webkit-scrollbar-thumb { background-color: rgba(255, 255, 255, 0.3); }

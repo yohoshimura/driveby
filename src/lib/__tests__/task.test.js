@@ -9,6 +9,7 @@ import {
   sourceFolderName,
   taskDestinations,
   taskSources,
+  usesSubfolders,
 } from '../task';
 
 describe('taskDestinations', () => {
@@ -111,6 +112,23 @@ describe('folderNameError', () => {
     for (const good of ['Photos', 'Photos-Work', 'Mes documents', '2024.backup']) {
       expect(folderNameError(good)).toBeNull();
     }
+  });
+});
+
+describe('usesSubfolders', () => {
+  // The rule of `uses_subfolders` in src-tauri/src/backup.rs. The form hides
+  // the folder name when it is not used, so the two sides must agree on when
+  // that is.
+  test('a single source is mirrored straight into the destination', () => {
+    expect(usesSubfolders([{ path: 'C:/Photos', folder: 'Photos' }])).toBe(false);
+    expect(usesSubfolders([])).toBe(false);
+  });
+
+  test('several sources each get a folder of their own', () => {
+    expect(usesSubfolders([
+      { path: 'C:/Photos', folder: 'Photos' },
+      { path: 'C:/Docs', folder: 'Docs' },
+    ])).toBe(true);
   });
 });
 

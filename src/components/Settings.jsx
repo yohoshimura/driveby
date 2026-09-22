@@ -8,6 +8,7 @@ import { checkForUpdate, installUpdate } from '../lib/updater';
 import { useT } from '../hooks/useT';
 import { HISTORY_RETENTIONS, DEFAULT_HISTORY_RETENTION } from '../lib/history';
 import { SUPPORTED_LANGUAGES, LANGUAGE_LABELS, DEFAULT_LANGUAGE } from '../lib/i18n';
+import { UI_STYLES } from '../lib/uiStyle';
 
 const THEME_KEYS = {
   light: 'settings.theme.light',
@@ -330,7 +331,27 @@ export default function Settings() {
             ))}
           </div>
         </div>
-
+        <div className="setting-row">
+          <div>
+            <div className="setting-row__label">{t('settings.label.ui_style')}</div>
+          </div>
+          <div className="setting-row__control">
+            <InfoTip text={t('settings.tip.ui_style')} />
+            <div className="segmented" role="radiogroup" aria-label={t('settings.label.ui_style')}>
+              {UI_STYLES.map((opt) => (
+                <button
+                  key={opt}
+                  role="radio"
+                  aria-checked={settings.uiStyle === opt}
+                  className={`segmented__btn ${settings.uiStyle === opt ? 'segmented__btn--active' : ''}`}
+                  onClick={() => updateSetting('uiStyle', opt)}
+                >
+                  {t(`settings.ui_style.${opt}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="group-title">{t('settings.section.language')}</div>
