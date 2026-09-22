@@ -311,49 +311,6 @@ export default function Settings() {
         </div>
       </div>
 
-      <div className="group-title">{t('settings.section.appearance')}</div>
-      <div className="group">
-        <div className="setting-row">
-          <div>
-            <div className="setting-row__label">{t('settings.label.appearance')}</div>
-          </div>
-          <div className="segmented" role="radiogroup" aria-label={t('settings.label.appearance')}>
-            {['light', 'dark', 'system'].map((opt) => (
-              <button
-                key={opt}
-                role="radio"
-                aria-checked={settings.theme === opt}
-                className={`segmented__btn ${settings.theme === opt ? 'segmented__btn--active' : ''}`}
-                onClick={() => updateSetting('theme', opt)}
-              >
-                {t(THEME_KEYS[opt])}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="setting-row">
-          <div>
-            <div className="setting-row__label">{t('settings.label.ui_style')}</div>
-          </div>
-          <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.ui_style')} />
-            <div className="segmented" role="radiogroup" aria-label={t('settings.label.ui_style')}>
-              {UI_STYLES.map((opt) => (
-                <button
-                  key={opt}
-                  role="radio"
-                  aria-checked={settings.uiStyle === opt}
-                  className={`segmented__btn ${settings.uiStyle === opt ? 'segmented__btn--active' : ''}`}
-                  onClick={() => updateSetting('uiStyle', opt)}
-                >
-                  {t(`settings.ui_style.${opt}`)}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-
       <div className="group-title">{t('settings.section.language')}</div>
       <div className="group">
         <div className="setting-row">
@@ -470,6 +427,49 @@ export default function Settings() {
             <div className="setting-row__label">{t('settings.label.logs')}</div>
           </div>
           <Button size="small" onClick={revealLogs}>{t('common.open')}</Button>
+        </div>
+      </div>
+
+      <div className="group-title">{t('settings.section.appearance')}</div>
+      <div className="group">
+        <div className="setting-row">
+          <div>
+            <div className="setting-row__label">{t('settings.label.appearance')}</div>
+          </div>
+          <div className="segmented" role="radiogroup" aria-label={t('settings.label.appearance')}>
+            {['light', 'dark', 'system'].map((opt) => (
+              <button
+                key={opt}
+                role="radio"
+                aria-checked={settings.theme === opt}
+                className={`segmented__btn ${settings.theme === opt ? 'segmented__btn--active' : ''}`}
+                onClick={() => updateSetting('theme', opt)}
+              >
+                {t(THEME_KEYS[opt])}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="setting-row">
+          <div>
+            <div className="setting-row__label">{t('settings.label.ui_style')}</div>
+          </div>
+          <div className="setting-row__control">
+            <InfoTip text={t('settings.tip.ui_style')} />
+            <div className="segmented" role="radiogroup" aria-label={t('settings.label.ui_style')}>
+              {UI_STYLES.map((opt) => (
+                <button
+                  key={opt}
+                  role="radio"
+                  aria-checked={settings.uiStyle === opt}
+                  className={`segmented__btn ${settings.uiStyle === opt ? 'segmented__btn--active' : ''}`}
+                  onClick={() => updateSetting('uiStyle', opt)}
+                >
+                  {t(`settings.ui_style.${opt}`)}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </>
