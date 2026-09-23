@@ -1,11 +1,25 @@
 import { describe, expect, test } from 'vitest';
-import { resolveUiStyle, UI_STYLES, DEFAULT_UI_STYLE } from '../uiStyle';
+import { platformOf, resolveUiStyle, UI_STYLES, DEFAULT_UI_STYLE } from '../uiStyle';
 
 // What each webview actually reports: WebView2 on Windows, WebKitGTK on
 // Linux, WKWebView on macOS.
 const WEBVIEW2 = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0';
 const WEBKITGTK = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
 const WKWEBVIEW = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)';
+
+describe('platformOf', () => {
+  test('names the OS each webview reports', () => {
+    expect(platformOf(WEBVIEW2)).toBe('windows');
+    expect(platformOf(WEBKITGTK)).toBe('linux');
+    expect(platformOf(WKWEBVIEW)).toBe('macos');
+  });
+
+  // No Linux-only rule may reach a platform we cannot name.
+  test('anything it does not recognise is not Linux', () => {
+    expect(platformOf('')).toBe('macos');
+    expect(platformOf(undefined)).toBe('macos');
+  });
+});
 
 describe('resolveUiStyle', () => {
   test('auto follows the platform the webview reports', () => {

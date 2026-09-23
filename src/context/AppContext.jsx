@@ -12,7 +12,7 @@ import { bridge } from '../lib/tauri';
 import { useSystemTheme } from '../hooks/useSystemTheme';
 import { useProgress } from './ProgressContext';
 import { DEFAULT_ACCENT } from '../lib/accent';
-import { DEFAULT_UI_STYLE, resolveUiStyle } from '../lib/uiStyle';
+import { DEFAULT_UI_STYLE, platformOf, resolveUiStyle } from '../lib/uiStyle';
 import { DEFAULT_HISTORY_RETENTION, trimHistory } from '../lib/history';
 import { migrateTasks, taskDestinations, taskSources } from '../lib/task';
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, translate } from '../lib/i18n';
@@ -151,6 +151,12 @@ export function AppProvider({ children }) {
   useEffect(() => {
     document.documentElement.setAttribute('data-style', resolvedStyle);
   }, [resolvedStyle]);
+
+  // The OS rather than the style, for the few rules that answer to what is
+  // installed there — the font a style falls back to when its own is absent.
+  useEffect(() => {
+    document.documentElement.setAttribute('data-platform', platformOf(navigator.userAgent));
+  }, []);
 
   useEffect(() => {
     const unlisten = [];
