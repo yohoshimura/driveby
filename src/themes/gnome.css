@@ -31,8 +31,12 @@
   --separator: rgba(0, 0, 6, 0.08);
   --separator-opaque: #dedee1;
 
-  --accent: #3584e4;
-  --accent-hover: #4990e6;
+  /* The desktop's accent when it has one — Rust reads it from the settings
+     portal on Linux, as libadwaita does, and sets --system-accent on the
+     root — and Adwaita's blue everywhere else. Hover is the accent under a
+     10% white wash, which is how libadwaita draws a suggested action. */
+  --accent: var(--system-accent, #3584e4);
+  --accent-hover: color-mix(in srgb, var(--accent) 90%, #ffffff);
   --accent-label: #ffffff;
 
   --shadow-sm: 0 0 transparent;
@@ -40,13 +44,14 @@
   --shadow-lg: 0 4px 24px rgba(0, 0, 6, 0.18), 0 0 0 1px rgba(0, 0, 6, 0.05);
   --shadow-focus: 0 0 0 2px color-mix(in srgb, var(--gnome-accent-text) 50%, transparent);
 
-  /* Buttons and entries at 6px, boxed lists and cards at 12px, dialogs
-     rounder still. */
+  /* libadwaita 1.9 (GNOME 50): buttons, entries and sidebar rows at 9px
+     ($button_radius), a toggle inside a group at 6 — 9 less the group's 3px
+     padding — cards at 12 and dialogs at 15. */
   --radius-sm: 6px;
-  --radius-md: 6px;
+  --radius-md: 9px;
   --radius-lg: 9px;
   --radius-xl: 12px;
-  --radius-2xl: 18px;
+  --radius-2xl: 15px;
 
   /* Adwaita Sans since GNOME 48, Cantarell before it. Neither ships with
      Windows or macOS, where this falls back to the system face. */
@@ -61,8 +66,13 @@
   --gnome-sidebar-border: rgba(0, 0, 6, 0.07);
   --gnome-card-shadow: 0 0 0 1px rgba(0, 0, 6, 0.03), 0 1px 3px 1px rgba(0, 0, 6, 0.07), 0 2px 6px 2px rgba(0, 0, 6, 0.03);
   --gnome-toggle-checked: #ffffff;
-  --gnome-switch-off: rgba(0, 0, 6, 0.15);
+  /* currentColor at 15%, and the text is itself 80% opaque. */
+  --gnome-switch-off: rgba(0, 0, 6, 0.12);
+  --gnome-switch-knob: #ffffff;
   --gnome-osd: rgba(0, 0, 6, 0.8);
+  --gnome-toast: #505053;
+  --gnome-dimming: rgba(0, 0, 6, 0.14);
+  --gnome-scrollbar: rgba(0, 0, 6, 0.16);
 }
 
 :root[data-style='gnome'][data-theme='dark'] {
@@ -91,8 +101,8 @@
   --separator: rgba(0, 0, 6, 0.36);
   --separator-opaque: #1f1f23;
 
-  --accent: #3584e4;
-  --accent-hover: #4990e6;
+  --accent: var(--system-accent, #3584e4);
+  --accent-hover: color-mix(in srgb, var(--accent) 90%, #ffffff);
   --accent-label: #ffffff;
 
   --shadow-sm: 0 0 transparent;
@@ -109,7 +119,21 @@
   --gnome-card-shadow: 0 0 0 1px rgba(0, 0, 6, 0.09), 0 1px 3px 1px rgba(0, 0, 6, 0.09), 0 2px 6px 2px rgba(0, 0, 6, 0.03);
   --gnome-toggle-checked: rgba(255, 255, 255, 0.2);
   --gnome-switch-off: rgba(255, 255, 255, 0.15);
+  /* White knocked back 20% towards the view colour, so it doesn't glare. */
+  --gnome-switch-knob: color-mix(in srgb, #ffffff 80%, #1d1d20);
   --gnome-osd: rgba(0, 0, 6, 0.8);
+  --gnome-dimming: rgba(0, 0, 6, 0.5);
+  --gnome-scrollbar: rgba(255, 255, 255, 0.2);
+}
+
+/* The accent as text — focus rings, links — is the accent itself pulled
+   into a readable lightness, the way libadwaita derives --accent-color: no
+   lighter than 0.5 in oklab on a light page, no darker than 0.85 on a dark
+   one. The hex values in the two blocks above are what the blue gives, for
+   a webview without relative colours. After both blocks, so it wins. */
+@supports (color: oklab(from red min(l, 0.5) a b)) {
+  :root[data-style='gnome'] { --gnome-accent-text: oklab(from var(--accent) min(l, 0.5) a b); }
+  :root[data-style='gnome'][data-theme='dark'] { --gnome-accent-text: oklab(from var(--accent) max(l, 0.85) a b); }
 }
 
 /* ─── Type ─── */
@@ -164,8 +188,8 @@
   padding: 8px 10px 4px;
 }
 :root[data-style='gnome'] .sidebar__item {
-  min-height: 38px;
-  padding: 0 10px;
+  min-height: 36px;
+  padding: 0 8px;
   gap: 12px;
   font-size: 13px;
   margin-bottom: 2px;
@@ -224,10 +248,10 @@
 }
 
 /* ─── Buttons ─── */
-/* Borderless tinted buttons with bold labels. */
+/* Borderless tinted buttons with bold labels, padded as a text button. */
 :root[data-style='gnome'] .btn {
   height: 34px;
-  padding: 0 12px;
+  padding: 0 17px;
   font-size: 13px;
   font-weight: 700;
   background: var(--gnome-button);
@@ -283,7 +307,7 @@
 :root[data-style='gnome'] .toggle__knob {
   top: 3px; left: 3px;
   width: 20px; height: 20px;
-  background: #ffffff;
+  background: var(--gnome-switch-knob);
   box-shadow: 0 2px 4px rgba(0, 0, 6, 0.2);
   transition: left 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
 }
@@ -336,11 +360,12 @@
   background: var(--gnome-button);
   box-shadow: none;
 }
+/* 28px toggles in a 34px group, the height of every other control. */
 :root[data-style='gnome'] .segmented__btn {
-  padding: 4px 12px;
+  padding: 5px 8px;
   font-size: 13px;
   font-weight: 700;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
 }
 :root[data-style='gnome'] .segmented__btn:hover:not(.segmented__btn--active) { background: var(--gnome-flat-hover); }
 :root[data-style='gnome'] .segmented__btn--active {
@@ -364,28 +389,31 @@
   transform: none;
 }
 /* Adwaita's tooltips are an on-screen-display: dark and see-through in both
-   modes, so the translucency every tip keeps comes for free here. */
+   modes, so the translucency every tip keeps comes for free here. The faint
+   light edge keeps one from melting into a dark window behind it. */
 :root[data-style='gnome'] .info-tip::after {
   font-family: var(--gnome-font);
   font-size: 12px;
   padding: 6px 10px;
   border-radius: var(--radius-lg);
   background: var(--gnome-osd);
+  background-clip: padding-box;
   color: #ffffff;
-  border: none;
+  border: 1px solid rgba(255, 255, 255, 0.1);
   box-shadow: none;
 }
 
 /* ─── Modal (alert dialog) ─── */
 :root[data-style='gnome'] .modal__backdrop {
-  background: rgba(0, 0, 6, 0.25);
+  background: var(--gnome-dimming);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
+/* A floating sheet: three soft shadows and a hairline, not one heavy drop. */
 :root[data-style='gnome'] .modal__content {
   background: var(--bg-window-solid);
   padding: 32px 24px 24px;
-  box-shadow: var(--shadow-lg);
+  box-shadow: 0 0 14px 2px rgba(0, 0, 6, 0.03), 0 0 5px 2px rgba(0, 0, 6, 0.1), 0 0 0 1px rgba(0, 0, 0, 0.05);
 }
 :root[data-style='gnome'] .modal__title { font-size: 16px; font-weight: 700; margin-bottom: 10px; }
 :root[data-style='gnome'] .modal__body { font-size: 13px; color: var(--label-primary); margin-bottom: 24px; }
@@ -393,20 +421,20 @@
 :root[data-style='gnome'] .modal__actions .btn { height: 40px; border-radius: var(--radius-xl); }
 
 /* ─── Toast ─── */
-/* An on-screen-display pill, dark in both modes. */
+/* A solid dark-grey pill in both modes, lifted by the card shadow. */
 :root[data-style='gnome'] .toast {
-  background: var(--gnome-osd);
+  background: var(--gnome-toast);
   color: #ffffff;
   font-size: 13px; font-weight: 400;
   padding: 9px 18px;
-  box-shadow: none;
+  box-shadow: 0 1px 3px 1px rgba(0, 0, 6, 0.07), 0 2px 6px 2px rgba(0, 0, 6, 0.03);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
 :root[data-style='gnome'] .toast--error { color: #ff938c; }
 
 /* ─── Progress ─── */
-:root[data-style='gnome'] .progressbar { height: 6px; border-radius: 99px; background: var(--gnome-switch-off); }
+:root[data-style='gnome'] .progressbar { height: 8px; border-radius: 99px; background: var(--gnome-switch-off); }
 :root[data-style='gnome'] .progressbar__fill { border-radius: 99px; }
 :root[data-style='gnome'] .progressbar__fill::after { display: none; }
 
@@ -427,5 +455,4 @@
 :root[data-style='gnome'] .badge--cancelled { background: color-mix(in srgb, var(--system-gray) 18%, transparent); }
 
 /* ─── Scrollbars ─── */
-:root[data-style='gnome'] ::-webkit-scrollbar-thumb { border-width: 4px; border-radius: 99px; background-color: rgba(0, 0, 6, 0.3); }
-:root[data-style='gnome'][data-theme='dark'] ::-webkit-scrollbar-thumb { background-color: rgba(255, 255, 255, 0.3); }
+:root[data-style='gnome'] ::-webkit-scrollbar-thumb { border-width: 4px; border-radius: 99px; background-color: var(--gnome-scrollbar); }

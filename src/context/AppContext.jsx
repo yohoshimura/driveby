@@ -158,6 +158,28 @@ export function AppProvider({ children }) {
     document.documentElement.setAttribute('data-platform', platformOf(navigator.userAgent));
   }, []);
 
+  // The desktop's accent colour, which the Adwaita style paints with as
+  // libadwaita apps do (src/themes/gnome.css). Set on the root for every
+  // style but read by that one alone; without it, Adwaita keeps its blue.
+  useEffect(() => {
+    const root = document.documentElement.style;
+    const apply = (hex) => {
+      if (hex) root.setProperty('--system-accent', hex);
+      else root.removeProperty('--system-accent');
+    };
+    let off;
+    let cancelled = false;
+    bridge.systemAccent().then(apply).catch(() => {});
+    bridge.onSystemAccent(apply).then((fn) => {
+      if (cancelled) fn();
+      else off = fn;
+    });
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, []);
+
   useEffect(() => {
     const unlisten = [];
     let cancelled = false;

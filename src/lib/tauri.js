@@ -18,6 +18,8 @@ export const bridge = {
   restoreBackup: (backupPath, destination) => invoke('restore_backup', { backupPath, destination }),
   cancelRestore: () => invoke('cancel_restore'),
   revealLogsFolder: () => invoke('reveal_logs_folder'),
+  // '#rrggbb' on a Linux desktop that sets an accent colour, null elsewhere.
+  systemAccent: () => invoke('system_accent'),
 
   selectDirectory: async (title) => {
     const res = await open({ directory: true, multiple: false, title });
@@ -74,4 +76,6 @@ export const bridge = {
   // A notification's "View in History" was clicked; the payload is the
   // history row's id. Rust has already brought the window up.
   onShowHistory: (cb) => listen('show-history', (e) => cb(e.payload)),
+  // The accent changed in the desktop's settings; same payload as systemAccent.
+  onSystemAccent: (cb) => listen('system-accent', (e) => cb(e.payload)),
 };

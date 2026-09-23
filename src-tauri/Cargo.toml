@@ -58,6 +58,9 @@ libc = "0.2"
 # Also already in the tree under tauri-plugin-notification, which drops the
 # actions on desktop; notification.rs uses it directly for them.
 notify-rust = "4"
+# The D-Bus client notify-rust already brings in, with the same features, for
+# reading the desktop's accent colour off the settings portal (appearance.rs).
+zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 [[bin]]
 name = "driveby"

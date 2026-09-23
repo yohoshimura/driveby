@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod appearance;
 mod backup;
 mod fsutil;
 mod glob;
@@ -353,6 +354,7 @@ fn main() {
             }
 
             scheduler::spawn(app.handle().clone());
+            appearance::watch(app.handle());
             Ok(())
         });
 
@@ -371,6 +373,7 @@ fn main() {
         cancel_restore,
         reveal_logs_folder,
         notify,
+        appearance::system_accent,
     ]);
 
     // `main()` is the only place we let the runtime own the process: a

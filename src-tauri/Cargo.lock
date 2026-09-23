@@ -904,6 +904,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
  "xxhash-rust",
+ "zbus",
 ]
 
 [[package]]
