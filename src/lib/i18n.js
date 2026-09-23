@@ -248,7 +248,7 @@ const MESSAGES = {
     'settings.tip.history_retention': "How far back the history goes. Older runs are dropped; backup folders are never touched.",
     'settings.tip.continue_on_error': "Skips files that cannot be copied — locked, or not permitted — and carries on instead of stopping the whole job.",
     'settings.tip.preserve_mtime': "Keeps each file’s original modification date, which lets later runs skip unchanged files instantly.",
-    'settings.tip.ui_style': "The look of controls, lists and the sidebar. System matches your OS: Windows 11 on Windows, GNOME on Linux, iOS on macOS.",
+    'settings.tip.ui_style': "The look of controls, lists and the sidebar. System matches your OS: Mica on Windows, Adwaita on Linux, Sequoia on macOS.",
     'settings.tip.exclude': "One pattern per line, or comma-separated. * matches any characters, ** crosses folders, ? a single one, and a leading ! puts something back in.",
 
     'settings.placeholder.exclude': '*.tmp\nnode_modules\n.DS_Store\n!important.tmp',
@@ -263,9 +263,9 @@ const MESSAGES = {
     'settings.theme.system': 'System',
 
     'settings.ui_style.auto': 'System',
-    'settings.ui_style.ios': 'iOS',
-    'settings.ui_style.windows': 'Windows 11',
-    'settings.ui_style.gnome': 'GNOME',
+    'settings.ui_style.ios': 'Sequoia',
+    'settings.ui_style.windows': 'Mica',
+    'settings.ui_style.gnome': 'Adwaita',
 
     'settings.toast.cannot_open_logs': 'Cannot open logs: {error}',
   },
@@ -502,7 +502,7 @@ const MESSAGES = {
     'settings.tip.history_retention': "Ancienneté maximale de l’historique. Les exécutions plus anciennes sont supprimées ; les dossiers de sauvegarde ne sont jamais touchés.",
     'settings.tip.continue_on_error': "Saute les fichiers impossibles à copier — verrouillés ou sans droits — et poursuit au lieu d’arrêter toute la tâche.",
     'settings.tip.preserve_mtime': "Conserve la date de modification d’origine, ce qui permet aux exécutions suivantes de sauter instantanément les fichiers inchangés.",
-    'settings.tip.ui_style': "L’allure des contrôles, des listes et de la barre latérale. Système suit votre OS : Windows 11 sous Windows, GNOME sous Linux, iOS sous macOS.",
+    'settings.tip.ui_style': "L’allure des contrôles, des listes et de la barre latérale. Système suit votre OS : Mica sous Windows, Adwaita sous Linux, Sequoia sous macOS.",
     'settings.tip.exclude': "Un motif par ligne, ou séparés par des virgules. * remplace n’importe quels caractères, ** traverse les dossiers, ? un seul, et ! en début de ligne réinclut.",
 
     'settings.placeholder.exclude': '*.tmp\nnode_modules\n.DS_Store\n!important.tmp',
@@ -517,9 +517,9 @@ const MESSAGES = {
     'settings.theme.system': 'Système',
 
     'settings.ui_style.auto': 'Système',
-    'settings.ui_style.ios': 'iOS',
-    'settings.ui_style.windows': 'Windows 11',
-    'settings.ui_style.gnome': 'GNOME',
+    'settings.ui_style.ios': 'Sequoia',
+    'settings.ui_style.windows': 'Mica',
+    'settings.ui_style.gnome': 'Adwaita',
 
     'settings.toast.cannot_open_logs': 'Impossible d’ouvrir les journaux : {error}',
   },
