@@ -129,6 +129,8 @@ const MESSAGES = {
     'backup.nospace.short': 'Not enough space: {needed} needed, {free} free',
     'backup.notification.title': 'Driveby',
     'backup.notification.body': 'Backup of “{name}” complete',
+    'backup.notification.open_folder': 'Open destination folder',
+    'backup.notification.view_history': 'View in History',
     'backup.toast.partial': 'Backed up to {done} of {total} destinations',
     'backup.toast.destination_missing': '“{name}” was skipped — its destination is not connected',
 
@@ -381,6 +383,8 @@ const MESSAGES = {
     'backup.nospace.short': 'Espace insuffisant : {needed} nécessaires, {free} libres',
     'backup.notification.title': 'Driveby',
     'backup.notification.body': 'Sauvegarde de « {name} » terminée',
+    'backup.notification.open_folder': 'Ouvrir la destination',
+    'backup.notification.view_history': 'Voir dans l’historique',
     'backup.toast.partial': 'Sauvegardé vers {done} destinations sur {total}',
     'backup.toast.destination_missing': '« {name} » n’a pas été lancée — sa destination n’est pas connectée',
 

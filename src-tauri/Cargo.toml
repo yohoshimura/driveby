@@ -47,9 +47,17 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+# Already in the tree under tauri-plugin-notification, which does not expose
+# toast buttons or clicks on desktop; notification.rs drives it directly.
+tauri-winrt-notification = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Also already in the tree under tauri-plugin-notification, which drops the
+# actions on desktop; notification.rs uses it directly for them.
+notify-rust = "4"
 
 [[bin]]
 name = "driveby"

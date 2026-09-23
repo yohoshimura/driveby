@@ -162,11 +162,15 @@ export function AppProvider({ children }) {
         // lastBackup is now owned by Rust — it emits task-updated which the
         // listener below applies. Don't mutate tasks locally on complete.
         const existingTask = tasksRef.current.find((t) => t.id === data.taskId);
+        // Named up front so the notification's "View in History" can point
+        // at the row it is about to describe.
+        const historyId = uuidv4();
+        const viewHistory = { kind: 'viewHistory', label: tr('backup.notification.view_history'), historyId };
         setHistory((prev) =>
           trimHistory(
             [
               {
-                id: uuidv4(),
+                id: historyId,
                 taskId: data.taskId,
                 taskName: existingTask?.name || tr('common.backup'),
                 timestamp: new Date().toISOString(),
@@ -200,6 +204,14 @@ export function AppProvider({ children }) {
             bridge.notify(
               tr('backup.notification.title'),
               tr('backup.notification.body', { name: existingTask?.name || tr('view.tasks').toLowerCase() }),
+              [
+                // `path` is the first destination written; with several,
+                // the others are one click away in the History row.
+                ...(data.path
+                  ? [{ kind: 'openFolder', label: tr('backup.notification.open_folder'), path: data.path }]
+                  : []),
+                viewHistory,
+              ],
             );
           }
         } else if (data.cancelled) {
@@ -231,7 +243,7 @@ export function AppProvider({ children }) {
             });
             showToast(message, 'error');
             if (settingsRef.current.showNotifications) {
-              bridge.notify(tr('backup.notification.title'), message);
+              bridge.notify(tr('backup.notification.title'), message, [viewHistory]);
             }
           } else {
             showToast(tr('backup.toast.failed', { error: data.error }), 'error');

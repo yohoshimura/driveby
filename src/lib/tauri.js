@@ -2,7 +2,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
-import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
 
 export const bridge = {
@@ -54,11 +53,12 @@ export const bridge = {
     }
   },
 
-  notify: async (title, body) => {
+  // `actions` become buttons on Windows and Linux, where Rust also acts on
+  // the click: [{ kind: 'openFolder', label, path } | { kind: 'viewHistory', label, historyId }].
+  // macOS shows the plain notification (see notification.rs).
+  notify: async (title, body, actions = []) => {
     try {
-      let granted = await isPermissionGranted();
-      if (!granted) granted = (await requestPermission()) === 'granted';
-      if (granted) sendNotification({ title, body });
+      await invoke('notify', { title, body, actions });
     } catch {}
   },
 
@@ -71,4 +71,7 @@ export const bridge = {
   // picture: every task with at least one destination missing.
   onDestinationsStatus: (cb) => listen('destinations-status', (e) => cb(e.payload)),
   onDestinationMissing: (cb) => listen('destination-missing', (e) => cb(e.payload)),
+  // A notification's "View in History" was clicked; the payload is the
+  // history row's id. Rust has already brought the window up.
+  onShowHistory: (cb) => listen('show-history', (e) => cb(e.payload)),
 };

@@ -1051,8 +1051,13 @@ input, textarea { user-select: text; }
   padding: 9px 12px; font-size: 12px;
   border-top: 0.5px solid var(--separator);
   vertical-align: middle;
+  transition: background 0.18s ease;
 }
 .history-table tr:hover td { background: var(--bg-control-hover); }
+/* The row a notification's "View in History" pointed at, marked for a
+   moment. Declared after :hover, same specificity, so it wins under the
+   pointer too. */
+.history-table tr.history-row--focus td { background: color-mix(in srgb, var(--accent) 16%, transparent); }
 /* `.history-table th` sets text-align on a selector one point more specific
    than a bare class, so a `th--right` or `th--center` on its own never won
    and every header stayed left while its column's contents did not. Naming

@@ -3,6 +3,7 @@
 mod backup;
 mod fsutil;
 mod glob;
+mod notification;
 mod persist;
 mod preview;
 mod ratelimit;
@@ -243,6 +244,19 @@ async fn cancel_restore(state: tauri::State<'_, RestoreState>) -> Result<(), Str
     Ok(())
 }
 
+/// Show a desktop notification. On Windows and Linux its `actions` become
+/// buttons that Rust acts on when clicked; on macOS they are dropped (see
+/// notification.rs).
+#[tauri::command]
+async fn notify(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+    actions: Vec<notification::Action>,
+) -> Result<(), String> {
+    notification::show(&app, &title, &body, actions)
+}
+
 #[tauri::command]
 fn reveal_logs_folder(app: tauri::AppHandle) -> Result<String, String> {
     let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
@@ -356,6 +370,7 @@ fn main() {
         restore_backup,
         cancel_restore,
         reveal_logs_folder,
+        notify,
     ]);
 
     // `main()` is the only place we let the runtime own the process: a

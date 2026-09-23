@@ -14,6 +14,7 @@ import RestoreOverlay from './components/RestoreOverlay';
 import Splash, { SPLASH_MS } from './components/Splash';
 import Toast from './components/Toast';
 import { checkForUpdate } from './lib/updater';
+import { bridge } from './lib/tauri';
 import { useT } from './hooks/useT';
 
 const TITLE_KEYS = {
@@ -75,6 +76,27 @@ function Shell() {
     if (loaded) synced.current = true;
   }, [loaded]);
 
+  // "View in History" on a notification: Rust has already raised the window,
+  // this opens History on the run it was about. A fresh object each time, so
+  // a second click still reaches History; History clears it once handled,
+  // so coming back to the view later does not replay it.
+  const [historyFocus, setHistoryFocus] = useState(null);
+  useEffect(() => {
+    let off;
+    let cancelled = false;
+    bridge.onShowHistory((historyId) => {
+      setView('history');
+      setHistoryFocus({ id: historyId });
+    }).then((fn) => {
+      if (cancelled) fn();
+      else off = fn;
+    });
+    return () => {
+      cancelled = true;
+      off?.();
+    };
+  }, []);
+
   // One silent check at launch — it only ever raises a toast pointing at
   // Settings; downloading and installing stays an explicit user action.
   useEffect(() => {
@@ -131,7 +153,9 @@ function Shell() {
               <div className="content__inner">
                 <div className="view-route" key={view}>
                   {view === 'home' && <Home />}
-                  {view === 'history' && <History />}
+                  {view === 'history' && (
+                    <History focus={historyFocus} onFocusHandled={() => setHistoryFocus(null)} />
+                  )}
                   {view === 'statistics' && <Statistics />}
                   {view === 'settings' && <Settings />}
                 </div>

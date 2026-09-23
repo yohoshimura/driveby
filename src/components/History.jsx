@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
 import { useProgress } from '../context/ProgressContext';
 import { useFormat } from '../hooks/useFormat';
@@ -38,13 +38,40 @@ const DEST_STATUS_KEY = {
 /// blank marker.
 const destStatus = (dest) => (DEST_STATUS_KEY[dest?.status] ? dest.status : 'error');
 
-export default function History() {
+// How long the row a notification pointed at stays marked.
+const FOCUS_MS = 2400;
+
+/// `focus` ({ id }) is a history row a notification's "View in History" asked
+/// to see; `onFocusHandled` tells the parent it has been taken care of.
+export default function History({ focus = null, onFocusHandled }) {
   const { history, deleteHistory, clearHistory, revealFolder, restoreBackup } = useApp();
   const { activeRestore } = useProgress();
   const t = useT();
   const { formatTime, formatBytes, formatDuration, formatNumber } = useFormat();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
+  const [focusedId, setFocusedId] = useState(null);
+  const tableRef = useRef(null);
+
+  // A search or a filter left in place could hide the very row asked for,
+  // so both go before it is marked.
+  useEffect(() => {
+    if (!focus) return;
+    setQuery('');
+    setFilter('all');
+    setFocusedId(focus.id);
+    onFocusHandled?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus]);
+
+  useEffect(() => {
+    if (!focusedId) return undefined;
+    tableRef.current
+      ?.querySelector(`tr[data-history-id="${focusedId}"]`)
+      ?.scrollIntoView({ block: 'nearest' });
+    const timer = setTimeout(() => setFocusedId(null), FOCUS_MS);
+    return () => clearTimeout(timer);
+  }, [focusedId]);
 
   const filtered = useMemo(() => {
     return history.filter((h) => {
@@ -100,7 +127,7 @@ export default function History() {
         </select>
       </div>
 
-      <table className="history-table">
+      <table className="history-table" ref={tableRef}>
         <thead>
           <tr>
             <th>{t('history.col.date')}</th>
@@ -123,7 +150,11 @@ export default function History() {
             const only = perDestination ? null : destinations[0];
             const onlyStatus = only ? destStatus(only) : null;
             return (
-              <tr key={entry.id}>
+              <tr
+                key={entry.id}
+                data-history-id={entry.id}
+                className={entry.id === focusedId ? 'history-row--focus' : undefined}
+              >
                 <td><span className="mono">{formatTime(entry.timestamp)}</span></td>
                 <td>
                   <div className="history-task-name">{entry.taskName}</div>
