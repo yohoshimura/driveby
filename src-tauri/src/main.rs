@@ -10,6 +10,7 @@ mod preview;
 mod ratelimit;
 mod restore;
 mod scheduler;
+mod snapshot;
 mod tray;
 
 use backup::{BackupState, CompletePayload, Settings, Task};
