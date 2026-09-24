@@ -412,11 +412,17 @@ pub(crate) async fn prepare(
         // stops half-way is simply carried on by the next run.
         fs::create_dir_all(long_path(&in_progress)).await?;
         let moved = move_entries(destination, &in_progress, &[IN_PROGRESS, "desktop.ini"]).await?;
-        for name in &moved.blocked {
-            warn!(
-                dest = %destination.display(),
-                "{} is already in the first version; left at the root", name
-            );
+        // The marker says the root holds nothing but days. Written over a root
+        // the move did not empty — a name already taken in the first day, a
+        // listing cut short — it would strand mirror entries where nothing
+        // looks again, and one named like a date would read as a day.
+        let left = leftovers_at_root(destination).await?;
+        if !left.is_empty() {
+            return Err(anyhow!(
+                "Could not move everything at {} into the first version; still at the root: {}",
+                destination.display(),
+                left.join(", ")
+            ));
         }
         write_marker(destination, &Marker::default()).await?;
         info!(
@@ -499,9 +505,18 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
         marker.cleared = true;
         write_marker(destination, &marker).await?;
     }
-    let from = destination.join(&leaving);
-    if is_dir(&from).await {
-        come_up(destination, &from).await?;
+    // The day coming up is set aside under `.driveby-in-progress` first: a
+    // source folder named like the day itself would otherwise collide with the
+    // day's own folder at the root and block turning off for ever, and no
+    // source can bring the reserved name. A resumed run finds it already there.
+    let day = destination.join(&leaving);
+    if leaving != IN_PROGRESS && is_dir(&day).await {
+        fs::rename(long_path(&day), long_path(&in_progress))
+            .await
+            .with_context(|| format!("set the version of {} aside", leaving))?;
+    }
+    if is_dir(&in_progress).await {
+        come_up(destination, &in_progress).await?;
     }
     info!(
         dest = %destination.display(),
@@ -539,6 +554,39 @@ async fn come_up(destination: &Path, from: &Path) -> Result<()> {
     })
     .await
     .with_context(|| format!("remove {}", from.display()))
+}
+
+/// What the first move left at the destination root, besides what may stay
+/// there: the in-progress folder, the root's own `desktop.ini`, and the
+/// scratch files of an interrupted marker write or link probe. Symlinks are
+/// left alone by the move, and here too. Unlike `backup::entry_names`, a
+/// listing error is an error: "could not tell" must not read as "empty".
+async fn leftovers_at_root(destination: &Path) -> Result<Vec<String>> {
+    let root = long_path(destination);
+    let mut entries = fs::read_dir(&root)
+        .await
+        .with_context(|| format!("list {}", root.display()))?;
+    let mut left = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| format!("list {}", root.display()))?
+    {
+        let kind = entry.file_type().await.with_context(|| format!("list {}", root.display()))?;
+        if kind.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let stays = name.eq_ignore_ascii_case(IN_PROGRESS)
+            || name.eq_ignore_ascii_case("desktop.ini")
+            || name.starts_with(".driveby-link-probe")
+            || (name.starts_with(".driveby-snapshots.") && name.ends_with(".tmp"));
+        if !stays {
+            left.push(name);
+        }
+    }
+    left.sort();
+    Ok(left)
 }
 
 /// Make the snapshot a run wrote into its day: rename `.driveby-in-progress`
@@ -818,6 +866,69 @@ mod tests {
         prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap();
         assert!(dest.join(IN_PROGRESS).join("busy/x.txt").exists());
         assert!(read_marker(dest).await.unwrap().is_some());
+    }
+
+    /// A source folder named like the day coming up — a photo import named by
+    /// date — would collide with the day's own folder at the root. Turning off
+    /// must still finish.
+    #[tokio::test]
+    async fn turning_off_finishes_when_the_source_has_a_folder_named_like_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-22"), &[("2026-09-22/x.txt", "x"), ("a.txt", "a")]);
+        mark(dest).await;
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["2026-09-22", "a.txt"]);
+        assert_eq!(std::fs::read(dest.join("2026-09-22/x.txt")).unwrap(), b"x");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// `leaving` and `cleared` are on disk before anything moves: a turning-off
+    /// stopped half-way — here by a name already taken at the root — resumes
+    /// without taking a source folder that already came up for a day.
+    #[tokio::test]
+    async fn turning_off_writes_its_progress_before_anything_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-21"), &[("old.txt", "old")]);
+        tree(
+            &dest.join("2026-09-22"),
+            &[("2030-01-01/inside.txt", "i"), ("a.txt", "day copy")],
+        );
+        tree(dest, &[("a.txt", "in the way")]);
+        mark(dest).await;
+
+        assert!(leave(dest, &go()).await.is_err());
+        let marker = read_marker(dest).await.unwrap().expect("the marker stays until the end");
+        assert_eq!(marker.leaving.as_deref(), Some("2026-09-22"));
+        assert!(marker.cleared);
+        assert!(!dest.join("2026-09-21").exists());
+
+        std::fs::remove_file(dest.join("a.txt")).unwrap();
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(std::fs::read(dest.join("2030-01-01/inside.txt")).unwrap(), b"i");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"day copy");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// The marker says the root holds nothing but days. When the move could
+    /// not empty it, no marker is written and the destination fails, naming
+    /// what is left.
+    #[tokio::test]
+    async fn a_first_move_that_leaves_something_behind_writes_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("a.txt", "root copy")]);
+        tree(&dest.join(IN_PROGRESS), &[("a.txt", "already moved")]);
+
+        let err = prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap_err();
+
+        assert!(err.to_string().contains("a.txt"), "{err}");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"root copy");
     }
 
     #[test]
