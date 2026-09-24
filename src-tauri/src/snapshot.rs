@@ -65,7 +65,7 @@ pub(crate) async fn read_marker(destination: &Path) -> Result<Option<Marker>> {
 }
 
 pub(crate) async fn write_marker(destination: &Path, marker: &Marker) -> Result<()> {
-    persist::write_json_atomic(&destination.join(MARKER), marker).await
+    persist::write_json_atomic(&long_path(&destination.join(MARKER)), marker).await
 }
 
 /// Remove the marker; nothing to do when it is already gone.
