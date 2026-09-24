@@ -565,4 +565,102 @@ mod tests {
         assert!(root.join("desktop.ini").exists(), "the destination's own icon stays");
         assert_eq!(std::fs::read(root.join("clash")).unwrap(), b"root copy");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_tree_never_follows_a_link_out_of_the_tree() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let outside_file = outside.join("file.txt");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        let tree_root = dir.path().join("tree");
+        std::fs::create_dir_all(&tree_root).unwrap();
+        unix_fs::symlink(&outside, tree_root.join("link")).unwrap();
+
+        remove_tree(&tree_root, &go()).await.unwrap();
+
+        assert!(!tree_root.exists(), "tree is removed");
+        assert!(outside.exists(), "target dir outside tree still exists");
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside", "target file unchanged");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clone_tree_leaves_links_out() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let outside_file = outside.join("file.txt");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        let from = dir.path().join("from");
+        std::fs::create_dir_all(&from).unwrap();
+        unix_fs::symlink(&outside, from.join("link")).unwrap();
+
+        let into = dir.path().join("into");
+        clone_tree(&from, &into, &go()).await.unwrap();
+
+        assert!(!into.join("link").exists(), "symlink is not cloned");
+        assert!(outside.exists(), "target dir outside tree still exists");
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside", "target file unchanged");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_tree_never_follows_a_junction_out_of_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let outside_file = outside.join("file.txt");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        let tree_root = dir.path().join("tree");
+        std::fs::create_dir_all(&tree_root).unwrap();
+        let junction = tree_root.join("junction");
+
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), outside.to_str().unwrap()])
+            .status()
+            .expect("mklink command failed");
+        assert!(status.success(), "junction creation failed");
+
+        remove_tree(&tree_root, &go()).await.unwrap();
+
+        assert!(!tree_root.exists(), "tree is removed");
+        assert!(outside.exists(), "target dir outside tree still exists");
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside", "target file unchanged");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn clone_tree_leaves_junctions_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let outside_file = outside.join("file.txt");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        let from = dir.path().join("from");
+        std::fs::create_dir_all(&from).unwrap();
+        let junction = from.join("junction");
+
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), outside.to_str().unwrap()])
+            .status()
+            .expect("mklink command failed");
+        assert!(status.success(), "junction creation failed");
+
+        let into = dir.path().join("into");
+        clone_tree(&from, &into, &go()).await.unwrap();
+
+        assert!(!into.join("junction").exists(), "junction is not cloned");
+        assert!(outside.exists(), "target dir outside tree still exists");
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside", "target file unchanged");
+    }
 }
