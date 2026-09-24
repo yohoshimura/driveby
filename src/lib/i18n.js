@@ -115,7 +115,7 @@ const MESSAGES = {
     'form.aria.remove_source': 'Remove source {path}',
     'form.error.source_overlap': 'Sources cannot be inside one another',
     'form.error.source_folder_empty': 'Name the destination folder for {path}',
-    'form.error.source_folder_invalid': 'A destination folder name cannot be . or .., nor contain / \\ < > : “ | ? * — “{folder}”',
+    'form.error.source_folder_invalid': 'A destination folder name cannot be . or .., nor contain / \\ < > : " | ? * — “{folder}”',
     'form.error.source_folder_reserved': '”{folder}” is a name Driveby keeps for itself at a destination',
     'form.error.source_folder_duplicate': 'Two sources cannot use the same destination folder “{folder}”',
     'form.error.dest_overlap': 'Destinations cannot be inside one another',
