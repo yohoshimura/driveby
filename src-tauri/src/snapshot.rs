@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub(crate) const MARKER: &str = ".driveby-snapshots";
 pub(crate) const IN_PROGRESS: &str = ".driveby-in-progress";
@@ -353,6 +353,205 @@ pub(crate) async fn move_entries(
     Ok(report)
 }
 
+/// Where one destination's run writes, decided before its copy phase.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Plan {
+    /// A plain mirror at the destination root. `versions_unavailable` when
+    /// the task keeps versions and this drive cannot make hard links.
+    Mirror { versions_unavailable: bool },
+    /// A snapshot. `target` is the day's own folder, updated in place, or
+    /// `.driveby-in-progress`, which `commit` renames to `day`.
+    Snapshot { target: PathBuf, day: String, in_progress: bool },
+}
+
+impl Plan {
+    /// The folder the pipeline writes into.
+    pub(crate) fn target<'a>(&'a self, destination: &'a Path) -> &'a Path {
+        match self {
+            Plan::Mirror { .. } => destination,
+            Plan::Snapshot { target, .. } => target,
+        }
+    }
+}
+
+/// Get `destination` ready for a run that keeps versions: move an existing
+/// mirror into the first snapshot, apply retention, and pick and fill the
+/// target. `can_link` is `fsutil::hard_link_supported`'s answer for this
+/// destination, taken by the caller.
+pub(crate) async fn prepare(
+    destination: &Path,
+    keep_days: u32,
+    clock: NaiveDate,
+    can_link: bool,
+    token: &CancellationToken,
+) -> Result<Plan> {
+    let mut marker = read_marker(destination).await?;
+    // Turned off, then on again before turning off had finished: the user
+    // confirmed deleting those versions, so that is finished first.
+    if marker.as_ref().is_some_and(|m| m.leaving.is_some()) {
+        leave(destination, token).await?;
+        marker = None;
+    }
+    if !can_link {
+        if marker.is_some() {
+            return Err(anyhow!(
+                "This destination keeps daily versions, but hard links cannot be made there \
+                 now. Nothing was changed."
+            ));
+        }
+        // Finishes an interrupted first move, if there is one, so the mirror
+        // this run writes to is whole.
+        leave(destination, token).await?;
+        return Ok(Plan::Mirror { versions_unavailable: true });
+    }
+
+    let in_progress = destination.join(IN_PROGRESS);
+    if marker.is_none() {
+        // The first run with versions: the mirror at the root becomes the
+        // first snapshot, by renaming. The marker goes last, so a move that
+        // stops half-way is simply carried on by the next run.
+        fs::create_dir_all(long_path(&in_progress)).await?;
+        let moved = move_entries(destination, &in_progress, &[IN_PROGRESS, "desktop.ini"]).await?;
+        for name in &moved.blocked {
+            warn!(
+                dest = %destination.display(),
+                "{} is already in the first version; left at the root", name
+            );
+        }
+        write_marker(destination, &Marker::default()).await?;
+        info!(
+            dest = %destination.display(),
+            "keeping daily versions from now on; {} entries moved into the first one", moved.moved
+        );
+    }
+
+    let snapshots = list(destination).await?;
+    let day = effective_day(clock, &snapshots);
+    let name = day_name(day);
+    for old in expired(&snapshots, day, keep_days) {
+        info!(dest = %destination.display(), "deleting the version of {}", old.name());
+        remove_tree(&old.path, token).await?;
+    }
+    let today = destination.join(&name);
+    if is_dir(&today).await {
+        // A later run on the same day updates that day in place, and a
+        // `.driveby-in-progress` beside it can only be a leftover.
+        if is_dir(&in_progress).await {
+            remove_tree(&in_progress, token).await?;
+        }
+        return Ok(Plan::Snapshot { target: today, day: name, in_progress: false });
+    }
+    fs::create_dir_all(long_path(&in_progress)).await?;
+    // Retention never deletes the newest, so it is still there to clone.
+    if let Some(newest) = snapshots.last() {
+        let cloned = clone_tree(&newest.path, &in_progress, token).await?;
+        info!(
+            dest = %destination.display(),
+            "started {} from {}: {} linked, {} copied",
+            name,
+            newest.name(),
+            cloned.linked,
+            cloned.copied
+        );
+    }
+    Ok(Plan::Snapshot { target: in_progress, day: name, in_progress: true })
+}
+
+/// Turn a destination with daily versions back into a mirror: the newest
+/// snapshot comes up to the root and the others are deleted. Also finishes a
+/// first move into snapshots that was interrupted before its marker was
+/// written. A mirror is left as it is.
+///
+/// Every step can be redone after an interruption. `leaving` is written
+/// before anything is deleted and `cleared` before anything moves, so a run
+/// that stops half-way knows which folder is coming up, and never takes a
+/// source folder named like a date for a snapshot.
+pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Result<()> {
+    let in_progress = destination.join(IN_PROGRESS);
+    let Some(mut marker) = read_marker(destination).await? else {
+        if is_dir(&in_progress).await {
+            come_up(destination, &in_progress).await?;
+        }
+        return Ok(());
+    };
+    let leaving = match marker.leaving.clone() {
+        Some(name) => name,
+        None => {
+            let name = match list(destination).await?.last() {
+                Some(newest) => newest.name(),
+                None if is_dir(&in_progress).await => IN_PROGRESS.to_string(),
+                None => return remove_marker(destination).await,
+            };
+            marker.leaving = Some(name.clone());
+            write_marker(destination, &marker).await?;
+            name
+        }
+    };
+    if !marker.cleared {
+        for snapshot in list(destination).await? {
+            if snapshot.name() != leaving {
+                remove_tree(&snapshot.path, token).await?;
+            }
+        }
+        if leaving != IN_PROGRESS && is_dir(&in_progress).await {
+            remove_tree(&in_progress, token).await?;
+        }
+        marker.cleared = true;
+        write_marker(destination, &marker).await?;
+    }
+    let from = destination.join(&leaving);
+    if is_dir(&from).await {
+        come_up(destination, &from).await?;
+    }
+    info!(
+        dest = %destination.display(),
+        "daily versions turned off; {} is the backup again",
+        leaving
+    );
+    remove_marker(destination).await
+}
+
+/// Move `from`'s entries up to `destination`, then remove the emptied folder.
+async fn come_up(destination: &Path, from: &Path) -> Result<()> {
+    let moved = move_entries(from, destination, &[]).await?;
+    for name in &moved.blocked {
+        // The destination root's own folder icon stays. A snapshot's
+        // `desktop.ini` is the source's, which the mirror copies again anyway.
+        if name.eq_ignore_ascii_case("desktop.ini") {
+            let copy = from.join(name);
+            blocking(move || remove_link_safe(&copy))
+                .await
+                .with_context(|| format!("remove {}", from.join(name).display()))?;
+            continue;
+        }
+        return Err(anyhow!(
+            "{} cannot come back to {}: an entry of that name is already there",
+            name,
+            destination.display()
+        ));
+    }
+    let dir = from.to_path_buf();
+    blocking(move || {
+        // Emptied now. Its own ReadOnly bit (a custom folder icon) would block
+        // the removal, and a directory is never shared with another snapshot.
+        clear_readonly(&dir);
+        std::fs::remove_dir(long_path(&dir))
+    })
+    .await
+    .with_context(|| format!("remove {}", from.display()))
+}
+
+/// Make the snapshot a run wrote into its day: rename `.driveby-in-progress`
+/// to the day's name. A day updated in place is already where it belongs.
+pub(crate) async fn commit(destination: &Path, plan: &Plan) -> Result<()> {
+    if let Plan::Snapshot { target, day, in_progress: true } = plan {
+        fs::rename(long_path(target), long_path(&destination.join(day)))
+            .await
+            .with_context(|| format!("commit the version of {}", day))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +584,240 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    use crate::fsutil::same_file;
+
+    async fn mark(dest: &Path) {
+        write_marker(dest, &Marker::default()).await.unwrap();
+    }
+
+    fn in_progress_on(dest: &Path, day: &str) -> Plan {
+        Plan::Snapshot { target: dest.join(IN_PROGRESS), day: day.into(), in_progress: true }
+    }
+
+    #[tokio::test]
+    async fn the_first_run_turns_the_mirror_into_the_first_day_by_renaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("a.txt", "a"), ("sub/b.txt", "b"), ("desktop.ini", "[icon]")]);
+
+        let plan = prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap();
+
+        assert_eq!(plan, in_progress_on(dest, "2026-09-21"));
+        assert_eq!(names_at(dest), [IN_PROGRESS, MARKER, "desktop.ini"]);
+        assert_eq!(std::fs::read(dest.join(IN_PROGRESS).join("sub/b.txt")).unwrap(), b"b");
+        commit(dest, &plan).await.unwrap();
+        assert_eq!(names_at(dest), [MARKER, "2026-09-21", "desktop.ini"]);
+    }
+
+    #[tokio::test]
+    async fn the_next_day_starts_as_a_clone_of_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-21"), &[("a.txt", "a")]);
+        mark(dest).await;
+
+        let plan = prepare(dest, 30, d("2026-09-22"), true, &go()).await.unwrap();
+
+        assert_eq!(plan, in_progress_on(dest, "2026-09-22"));
+        assert!(same_file(&dest.join("2026-09-21/a.txt"), &dest.join(IN_PROGRESS).join("a.txt")));
+    }
+
+    #[tokio::test]
+    async fn a_later_run_the_same_day_updates_that_day_and_drops_a_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        tree(&dest.join(IN_PROGRESS), &[("stale.txt", "s")]);
+        mark(dest).await;
+
+        let plan = prepare(dest, 30, d("2026-09-22"), true, &go()).await.unwrap();
+
+        let today = dest.join("2026-09-22");
+        assert_eq!(
+            plan,
+            Plan::Snapshot { target: today.clone(), day: "2026-09-22".into(), in_progress: false }
+        );
+        assert!(!dest.join(IN_PROGRESS).exists());
+        commit(dest, &plan).await.unwrap();
+        assert!(today.join("a.txt").exists(), "a day updated in place has nothing to rename");
+    }
+
+    #[tokio::test]
+    async fn retention_deletes_old_days_but_never_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        for day in ["2026-08-01", "2026-09-20", "2026-09-22"] {
+            tree(&dest.join(day), &[("a.txt", "a")]);
+        }
+        mark(dest).await;
+
+        prepare(dest, 7, d("2026-09-23"), true, &go()).await.unwrap();
+
+        assert!(!dest.join("2026-08-01").exists());
+        assert!(dest.join("2026-09-20").exists());
+        assert!(dest.join("2026-09-22").exists());
+
+        let idle = tempfile::tempdir().unwrap();
+        tree(&idle.path().join("2026-01-01"), &[("a.txt", "a")]);
+        mark(idle.path()).await;
+        prepare(idle.path(), 7, d("2026-09-23"), true, &go()).await.unwrap();
+        assert!(idle.path().join("2026-01-01").exists(), "months without a run keep the last day");
+    }
+
+    #[tokio::test]
+    async fn a_clock_behind_the_newest_day_writes_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-23"), &[("a.txt", "a")]);
+        mark(dest).await;
+
+        let plan = prepare(dest, 30, d("2026-09-20"), true, &go()).await.unwrap();
+
+        assert_eq!(
+            plan,
+            Plan::Snapshot {
+                target: dest.join("2026-09-23"),
+                day: "2026-09-23".into(),
+                in_progress: false,
+            }
+        );
+        assert!(!dest.join("2026-09-20").exists());
+        assert!(!dest.join(IN_PROGRESS).exists());
+    }
+
+    #[tokio::test]
+    async fn without_hard_links_a_mirror_stays_a_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("a.txt", "a")]);
+
+        let plan = prepare(dest, 30, d("2026-09-21"), false, &go()).await.unwrap();
+
+        assert_eq!(plan, Plan::Mirror { versions_unavailable: true });
+        assert_eq!(names_at(dest), ["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn without_hard_links_a_destination_with_versions_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-21"), &[("a.txt", "a")]);
+        mark(dest).await;
+
+        let err = prepare(dest, 30, d("2026-09-22"), false, &go()).await.unwrap_err();
+
+        assert!(err.to_string().contains("hard links"), "{err}");
+        assert_eq!(names_at(dest), [MARKER, "2026-09-21"]);
+    }
+
+    #[tokio::test]
+    async fn turning_off_brings_the_newest_day_up_and_deletes_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-21"), &[("old.txt", "old")]);
+        tree(
+            &dest.join("2026-09-22"),
+            &[("a.txt", "a"), ("2026-01-01/inside.txt", "i"), ("desktop.ini", "[source icon]")],
+        );
+        tree(dest, &[("desktop.ini", "[destination icon]")]);
+        tree(&dest.join(IN_PROGRESS), &[("half.txt", "h")]);
+        mark(dest).await;
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["2026-01-01", "a.txt", "desktop.ini"]);
+        assert_eq!(std::fs::read(dest.join("desktop.ini")).unwrap(), b"[destination icon]");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_turning_off_does_not_take_a_source_folder_for_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        // Interrupted after the other days were deleted and `2026-01-01` — a
+        // source folder — had already come up.
+        tree(dest, &[("2026-01-01/inside.txt", "i")]);
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        let marker = Marker {
+            leaving: Some("2026-09-22".into()),
+            cleared: true,
+            ..Marker::default()
+        };
+        write_marker(dest, &marker).await.unwrap();
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(std::fs::read(dest.join("2026-01-01/inside.txt")).unwrap(), b"i");
+        assert_eq!(names_at(dest), ["2026-01-01", "a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_first_move_goes_back_up_when_versions_are_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("a.txt", "a")]);
+        tree(&dest.join(IN_PROGRESS), &[("b.txt", "b")]);
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["a.txt", "b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_first_move_is_finished_by_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("a.txt", "a")]);
+        tree(&dest.join(IN_PROGRESS), &[("b.txt", "b")]);
+
+        prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap();
+
+        assert_eq!(names_at(&dest.join(IN_PROGRESS)), ["a.txt", "b.txt"]);
+        assert!(read_marker(dest).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn turning_on_again_mid_way_finishes_turning_off_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-21"), &[("old.txt", "old")]);
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        let marker = Marker { leaving: Some("2026-09-22".into()), ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+
+        let plan = prepare(dest, 30, d("2026-09-23"), true, &go()).await.unwrap();
+
+        assert!(!dest.join("2026-09-21").exists(), "the confirmed deletion is carried out");
+        assert_eq!(plan, in_progress_on(dest, "2026-09-23"));
+        assert_eq!(names_at(&dest.join(IN_PROGRESS)), ["a.txt"]);
+    }
+
+    /// Explorer showing a folder of the backup holds it open, and renaming it
+    /// fails. The destination fails with no marker, and the next run carries
+    /// the move on.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_folder_held_open_stops_the_first_move_and_the_next_run_finishes_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(dest, &[("busy/x.txt", "x"), ("a.txt", "a")]);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: needed to open a folder
+            .open(dest.join("busy"))
+            .unwrap();
+
+        assert!(prepare(dest, 30, d("2026-09-21"), true, &go()).await.is_err());
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+
+        drop(held);
+        prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap();
+        assert!(dest.join(IN_PROGRESS).join("busy/x.txt").exists());
+        assert!(read_marker(dest).await.unwrap().is_some());
     }
 
     #[test]
