@@ -312,6 +312,157 @@ pub fn apply_attrs(_p: &Path, _attrs: u32) {}
 pub fn clear_readonly(_p: &Path) {}
 
 // ─────────────────────────────────────────────────────────────────────
+// Hard links (daily versions)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Rename `tmp` over `dest` without touching the attributes of the file
+/// `dest` names.
+///
+/// With daily versions `dest` is usually a hard link shared with earlier
+/// snapshots, and on Windows the ReadOnly bit belongs to the file, not to the
+/// link: `finish_copy`'s `clear_readonly(dest)` strips it from every day that
+/// shares the file. `std::fs::rename` will not replace a `+R` file at all.
+/// `FileRenameInfoEx` with `FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE`
+/// replaces it, atomically, and leaves the other links as they were (NTFS,
+/// Windows 10 1809 and later — measured with rustc 1.98). Where the call is
+/// not supported, fall back to clear-then-rename, and say so.
+#[cfg(windows)]
+pub fn replace_link_safe(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, DELETE, FILE_RENAME_INFO,
+    };
+    // winbase.h. windows-sys 0.59 exports these only under
+    // Win32_System_WindowsProgramming, which nothing else here needs.
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    const FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
+
+    let attempt = || -> std::io::Result<()> {
+        let file =
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .open(long_path(tmp))?;
+        let name: Vec<u16> = long_path(dest).as_os_str().encode_wide().collect();
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
+        // u64 storage keeps the buffer aligned for the struct's HANDLE field.
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
+        let ok = unsafe {
+            (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+                | FILE_RENAME_FLAG_POSIX_SEMANTICS
+                | FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE;
+            (*info).RootDirectory = std::ptr::null_mut();
+            (*info).FileNameLength = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (*info).FileName.as_mut_ptr(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileRenameInfoEx,
+                info as *const _,
+                size as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    match attempt() {
+        Ok(()) => Ok(()),
+        // ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER:
+        // an older Windows, or a filesystem without the Ex information class.
+        Err(e) if matches!(e.raw_os_error(), Some(1) | Some(50) | Some(87)) => {
+            warn!(
+                "link-safe rename unsupported ({}); clearing ReadOnly on {} first",
+                e,
+                dest.display()
+            );
+            clear_readonly(dest);
+            std::fs::rename(long_path(tmp), long_path(dest))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn replace_link_safe(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, dest)
+}
+
+/// Delete `path` without touching the attributes of the file it names.
+///
+/// std's `remove_file` already deletes a `+R` file on NTFS without clearing
+/// the bit — it asks for `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE` —
+/// so the other links to it keep theirs (measured with rustc 1.98). What
+/// strips the bit is prune's `clear_readonly` *before* the delete. Only a
+/// filesystem without that disposition class answers PermissionDenied, and
+/// there clear-then-delete is the only way.
+pub fn remove_link_safe(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(long_path(path)) {
+        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            clear_readonly(path);
+            std::fs::remove_file(long_path(path))
+        }
+        other => other,
+    }
+}
+
+/// Whether `dir`'s filesystem can hard-link: make a file, link it, remove
+/// both. exFAT and FAT32 cannot, and neither can some network shares.
+pub fn hard_link_supported(dir: &Path) -> bool {
+    let a = dir.join(".driveby-link-probe");
+    let b = dir.join(".driveby-link-probe-2");
+    // Leftovers from a run killed mid-probe.
+    let _ = std::fs::remove_file(long_path(&b));
+    let _ = std::fs::remove_file(long_path(&a));
+    if std::fs::write(long_path(&a), b"probe").is_err() {
+        return false;
+    }
+    let linked = std::fs::hard_link(long_path(&a), long_path(&b)).is_ok();
+    let _ = std::fs::remove_file(long_path(&b));
+    let _ = std::fs::remove_file(long_path(&a));
+    linked
+}
+
+/// Whether `a` and `b` are one file reached by two links.
+#[cfg(test)]
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+            return false;
+        };
+        x.dev() == y.dev() && x.ino() == y.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let id = |p: &Path| -> Option<(u32, u32, u32)> {
+            let f = std::fs::File::open(long_path(p)).ok()?;
+            let mut info: BY_HANDLE_FILE_INFORMATION =
+                unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+            (ok != 0).then_some((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            ))
+        };
+        matches!((id(a), id(b)), (Some(x), Some(y)) if x == y)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Free space
 // ─────────────────────────────────────────────────────────────────────
 
@@ -417,18 +568,36 @@ pub async fn finish_copy(
     mtime: Option<std::time::SystemTime>,
 ) {
     blocking(move || {
-        if let Some(t) = mtime {
-            let _ = filetime::set_file_mtime(
-                long_path(&tmp),
-                filetime::FileTime::from_system_time(t),
-            );
-        }
-        if let Some(attrs) = read_attrs(&src) {
-            apply_attrs(&tmp, attrs);
-        }
+        stamp_scratch(&src, &tmp, mtime);
         clear_readonly(&dest);
     })
     .await
+}
+
+/// `finish_copy` for a scratch file that will replace a file shared with
+/// earlier snapshots: the same stamping, and the read-only bit left on the
+/// outgoing file, because it is theirs too. `replace_link_safe` does not need
+/// it gone.
+pub async fn finish_scratch(
+    src: PathBuf,
+    tmp: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+) {
+    blocking(move || stamp_scratch(&src, &tmp, mtime)).await
+}
+
+/// The source's mtime (when kept) and its kept attribute bits, onto the
+/// scratch file.
+fn stamp_scratch(src: &Path, tmp: &Path, mtime: Option<std::time::SystemTime>) {
+    if let Some(t) = mtime {
+        let _ = filetime::set_file_mtime(
+            long_path(tmp),
+            filetime::FileTime::from_system_time(t),
+        );
+    }
+    if let Some(attrs) = read_attrs(src) {
+        apply_attrs(tmp, attrs);
+    }
 }
 
 /// Mirror one directory's attributes onto its destination counterpart, and
@@ -879,5 +1048,126 @@ mod tests {
         clear_readonly(&src);
         clear_readonly(&dst);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn set_readonly(p: &Path, on: bool) {
+        let mut perms = std::fs::metadata(p).unwrap().permissions();
+        perms.set_readonly(on);
+        std::fs::set_permissions(p, perms).unwrap();
+    }
+
+    /// Replacing today's link must leave yesterday's file exactly as it was:
+    /// that is the whole of what a snapshot promises.
+    #[test]
+    fn replace_link_safe_replaces_only_this_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let yesterday = dir.path().join("yesterday.txt");
+        let today = dir.path().join("today.txt");
+        let tmp = dir.path().join("today.txt.driveby-tmp");
+        std::fs::write(&yesterday, b"old").unwrap();
+        std::fs::hard_link(&yesterday, &today).unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+
+        replace_link_safe(&tmp, &today).unwrap();
+
+        assert_eq!(std::fs::read(&today).unwrap(), b"new");
+        assert_eq!(std::fs::read(&yesterday).unwrap(), b"old");
+        assert!(!tmp.exists(), "the scratch file is what became today's copy");
+        assert!(!same_file(&today, &yesterday));
+    }
+
+    /// On Windows ReadOnly belongs to the file, not the link: replacing a
+    /// `+R` link the way `finish_copy` does — clear, then rename — strips the
+    /// bit from yesterday's copy as well.
+    #[cfg(windows)]
+    #[test]
+    fn replace_link_safe_leaves_the_other_links_readonly_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let yesterday = dir.path().join("yesterday.txt");
+        let today = dir.path().join("today.txt");
+        let tmp = dir.path().join("today.txt.driveby-tmp");
+        std::fs::write(&yesterday, b"old").unwrap();
+        set_readonly(&yesterday, true);
+        std::fs::hard_link(&yesterday, &today).unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+
+        replace_link_safe(&tmp, &today).unwrap();
+
+        assert_eq!(std::fs::read(&today).unwrap(), b"new");
+        assert_eq!(std::fs::read(&yesterday).unwrap(), b"old");
+        assert_ne!(read_attrs(&yesterday).unwrap() & ATTR_READONLY, 0, "yesterday lost its +R");
+        set_readonly(&yesterday, false);
+    }
+
+    #[test]
+    fn remove_link_safe_removes_one_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let yesterday = dir.path().join("yesterday.txt");
+        let today = dir.path().join("today.txt");
+        std::fs::write(&yesterday, b"old").unwrap();
+        std::fs::hard_link(&yesterday, &today).unwrap();
+
+        remove_link_safe(&today).unwrap();
+
+        assert!(!today.exists());
+        assert_eq!(std::fs::read(&yesterday).unwrap(), b"old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_link_safe_leaves_the_other_links_readonly_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let yesterday = dir.path().join("yesterday.txt");
+        let today = dir.path().join("today.txt");
+        std::fs::write(&yesterday, b"old").unwrap();
+        set_readonly(&yesterday, true);
+        std::fs::hard_link(&yesterday, &today).unwrap();
+
+        remove_link_safe(&today).unwrap();
+
+        assert!(!today.exists());
+        assert_ne!(read_attrs(&yesterday).unwrap() & ATTR_READONLY, 0, "yesterday lost its +R");
+        set_readonly(&yesterday, false);
+    }
+
+    #[test]
+    fn a_local_folder_can_hard_link_and_keeps_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(hard_link_supported(dir.path()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the probe files must go");
+    }
+
+    #[test]
+    fn same_file_tells_a_link_from_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (dir.path().join("a"), dir.path().join("b"), dir.path().join("c"));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        std::fs::copy(&a, &c).unwrap();
+        assert!(same_file(&a, &b));
+        assert!(!same_file(&a, &c));
+    }
+
+    /// `finish_scratch` stamps the scratch file as `finish_copy` does, and
+    /// leaves the ReadOnly bit of the file it will replace alone — that bit is
+    /// shared with earlier days.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn finish_scratch_leaves_the_outgoing_files_readonly_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        let tmp = dir.path().join("dest.txt.driveby-tmp");
+        let dest = dir.path().join("dest.txt");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&tmp, b"source").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        set_readonly(&dest, true);
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+
+        finish_scratch(src, tmp.clone(), Some(when)).await;
+
+        assert_eq!(std::fs::metadata(&tmp).unwrap().modified().unwrap(), when);
+        assert_ne!(read_attrs(&dest).unwrap() & ATTR_READONLY, 0);
+        set_readonly(&dest, false);
     }
 }
