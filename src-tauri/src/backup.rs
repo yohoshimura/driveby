@@ -973,7 +973,7 @@ pub(crate) async fn move_nested_copy_up(destination: &Path, nested: &NestedCopy)
 }
 
 /// The names in `dir`, symlinks left out — prune never follows one either.
-async fn entry_names(dir: &Path) -> Vec<String> {
+pub(crate) async fn entry_names(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     let Ok(mut entries) = fs::read_dir(long_path(dir)).await else {
         return names;
@@ -989,7 +989,7 @@ async fn entry_names(dir: &Path) -> Vec<String> {
 /// Nothing at `path` — and known to be nothing. An error that is not
 /// "not found" (a permission problem, say) answers false: this is the check
 /// that stands between a rename and a file it would replace.
-async fn is_absent(path: &Path) -> bool {
+pub(crate) async fn is_absent(path: &Path) -> bool {
     matches!(
         fs::symlink_metadata(long_path(path)).await,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
