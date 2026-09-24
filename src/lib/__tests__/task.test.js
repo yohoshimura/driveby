@@ -4,12 +4,14 @@ import {
   findForeignOverlap,
   findOverlap,
   folderNameError,
+  keepVersionsDays,
   migrateTasks,
   pathContains,
   sourceFolderName,
   taskDestinations,
   taskSources,
   usesSubfolders,
+  VERSION_CHOICES,
 } from '../task';
 
 describe('taskDestinations', () => {
@@ -112,6 +114,12 @@ describe('folderNameError', () => {
     for (const good of ['Photos', 'Photos-Work', 'Mes documents', '2024.backup']) {
       expect(folderNameError(good)).toBeNull();
     }
+  });
+
+  test('refuses the names Driveby keeps at a destination', () => {
+    expect(folderNameError('.driveby-snapshots')).toBe('reserved');
+    expect(folderNameError('.DriveBy-In-Progress')).toBe('reserved');
+    expect(folderNameError('driveby')).toBe(null);
   });
 });
 
@@ -282,5 +290,24 @@ describe('findForeignOverlap', () => {
   test('is null with nothing to compare against', () => {
     expect(findForeignOverlap(['/backup'], [], true)).toBeNull();
     expect(findForeignOverlap(['/backup'], undefined, true)).toBeNull();
+  });
+});
+
+describe('keepVersionsDays', () => {
+  test('is off unless a positive number of days is set', () => {
+    expect(keepVersionsDays({})).toBe(0);
+    expect(keepVersionsDays(null)).toBe(0);
+    expect(keepVersionsDays({ keepVersionsDays: 0 })).toBe(0);
+    expect(keepVersionsDays({ keepVersionsDays: -3 })).toBe(0);
+    expect(keepVersionsDays({ keepVersionsDays: 'soon' })).toBe(0);
+    expect(keepVersionsDays({ keepVersionsDays: 30 })).toBe(30);
+  });
+
+  test('stops at 1000 days, as the backend does', () => {
+    expect(keepVersionsDays({ keepVersionsDays: 5000 })).toBe(1000);
+  });
+
+  test('offers off and four lengths', () => {
+    expect(VERSION_CHOICES).toEqual([0, 7, 30, 90, 365]);
   });
 });

@@ -878,6 +878,7 @@ mod tests {
             schedule_days: days,
             schedule_time: time.map(|t| t.into()),
             last_backup: None,
+            keep_versions_days: None,
         }
     }
 

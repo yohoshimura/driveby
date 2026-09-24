@@ -67,6 +67,10 @@ export function sourceFolderName(path) {
   return trimmed.split(/[\\/]/).pop();
 }
 
+/// Names Driveby keeps for itself at a destination root — the rule of
+/// `snapshot::is_reserved_name` in src-tauri/src/snapshot.rs.
+const RESERVED_NAMES = ['.driveby-snapshots', '.driveby-in-progress'];
+
 /// Why this is not a usable destination folder name, or null when it is.
 ///
 /// The rules of `validate_folder_name` in src-tauri/src/backup.rs. A name,
@@ -80,6 +84,7 @@ export function folderNameError(name) {
   if (n === '.' || n === '..') return 'dots';
   if (/[\\/]/.test(n)) return 'separator';
   if (/[<>:"|?*\x00-\x1f]/.test(n)) return 'character';
+  if (RESERVED_NAMES.includes(n.toLowerCase())) return 'reserved';
   return null;
 }
 
@@ -211,4 +216,21 @@ export function findForeignOverlap(destinations, otherTasks, fold = FOLDS_CASE) 
     }
   }
   return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Daily versions
+// ─────────────────────────────────────────────────────────────────────
+
+/// The lengths the form offers, in days; 0 is off.
+export const VERSION_CHOICES = [0, 7, 30, 90, 365];
+
+/// The days of daily versions a task keeps, 0 when versions are off — the
+/// rule of `Task::keep_versions_days()` in src-tauri/src/backup.rs: absent,
+/// zero, negative or not a number is off, and the ceiling is 1000 (NTFS
+/// allows 1023 links to one file).
+export function keepVersionsDays(task) {
+  const n = Number(task?.keepVersionsDays);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.floor(n), 1000);
 }

@@ -65,6 +65,10 @@ pub struct Task {
     pub schedule_time: Option<String>,
     #[serde(default, rename = "lastBackup")]
     pub last_backup: Option<String>,
+    /// How many days of daily versions this task keeps at each destination;
+    /// absent or 0 is off. See `snapshot.rs`.
+    #[serde(default, rename = "keepVersionsDays", skip_serializing_if = "Option::is_none")]
+    pub keep_versions_days: Option<u32>,
 }
 
 impl Task {
@@ -132,6 +136,13 @@ impl Task {
             .filter(|d| !d.is_empty())
             .filter(|d| seen.insert(d.clone()))
             .collect()
+    }
+
+    /// The days of versions to keep, or None when versions are off. Clamped
+    /// to 1000: NTFS allows 1023 links to one file, and a file unchanged for
+    /// longer than the retention is linked once for every day kept.
+    pub fn keep_versions_days(&self) -> Option<u32> {
+        self.keep_versions_days.filter(|&days| days > 0).map(|days| days.min(1000))
     }
 }
 
@@ -1011,6 +1022,12 @@ fn validate_folder_name(folder: &str) -> Result<()> {
     if name.contains(|c: char| "<>:\"|?*".contains(c) || (c as u32) < 0x20) {
         return Err(anyhow!(
             "A source's destination folder cannot contain <>:\"|?* : \"{}\"",
+            name
+        ));
+    }
+    if crate::snapshot::is_reserved_name(name) {
+        return Err(anyhow!(
+            "\"{}\" is a name Driveby keeps for itself at a destination",
             name
         ));
     }
@@ -2695,14 +2712,35 @@ pub(crate) async fn walk_all(
                 format!("{}/{}", prefix, rel)
             }
         };
-        merged.total_bytes += walked.total_bytes;
+        // A single source is mirrored straight into the destination root,
+        // where these two names are Driveby's own (`snapshot::is_reserved_name`):
+        // another destination's marker copied here would make this one read as
+        // daily versions.
+        let reserved = |rel: &str| {
+            !nested && crate::snapshot::is_reserved_name(rel.split('/').next().unwrap_or(rel))
+        };
+        let (files, dropped): (Vec<FileEntry>, Vec<FileEntry>) =
+            walked.files.into_iter().partition(|f| !reserved(&f.rel));
+        if !dropped.is_empty() {
+            warn!(
+                source = %root.display(),
+                "left {} file(s) under Driveby's reserved names out of the copy",
+                dropped.len()
+            );
+        }
+        let dropped_bytes: u64 = dropped.iter().map(|f| f.size).sum();
+        merged.total_bytes += walked.total_bytes - dropped_bytes;
         merged.skipped += walked.skipped;
         merged
             .files
-            .extend(walked.files.into_iter().map(|f| FileEntry { rel: join(&f.rel), ..f }));
-        merged
-            .dirs
-            .extend(walked.dirs.into_iter().map(|(p, rel)| (p, join(&rel))));
+            .extend(files.into_iter().map(|f| FileEntry { rel: join(&f.rel), ..f }));
+        merged.dirs.extend(
+            walked
+                .dirs
+                .into_iter()
+                .filter(|(_, rel)| !reserved(rel))
+                .map(|(p, rel)| (p, join(&rel))),
+        );
         merged.excluded.extend(walked.excluded.iter().map(|r| join(r)));
         merged.unreadable.extend(walked.unreadable.iter().map(|r| join(r)));
     }
@@ -3023,6 +3061,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let token = CancellationToken::new();
         let payload = execute_all(
@@ -3087,6 +3126,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         }
     }
 
@@ -3240,6 +3280,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         assert!(preflight_sources(&task).is_err());
     }
@@ -3280,6 +3321,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         assert!(reject_foreign_overlaps("mine", &[PathBuf::from("/b")], &[other]).is_err());
     }
@@ -3303,6 +3345,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
 
         let payload = execute_all(
@@ -3415,6 +3458,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
 
         // The plural field wins over a leftover singular one.
@@ -3610,6 +3654,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         }
     }
 
@@ -3693,6 +3738,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let token = CancellationToken::new();
         let payload = execute_all(
@@ -3752,6 +3798,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let token = CancellationToken::new();
         let payload = execute_all(
@@ -3815,6 +3862,7 @@ mod tests {
                 schedule_days: None,
                 schedule_time: None,
                 last_backup: None,
+            keep_versions_days: None,
             };
             let settings = Settings {
                 parallel_copies: Some(n),
@@ -3867,6 +3915,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let settings = Settings {
             parallel_copies: Some(4),
@@ -3935,6 +3984,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let settings = Settings {
             continue_on_error: Some(true),
@@ -3994,6 +4044,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let settings = Settings {
             continue_on_error: Some(false),
@@ -4451,6 +4502,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
 
         let app = tauri::test::mock_app();
@@ -4502,6 +4554,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let app = tauri::test::mock_app();
         execute_all(
@@ -4600,6 +4653,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let settings = Settings {
             continue_on_error: Some(true),
@@ -4681,6 +4735,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         };
         let settings = Settings {
             exclude_patterns: "Photos/raw".into(),
@@ -5129,5 +5184,57 @@ mod tests {
             .await
             .unwrap();
         assert!(find_nested_copy(&dest, &sources, &walked).await.is_none());
+    }
+
+    #[test]
+    fn versions_are_off_unless_a_positive_number_of_days_is_set() {
+        let base = task_with("v", Path::new("/src"), &[]);
+        assert_eq!(base.keep_versions_days(), None);
+        let with = |days| Task { keep_versions_days: Some(days), ..base.clone() };
+        assert_eq!(with(0).keep_versions_days(), None);
+        assert_eq!(with(30).keep_versions_days(), Some(30));
+        assert_eq!(with(5000).keep_versions_days(), Some(1000), "NTFS allows 1023 links a file");
+    }
+
+    #[test]
+    fn keep_versions_days_is_read_from_tasks_json() {
+        let task: Task = serde_json::from_value(
+            serde_json::json!({ "id": "t", "name": "t", "keepVersionsDays": 30 })
+        )
+        .unwrap();
+        assert_eq!(task.keep_versions_days(), Some(30));
+        let older: Task =
+            serde_json::from_value(serde_json::json!({ "id": "t", "name": "t" })).unwrap();
+        assert_eq!(older.keep_versions_days(), None);
+    }
+
+    #[test]
+    fn a_source_folder_cannot_take_a_name_driveby_keeps() {
+        assert!(validate_folder_name(".driveby-snapshots").is_err());
+        assert!(validate_folder_name(".DriveBy-In-Progress").is_err());
+        assert!(validate_folder_name("driveby").is_ok());
+    }
+
+    /// A single source is mirrored straight into the destination root, where
+    /// these names are Driveby's own. Another destination's marker copied
+    /// there would make this one read as daily versions.
+    #[tokio::test]
+    async fn a_single_source_does_not_bring_driveby_s_names_to_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join(".driveby-in-progress")).unwrap();
+        std::fs::write(source.join(".driveby-in-progress").join("x.txt"), b"x").unwrap();
+        std::fs::write(source.join(".driveby-snapshots"), b"{}").unwrap();
+        std::fs::write(source.join("kept.txt"), b"kept").unwrap();
+        let sources = vec![Source { path: source.to_string_lossy().into(), folder: "source".into() }];
+
+        let walked = walk_all(&sources, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let rels: Vec<&str> = walked.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["kept.txt"]);
+        assert!(walked.dirs.is_empty());
+        assert_eq!(walked.total_bytes, 4);
     }
 }

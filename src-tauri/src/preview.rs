@@ -341,6 +341,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         }
     }
 
@@ -369,6 +370,7 @@ mod tests {
             schedule_days: None,
             schedule_time: None,
             last_backup: None,
+            keep_versions_days: None,
         }
     }
 

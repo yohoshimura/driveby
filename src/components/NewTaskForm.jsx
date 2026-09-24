@@ -176,9 +176,12 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     if (nested) {
       const misnamed = task.sources.find((s) => folderNameError(s.folder));
       if (misnamed) {
-        const key = folderNameError(misnamed.folder) === 'empty'
+        const error = folderNameError(misnamed.folder);
+        const key = error === 'empty'
           ? 'form.error.source_folder_empty'
-          : 'form.error.source_folder_invalid';
+          : error === 'reserved'
+            ? 'form.error.source_folder_reserved'
+            : 'form.error.source_folder_invalid';
         return showToast?.(t(key, { path: misnamed.path, folder: misnamed.folder.trim() }), 'error');
       }
       const duplicate = findDuplicateFolder(task.sources);
