@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.0.0
+
+**Daily versions.** A task can now keep one version of its backup per day,
+for 7, 30 or 90 days or a year: choose it under *Daily versions* when you
+create or edit the task. Each destination then holds a folder per day —
+`2026-09-23`, `2026-09-22`, … — and each one is a complete backup you can open
+and browse. A file deleted or damaged by accident can be taken back as it was
+on any of those days: open that day's folder, or restore the whole day from
+History, which now asks which day.
+
+A day costs only what changed. Files that did not change since the day before
+are hard links to the same copy, not copies, so thirty days of a folder where
+little changes take little more room than one. Several runs on the same day
+update that day's version. When the drive runs out of room, the oldest days
+are deleted first, and History says how many; the most recent day is never
+deleted.
+
+Turning versions on moves the backup already on the drive into the first day.
+That is a rename, so it is instant and needs no room. Turning them off, or
+keeping fewer days, asks first, then deletes the versions it no longer keeps
+at the next run; the latest day becomes the backup again.
+
+Versions need a drive that can make hard links: NTFS on Windows, APFS on
+macOS, ext4 and most Linux filesystems. On exFAT or FAT32 — the usual format
+of USB sticks — the task goes on backing up as before, as a mirror, and History
+and the notification say that no versions were kept.
+
+**Before going back to 1.x.** Driveby 1.x does not know about daily versions:
+on a drive that holds them, it would delete every day as a folder the source
+does not have. Turn versions off and run the task once before installing an
+older version.
+
 ## 1.7.7
 
 **Backups are incremental again.** 1.7.6 gave a task with a single source a

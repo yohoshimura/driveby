@@ -16,9 +16,16 @@ manual, hourly, daily, weekly or monthly. Run one by hand at any time.
 skipped, so a repeat run over a large tree finishes in seconds. Up to eight
 files copy at once; one at a time suits an older spinning disk better.
 
-**A mirror, not snapshots.** The destination reflects the source as it is now.
-Files you delete at the source are removed from the copy on the next run.
-There is no version history to roll back through — see *Limits* below.
+**A mirror, or daily versions.** By default the destination reflects the
+source as it is now: files you delete at the source are removed from the copy
+on the next run. Turn on *Daily versions* for a task and each destination
+keeps one complete folder per day instead — `2026-09-23`, `2026-09-22`, … —
+for 7, 30 or 90 days, or a year. Files that did not change are hard links to
+the day before, so a day costs only what changed. To get one file back, open
+that day's folder; to get a whole day back, restore it from History. Versions
+need a drive that can make hard links (NTFS, APFS, ext4); on exFAT or FAT32 the
+task backs up as a mirror and says so. They also rely on *Preserve file
+modification time*, which is on by default.
 
 **Runs without you.** Closing the window can leave Driveby in the notification
 area so scheduled backups still fire, and it can start with your session.
@@ -30,7 +37,8 @@ something back in.
 **Verification.** Optionally read every copied file back and compare it against
 a fingerprint taken while it was written, to catch corruption in transit.
 
-**Restore.** Pick a past backup, choose where to put it, and watch it go — with
+**Restore.** Pick a past backup, choose where to put it, after
+choosing the day when the task keeps daily versions, and watch it go — with
 a progress bar and a stop button. Nothing at the destination is overwritten
 until the replacement is safely written.
 
@@ -81,9 +89,13 @@ updated through your package manager, not by the app.
 
 ## Limits
 
-- **No versioned snapshots.** Restoring gives you the state of the last run, not
-  a point in time you choose. This is a deliberate design choice, not an
-  oversight — versioning changes the storage model entirely.
+- **Daily versions need hard links.** exFAT and FAT32 drives — the usual
+  format of USB sticks — are backed up as a mirror. On a drive with versions,
+  a folder's Properties in Explorer counts every day at its full size; the
+  drive's free space is the real figure.
+- **Going back to Driveby 1.x deletes daily versions.** 1.x does not know the
+  layout and removes every day's folder as something the source does not have.
+  Turn versions off and run the task once before installing an older version.
 - Scheduled backups only run while Driveby is running, whether in a window or
   in the notification area.
 - The tray menu is English-only.
