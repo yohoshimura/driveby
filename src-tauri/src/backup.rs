@@ -6,6 +6,7 @@ use crate::fsutil::{
 use crate::glob;
 use crate::persist;
 use crate::ratelimit;
+use crate::snapshot;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -1193,6 +1194,9 @@ fn on_disk(size: u64) -> u64 {
 ///   while it is being written both copies are on disk, so the `parallel`
 ///   largest ones are counted in full on top, being the worst that can be in
 ///   flight at once;
+/// - with daily versions (`credit_replaced` false), nothing is credited for
+///   the copy a modified file replaces: that copy is still referenced by the
+///   previous day, so replacing it frees nothing;
 /// - an unchanged file takes nothing;
 /// - and nothing is credited for deletions, because prune runs after the
 ///   copy phase and frees nothing while it needs the room.
@@ -1205,6 +1209,7 @@ pub(crate) async fn plan_writes(
     files: &[FileEntry],
     nested: Option<&NestedCopy>,
     parallel: usize,
+    credit_replaced: bool,
     token: &CancellationToken,
 ) -> Result<WritePlan> {
     let mut plan = WritePlan::default();
@@ -1236,7 +1241,11 @@ pub(crate) async fn plan_writes(
                 plan.modified_files += 1;
                 plan.modified_bytes += file.size;
                 // A directory in the way takes no room of its own to speak of.
-                let old = if meta.is_file() { on_disk(meta.len()) } else { 0 };
+                let old = if meta.is_file() && credit_replaced {
+                    on_disk(meta.len())
+                } else {
+                    0
+                };
                 plan.required_bytes += on_disk(file.size).saturating_sub(old);
                 rewritten.push(on_disk(file.size));
             }
@@ -1271,6 +1280,7 @@ pub(crate) async fn decide_room(
     files: &[FileEntry],
     parallel: usize,
     available: u64,
+    credit_replaced: bool,
     token: &CancellationToken,
 ) -> Result<Option<Shortfall>> {
     let sizes: Vec<u64> = files.iter().map(|f| on_disk(f.size)).collect();
@@ -1278,7 +1288,7 @@ pub(crate) async fn decide_room(
     if most <= available {
         return Ok(None);
     }
-    let plan = plan_writes(destination, files, None, parallel, token).await?;
+    let plan = plan_writes(destination, files, None, parallel, credit_replaced, token).await?;
     Ok((plan.required_bytes > available).then_some(Shortfall {
         needed: plan.required_bytes,
         available,
@@ -1292,6 +1302,7 @@ async fn room_check(
     destination: &Path,
     files: &[FileEntry],
     parallel: usize,
+    credit_replaced: bool,
     token: &CancellationToken,
 ) -> Result<Option<Shortfall>> {
     let probe = destination.to_path_buf();
@@ -1299,7 +1310,53 @@ async fn room_check(
         warn!(dest = %destination.display(), "free space could not be read; not checking room");
         return Ok(None);
     };
-    decide_room(destination, files, parallel, available, token).await
+    decide_room(destination, files, parallel, available, credit_replaced, token).await
+}
+
+/// With daily versions: give up the oldest days, one at a time, until the run
+/// fits — or none is left to give, and the destination is refused for room
+/// as before. Returns how many days went, and the shortfall that remains.
+///
+/// Free space is read again after each deletion rather than predicted: a day
+/// frees only the files no other day links to, and nothing short of deleting
+/// it says how much that is. `available` is that reading; tests pass their
+/// own.
+pub(crate) async fn fit_by_evicting<F, Fut>(
+    destination: &Path,
+    target: &Path,
+    files: &[FileEntry],
+    parallel: usize,
+    token: &CancellationToken,
+    available: F,
+) -> Result<(u32, Option<Shortfall>)>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Option<u64>>,
+{
+    let mut evicted = 0;
+    loop {
+        // A volume that will not say is not checked, as in `room_check`.
+        let Some(free) = available().await else {
+            return Ok((evicted, None));
+        };
+        let Some(short) = decide_room(target, files, parallel, free, false, token).await?
+        else {
+            return Ok((evicted, None));
+        };
+        let days = snapshot::list(destination).await?;
+        let Some(oldest) = snapshot::evictable(&days).into_iter().next() else {
+            return Ok((evicted, Some(short)));
+        };
+        warn!(
+            dest = %destination.display(),
+            "not enough room ({} needed, {} free): deleting the version of {}",
+            gigabytes(short.needed),
+            gigabytes(short.available),
+            oldest.name()
+        );
+        snapshot::remove_tree(&oldest.path, token).await?;
+        evicted += 1;
+    }
 }
 
 /// Outcome of one file's trip through the copy loop, folded into
@@ -1853,8 +1910,14 @@ async fn execute_one<R: Runtime>(
     // hours in and failing with half a copy. Checked per destination, just
     // before its turn: an earlier destination on the same volume has used
     // its share by then.
-    if let Some(short) =
-        room_check(destination, &walked.files, settings.parallel_copies(), token).await?
+    if let Some(short) = room_check(
+        destination,
+        &walked.files,
+        settings.parallel_copies(),
+        true,
+        token,
+    )
+    .await?
     {
         warn!(
             dest = %destination.display(),
@@ -5076,7 +5139,7 @@ mod tests {
         let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
             .await
             .unwrap();
-        let plan = plan_writes(&dest, &walked.files, None, 4, &CancellationToken::new())
+        let plan = plan_writes(&dest, &walked.files, None, 4, true, &CancellationToken::new())
             .await
             .unwrap();
 
@@ -5104,11 +5167,11 @@ mod tests {
             .unwrap();
         let token = CancellationToken::new();
         assert_eq!(
-            decide_room(&dest, &walked.files, 4, 100, &token).await.unwrap(),
+            decide_room(&dest, &walked.files, 4, 100, true, &token).await.unwrap(),
             Some(Shortfall { needed: 8192, available: 100 })
         );
         assert_eq!(
-            decide_room(&dest, &walked.files, 4, 1 << 40, &token).await.unwrap(),
+            decide_room(&dest, &walked.files, 4, 1 << 40, true, &token).await.unwrap(),
             None,
             "plenty of room is not a shortfall"
         );
@@ -5131,7 +5194,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            decide_room(&dest, &walked.files, 4, 0, &CancellationToken::new())
+            decide_room(&dest, &walked.files, 4, 0, true, &CancellationToken::new())
                 .await
                 .unwrap(),
             None
@@ -5236,5 +5299,70 @@ mod tests {
         assert_eq!(rels, ["kept.txt"]);
         assert!(walked.dirs.is_empty());
         assert_eq!(walked.total_bytes, 4);
+    }
+
+    /// With daily versions the old copy of a modified file stays, referenced
+    /// by the previous day, so the room check credits nothing for it.
+    #[tokio::test]
+    async fn a_snapshot_is_credited_nothing_for_the_copy_it_replaces() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("grown.bin"), vec![1u8; 9000]).unwrap();
+        std::fs::write(dest.join("grown.bin"), vec![1u8; 100]).unwrap();
+        let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let plan = plan_writes(&dest, &walked.files, None, 4, false, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        // All 12 KiB of the new copy, plus the same again while it is in flight.
+        assert_eq!(plan.required_bytes, 12288 + 12288);
+    }
+
+    #[tokio::test]
+    async fn a_destination_short_of_room_gives_up_its_oldest_days_first() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("new.bin"), vec![0u8; 5000]).unwrap();
+        for day in ["2026-09-20", "2026-09-21", "2026-09-22"] {
+            std::fs::create_dir_all(dest.join(day)).unwrap();
+        }
+        let target = dest.join(crate::snapshot::IN_PROGRESS);
+        std::fs::create_dir_all(&target).unwrap();
+        let walked = walk(&source, &glob::PatternSet::new(&[]), &CancellationToken::new())
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+
+        // Room appears once a single day besides the newest is left.
+        let probe = dest.clone();
+        let (evicted, short) = fit_by_evicting(&dest, &target, &walked.files, 4, &token, || {
+            let probe = probe.clone();
+            async move {
+                let days = crate::snapshot::list(&probe).await.unwrap().len();
+                Some(if days <= 2 { 1 << 30 } else { 100 })
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((evicted, short), (1, None));
+        assert!(!dest.join("2026-09-20").exists());
+        assert!(dest.join("2026-09-21").exists());
+
+        // Never enough: everything but the newest goes, then the refusal.
+        let (evicted, short) =
+            fit_by_evicting(&dest, &target, &walked.files, 4, &token, || async { Some(100) })
+                .await
+                .unwrap();
+        assert_eq!(evicted, 1);
+        assert_eq!(short, Some(Shortfall { needed: 8192, available: 100 }));
+        assert!(dest.join("2026-09-22").exists(), "the newest day is never given up");
     }
 }

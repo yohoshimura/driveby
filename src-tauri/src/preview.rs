@@ -222,7 +222,7 @@ async fn plan_one(
     // nothing the user could observe — counting it as "modified" on every
     // single preview would be noise standing in front of the numbers that
     // matter.
-    let writes = plan_writes(destination, &walked.files, nested, parallel, token).await?;
+    let writes = plan_writes(destination, &walked.files, nested, parallel, true, token).await?;
     let probe = destination.to_path_buf();
     let mut preview = DestinationPreview {
         path: destination.to_string_lossy().to_string(),
