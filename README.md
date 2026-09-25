@@ -22,10 +22,12 @@ on the next run. Turn on *Daily versions* for a task and each destination
 keeps one complete folder per day instead — `2026-09-23`, `2026-09-22`, … —
 for 7, 30 or 90 days, or a year. Files that did not change are hard links to
 the day before, so a day costs only what changed. To get one file back, open
-that day's folder; to get a whole day back, restore it from History. Versions
-need a drive that can make hard links (NTFS, APFS, ext4); on exFAT or FAT32 the
-task backs up as a mirror and says so. They also rely on *Preserve file
-modification time*, which is on by default.
+that day's folder; to get a whole day back, restore it from History. A file in
+a day's folder is the very same file as in every other day that kept it
+unchanged: copy it out before changing it, or every one of those days changes
+with it. Versions need a drive that can make hard links (NTFS, APFS, ext4); on
+exFAT or FAT32 the task backs up as a mirror and says so. They also rely on
+*Preserve file modification time*, which is on by default.
 
 **Runs without you.** Closing the window can leave Driveby in the notification
 area so scheduled backups still fire, and it can start with your session.
