@@ -83,7 +83,8 @@ fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
 pub(crate) struct Marker {
     pub(crate) version: u32,
     /// Set only while versions are being turned off: the snapshot that is
-    /// becoming the mirror again.
+    /// becoming the mirror again, and `.driveby-in-progress` once it has been
+    /// set aside there.
     #[serde(default)]
     pub(crate) leaving: Option<String>,
     /// Set once every other snapshot is gone, before anything moves up. From
@@ -571,9 +572,10 @@ pub(crate) async fn prepare(
 /// written. A mirror is left as it is.
 ///
 /// Every step can be redone after an interruption. `leaving` is written
-/// before anything is deleted and `cleared` before anything moves, so a run
-/// that stops half-way knows which folder is coming up, and never takes a
-/// source folder named like a date for a snapshot.
+/// before anything is deleted, `cleared` before anything moves, and `leaving`
+/// again once the day is set aside, before anything comes up. So a run that
+/// stops half-way knows which folder is coming up, and never takes a source
+/// folder named like a date for a snapshot.
 pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Result<()> {
     let in_progress = destination.join(IN_PROGRESS);
     let Some(mut marker) = read_marker(destination).await? else {
@@ -613,12 +615,24 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
     // The day coming up is set aside under `.driveby-in-progress` first: a
     // source folder named like the day itself would otherwise collide with the
     // day's own folder at the root and block turning off for ever, and no
-    // source can bring the reserved name. A resumed run finds it already there.
-    let day = destination.join(&leaving);
-    if leaving != IN_PROGRESS && folder_state(&day).await? {
-        fs::rename(long_path(&day), long_path(&in_progress))
-            .await
-            .with_context(|| format!("set the version of {} aside", leaving))?;
+    // source can bring the reserved name. The marker says so before anything
+    // comes up: from then on a folder at the root named like the day may be a
+    // source folder that already came up, and is never set aside.
+    if leaving != IN_PROGRESS {
+        let day = destination.join(&leaving);
+        match (folder_state(&day).await?, folder_state(&in_progress).await?) {
+            (true, true) => return Err(set_aside_clash(destination, &leaving)),
+            (true, false) => {
+                fs::rename(long_path(&day), long_path(&in_progress))
+                    .await
+                    .with_context(|| format!("set the version of {} aside", leaving))?;
+            }
+            // Set aside by a run that stopped before the marker said so — or
+            // nothing is left to bring up.
+            (false, _) => {}
+        }
+        marker.leaving = Some(IN_PROGRESS.to_string());
+        write_marker(destination, &marker).await?;
     }
     if folder_state(&in_progress).await? {
         come_up(destination, &in_progress, token).await?;
@@ -629,6 +643,18 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
         leaving
     );
     remove_marker(destination).await
+}
+
+/// The day a turning-off names and `.driveby-in-progress` both there, which
+/// no step leaves behind: which of the two is coming back cannot be told.
+fn set_aside_clash(destination: &Path, leaving: &str) -> anyhow::Error {
+    anyhow!(
+        "{} and {} are both at {}, and only one of them can become the backup again; \
+         nothing was changed",
+        leaving,
+        IN_PROGRESS,
+        destination.display()
+    )
 }
 
 /// Move `from`'s entries up to `destination`, then remove the emptied folder.
@@ -730,15 +756,22 @@ pub(crate) async fn preview_base(
         return Ok(destination.to_path_buf());
     };
     // Turning off: the day coming up is where the run starts — under its own
-    // name, or already set aside under `.driveby-in-progress` by `leave`, or
-    // already back at the root. The day list is not consulted here: a source
-    // folder named like a date may already have come up to the root.
+    // name, or set aside under `.driveby-in-progress` by `leave`, or already
+    // back at the root — in the states `leave` goes through. The day list is
+    // not consulted here, and once the marker names `.driveby-in-progress`
+    // no folder named like a date is either: a source folder named like one
+    // may already have come up to the root.
     let in_progress = destination.join(IN_PROGRESS);
     if let Some(leaving) = leaving_of(destination, &marker)? {
-        let day = destination.join(&leaving);
-        return Ok(if folder_state(&day).await? {
-            day
-        } else if folder_state(&in_progress).await? {
+        if leaving != IN_PROGRESS {
+            let day = destination.join(&leaving);
+            match (folder_state(&day).await?, folder_state(&in_progress).await?) {
+                (true, true) => return Err(set_aside_clash(destination, &leaving)),
+                (true, false) => return Ok(day),
+                (false, _) => {}
+            }
+        }
+        return Ok(if folder_state(&in_progress).await? {
             in_progress
         } else {
             destination.to_path_buf()
@@ -766,13 +799,18 @@ pub(crate) struct DayInfo {
 }
 
 /// The days a destination with daily versions can be restored from, newest
-/// first; none for a mirror, whose root is the backup. The path is built
-/// here so the frontend never joins paths.
+/// first; none for a mirror, whose root is the backup, nor while versions are
+/// being turned off. The path is built here so the frontend never joins
+/// paths.
 pub(crate) async fn restorable_days(destination: &Path) -> Result<Vec<DayInfo>> {
     let Some(marker) = read_marker(destination).await? else {
         return Ok(Vec::new());
     };
-    leaving_of(destination, &marker)?;
+    // Turning off: the other days are being deleted, and the one coming back
+    // may be half-way up to the root already.
+    if leaving_of(destination, &marker)?.is_some() {
+        return Ok(Vec::new());
+    }
     Ok(list(destination)
         .await?
         .into_iter()
@@ -1282,9 +1320,10 @@ mod tests {
         assert_eq!(read_marker(dest).await.unwrap(), None);
     }
 
-    /// `leaving` and `cleared` are on disk before anything moves: a turning-off
-    /// stopped half-way — here by a name already taken at the root — resumes
-    /// without taking a source folder that already came up for a day.
+    /// `leaving` and `cleared` are on disk before anything moves, and the day
+    /// set aside before anything comes up: a turning-off stopped half-way —
+    /// here by a name already taken at the root — resumes without taking a
+    /// source folder that already came up for a day.
     #[tokio::test]
     async fn turning_off_writes_its_progress_before_anything_moves() {
         let dir = tempfile::tempdir().unwrap();
@@ -1299,7 +1338,7 @@ mod tests {
 
         assert!(leave(dest, &go()).await.is_err());
         let marker = read_marker(dest).await.unwrap().expect("the marker stays until the end");
-        assert_eq!(marker.leaving.as_deref(), Some("2026-09-22"));
+        assert_eq!(marker.leaving.as_deref(), Some(IN_PROGRESS), "the day was set aside");
         assert!(marker.cleared);
         assert!(!dest.join("2026-09-21").exists());
 
@@ -1309,6 +1348,121 @@ mod tests {
         assert_eq!(std::fs::read(dest.join("2030-01-01/inside.txt")).unwrap(), b"i");
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"day copy");
         assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// Stopped while coming up, after a source folder named like the day had
+    /// already reached the root. The marker said the day was set aside before
+    /// anything came up, so the next run carries on from there instead of
+    /// taking that folder for the day.
+    #[tokio::test]
+    async fn a_turning_off_stopped_after_a_date_named_folder_came_up_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-22"), &[("2026-09-22/x.txt", "x"), ("b.txt", "day copy")]);
+        tree(dest, &[("b.txt", "in the way")]);
+        mark(dest).await;
+
+        assert!(leave(dest, &go()).await.is_err());
+        let marker = read_marker(dest).await.unwrap().expect("the marker stays until the end");
+        assert_eq!(marker.leaving.as_deref(), Some(IN_PROGRESS));
+        assert!(dest.join("2026-09-22/x.txt").exists(), "the source folder came up");
+
+        std::fs::remove_file(dest.join("b.txt")).unwrap();
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["2026-09-22", "b.txt"]);
+        assert_eq!(std::fs::read(dest.join("2026-09-22/x.txt")).unwrap(), b"x");
+        assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"day copy");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    fn set_aside(cleared: bool) -> Marker {
+        Marker { leaving: Some(IN_PROGRESS.into()), cleared, ..Marker::default() }
+    }
+
+    /// The same state, written down: a folder at the root named like a date
+    /// is never set aside once the marker names `.driveby-in-progress`.
+    #[tokio::test]
+    async fn a_resumed_turning_off_brings_up_what_is_left_of_the_day_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        write_marker(dest, &set_aside(true)).await.unwrap();
+        tree(&dest.join(IN_PROGRESS), &[("a.txt", "a")]);
+        tree(dest, &[("2026-09-22/x.txt", "x")]);
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["2026-09-22", "a.txt"]);
+        assert_eq!(std::fs::read(dest.join("2026-09-22/x.txt")).unwrap(), b"x");
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// Stopped after everything came up, before the marker went: only the
+    /// marker is left to remove, and a source folder named like a date at the
+    /// root is not taken for the day.
+    #[tokio::test]
+    async fn a_turning_off_stopped_before_removing_the_marker_only_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        write_marker(dest, &set_aside(true)).await.unwrap();
+        tree(dest, &[("2026-09-22/x.txt", "x"), ("a.txt", "a")]);
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["2026-09-22", "a.txt"]);
+        assert_eq!(names_at(&dest.join("2026-09-22")), ["x.txt"]);
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// Stopped between setting the day aside and saying so in the marker.
+    #[tokio::test]
+    async fn a_day_set_aside_before_the_marker_said_so_comes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let marker =
+            Marker { leaving: Some("2026-09-22".into()), cleared: true, ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+        tree(&dest.join(IN_PROGRESS), &[("a.txt", "a")]);
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["a.txt"]);
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// The day the marker names and `.driveby-in-progress` both there: which
+    /// one is coming back cannot be told, so neither is touched.
+    #[tokio::test]
+    async fn turning_off_stops_when_the_day_and_a_set_aside_copy_are_both_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let marker =
+            Marker { leaving: Some("2026-09-22".into()), cleared: true, ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        tree(&dest.join(IN_PROGRESS), &[("b.txt", "b")]);
+
+        let err = leave(dest, &go()).await.unwrap_err();
+
+        assert!(err.to_string().contains(IN_PROGRESS), "{err}");
+        assert_eq!(names_at(dest), [IN_PROGRESS, MARKER, "2026-09-22"]);
+        assert_eq!(names_at(&dest.join(IN_PROGRESS)), ["b.txt"]);
+        assert_eq!(names_at(&dest.join("2026-09-22")), ["a.txt"]);
+    }
+
+    /// Turning off deletes the other days and brings one up: none of them is
+    /// offered for restore meanwhile.
+    #[tokio::test]
+    async fn no_day_is_offered_for_restore_while_versions_are_being_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        for day in ["2026-09-21", "2026-09-22"] {
+            tree(&dest.join(day), &[("a.txt", "a")]);
+        }
+        let marker = Marker { leaving: Some("2026-09-22".into()), ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+
+        assert!(restorable_days(dest).await.unwrap().is_empty());
     }
 
     /// The marker says the root holds nothing but days. When the move could
@@ -1414,6 +1568,18 @@ mod tests {
             dest.join(IN_PROGRESS)
         );
 
+        std::fs::remove_dir_all(dest.join(IN_PROGRESS)).unwrap();
+        assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), dest);
+
+        // Set aside, and the marker says so: a folder named like the day at
+        // the root is a source folder that came up, never the day.
+        write_marker(dest, &set_aside(true)).await.unwrap();
+        tree(dest, &[("2026-09-22/x.txt", "a source folder that came up")]);
+        tree(&dest.join(IN_PROGRESS), &[("a.txt", "a")]);
+        assert_eq!(
+            preview_base(dest, false, d("2026-09-23")).await.unwrap(),
+            dest.join(IN_PROGRESS)
+        );
         std::fs::remove_dir_all(dest.join(IN_PROGRESS)).unwrap();
         assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), dest);
     }
