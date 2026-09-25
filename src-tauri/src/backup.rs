@@ -1945,6 +1945,8 @@ async fn execute_one<R: Runtime>(
     };
     let target = plan.target(destination).to_path_buf();
     let versions = matches!(plan, snapshot::Plan::Snapshot { .. });
+    let versions_unavailable =
+        matches!(plan, snapshot::Plan::Mirror { versions_unavailable: true }).then_some(true);
 
     let ctx = RunCtx {
         app,
@@ -1991,6 +1993,7 @@ async fn execute_one<R: Runtime>(
         );
         return Ok(DestinationOutcome {
             evicted_snapshots,
+            versions_unavailable,
             ..DestinationOutcome::no_space(destination, short)
         });
     }
@@ -2057,8 +2060,7 @@ async fn execute_one<R: Runtime>(
         needed_bytes: None,
         available_bytes: None,
         snapshot: snapshot_day,
-        versions_unavailable: matches!(plan, snapshot::Plan::Mirror { versions_unavailable: true })
-            .then_some(true),
+        versions_unavailable,
         evicted_snapshots,
     })
 }
