@@ -5,6 +5,7 @@
 //! <dest>/.driveby-snapshots      the marker: its presence makes this layout
 //! <dest>/2026-09-21/             a committed snapshot, the whole tree
 //! <dest>/.driveby-in-progress/   the snapshot being built; resumable
+//! <dest>/.driveby-deleting-2026-09-01/   a day being deleted; no longer listed
 //! ```
 //!
 //! The design, and why each step is ordered the way it is:
@@ -25,13 +26,23 @@ use tracing::{info, warn};
 
 pub(crate) const MARKER: &str = ".driveby-snapshots";
 pub(crate) const IN_PROGRESS: &str = ".driveby-in-progress";
+/// What a day is renamed to, after this prefix, while it is being deleted.
+pub(crate) const DELETING: &str = ".driveby-deleting-";
 
-/// Names Driveby owns at a destination root. A source must not bring either
-/// there: another destination's marker, mirrored onto this root, would make
-/// it read as daily versions.
+/// Names Driveby owns at a destination root. A source must not bring any of
+/// them there: another destination's marker, mirrored onto this root, would
+/// make it read as daily versions, and a folder named like a day being
+/// deleted would be deleted.
 pub(crate) fn is_reserved_name(name: &str) -> bool {
     let name = name.trim();
-    name.eq_ignore_ascii_case(MARKER) || name.eq_ignore_ascii_case(IN_PROGRESS)
+    name.eq_ignore_ascii_case(MARKER)
+        || name.eq_ignore_ascii_case(IN_PROGRESS)
+        || is_being_discarded(name)
+}
+
+/// A day whose deletion has started (`discard_day`).
+fn is_being_discarded(name: &str) -> bool {
+    starts_with_ignore_case(name, DELETING)
 }
 
 /// Root entries that belong to the operating system, not to the backup:
@@ -69,10 +80,13 @@ fn is_folder_clutter(name: &str) -> bool {
     FOLDER_CLUTTER.iter().any(|s| s.eq_ignore_ascii_case(name))
 }
 
-/// What the first move leaves at the root: Driveby's own folder, the
+/// What the first move leaves at the root: Driveby's own folders, the
 /// operating system's entries and folder clutter.
 fn stays_at_root(name: &str) -> bool {
-    name.eq_ignore_ascii_case(IN_PROGRESS) || is_system_entry(name) || is_folder_clutter(name)
+    name.eq_ignore_ascii_case(IN_PROGRESS)
+        || is_being_discarded(name)
+        || is_system_entry(name)
+        || is_folder_clutter(name)
 }
 
 fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
@@ -254,7 +268,7 @@ pub(crate) fn evictable(snapshots: &[Snapshot]) -> Vec<Snapshot> {
     snapshots.split_last().map(|(_, older)| older.to_vec()).unwrap_or_default()
 }
 
-/// Delete a tree Driveby owns — an expired snapshot, a stale
+/// Delete a tree Driveby owns — a day `discard_day` set aside, a stale
 /// `.driveby-in-progress` — without touching the attributes of the files it
 /// shares with other snapshots.
 ///
@@ -308,6 +322,35 @@ fn remove_tree_sync(root_path: &Path, token: &CancellationToken) -> Result<()> {
     for dir in dirs {
         clear_readonly(&dir);
         std::fs::remove_dir(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Delete a day — retention, eviction, turning off. It is renamed out of the
+/// list first (`.driveby-deleting-<day>` is not a date), then removed: a Stop
+/// or a crash part-way leaves a folder nothing offers as a day, rather than a
+/// day missing some of its files, and the next run finishes the deletion.
+pub(crate) async fn discard_day(
+    destination: &Path,
+    snapshot: &Snapshot,
+    token: &CancellationToken,
+) -> Result<()> {
+    let aside = destination.join(format!("{DELETING}{}", snapshot.name()));
+    fs::rename(long_path(&snapshot.path), long_path(&aside))
+        .await
+        .with_context(|| format!("set the version of {} aside to delete it", snapshot.name()))?;
+    remove_tree(&aside, token).await
+}
+
+/// Finish the deletions a Stop or a crash cut short: every folder at the root
+/// named `.driveby-deleting-…`. Links are left alone, as `list` leaves them.
+async fn finish_discards(destination: &Path, token: &CancellationToken) -> Result<()> {
+    for name in entry_names(destination).await {
+        let path = destination.join(&name);
+        if is_being_discarded(&name) && folder_state(&path).await? {
+            info!(dest = %destination.display(), "finishing the deletion of {}", name);
+            remove_tree(&path, token).await?;
+        }
     }
     Ok(())
 }
@@ -477,6 +520,9 @@ pub(crate) async fn prepare(
     token: &CancellationToken,
 ) -> Result<Plan> {
     let mut marker = read_marker(destination).await?;
+    // A day whose deletion was cut short is already off the list; its room
+    // is this run's.
+    finish_discards(destination, token).await?;
     let in_progress = destination.join(IN_PROGRESS);
     // Before anything moves: a link there would take the first day, or
     // today's clone, wherever it points.
@@ -538,7 +584,7 @@ pub(crate) async fn prepare(
     let today_there = folder_state(&today).await?;
     for old in expired(&snapshots, day, keep_days) {
         info!(dest = %destination.display(), "deleting the version of {}", old.name());
-        remove_tree(&old.path, token).await?;
+        discard_day(destination, &old, token).await?;
     }
     if today_there {
         // A later run on the same day updates that day in place, and a
@@ -587,6 +633,7 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
     // Both refused before anything is deleted or moved.
     let leaving = leaving_of(destination, &marker)?;
     let in_progress_there = folder_state(&in_progress).await?;
+    finish_discards(destination, token).await?;
     let leaving = match leaving {
         Some(name) => name,
         None => {
@@ -603,7 +650,7 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
     if !marker.cleared {
         for snapshot in list(destination).await? {
             if snapshot.name() != leaving {
-                remove_tree(&snapshot.path, token).await?;
+                discard_day(destination, &snapshot, token).await?;
             }
         }
         if leaving != IN_PROGRESS && folder_state(&in_progress).await? {
@@ -1350,6 +1397,44 @@ mod tests {
         assert_eq!(read_marker(dest).await.unwrap(), None);
     }
 
+    /// A day is taken off the list before its deletion starts: a Stop part-way
+    /// leaves a folder nothing offers as a day, and the next run finishes it.
+    #[tokio::test]
+    async fn a_stopped_discard_has_already_taken_the_day_off_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        for day in ["2026-09-01", "2026-09-22"] {
+            tree(&dest.join(day), &[("a.txt", "a")]);
+        }
+        mark(dest).await;
+        let stopped = go();
+        stopped.cancel();
+
+        let oldest = list(dest).await.unwrap().remove(0);
+        assert!(discard_day(dest, &oldest, &stopped).await.is_err());
+
+        let days: Vec<String> = list(dest).await.unwrap().iter().map(Snapshot::name).collect();
+        assert_eq!(days, ["2026-09-22"]);
+        let aside = dest.join(format!("{DELETING}2026-09-01"));
+        assert!(aside.join("a.txt").exists(), "the Stop came before anything was removed");
+
+        prepare(dest, 30, d("2026-09-22"), true, &go()).await.unwrap();
+        assert!(!aside.exists());
+    }
+
+    #[tokio::test]
+    async fn turning_off_finishes_an_interrupted_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        tree(&dest.join(format!("{DELETING}2026-09-01")), &[("old.txt", "old")]);
+        mark(dest).await;
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["a.txt"]);
+    }
+
     /// Stopped while coming up, after a source folder named like the day had
     /// already reached the root. The marker said the day was set aside before
     /// anything came up, so the next run carries on from there instead of
@@ -1502,6 +1587,9 @@ mod tests {
     fn reserved_names_are_driveby_s_own_whatever_the_case() {
         assert!(is_reserved_name(".driveby-snapshots"));
         assert!(is_reserved_name(".DriveBy-In-Progress"));
+        assert!(is_reserved_name(".driveby-deleting-2026-09-01"));
+        assert!(is_reserved_name(".Driveby-Deleting-anything"));
+        assert!(!is_reserved_name(".driveby-deleting"));
         assert!(!is_reserved_name("driveby-snapshots"));
         assert!(!is_reserved_name("Photos"));
     }

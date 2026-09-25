@@ -1375,7 +1375,7 @@ where
             gigabytes(short.available),
             oldest.name()
         );
-        snapshot::remove_tree(&oldest.path, token).await?;
+        snapshot::discard_day(destination, &oldest, token).await?;
         evicted += 1;
     }
 }
@@ -5495,6 +5495,7 @@ mod tests {
         .unwrap();
         assert_eq!((evicted, short), (1, None));
         assert!(!dest.join("2026-09-20").exists());
+        assert!(!dest.join(".driveby-deleting-2026-09-20").exists(), "the day went as a whole");
         assert!(dest.join("2026-09-21").exists());
 
         // Never enough: everything but the newest goes, then the refusal.
