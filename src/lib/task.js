@@ -68,8 +68,10 @@ export function sourceFolderName(path) {
 }
 
 /// Names Driveby keeps for itself at a destination root — the rule of
-/// `snapshot::is_reserved_name` in src-tauri/src/snapshot.rs.
+/// `snapshot::is_reserved_name` in src-tauri/src/snapshot.rs: two names, and
+/// the prefix a day takes while it is being deleted.
 const RESERVED_NAMES = ['.driveby-snapshots', '.driveby-in-progress'];
+const RESERVED_PREFIX = '.driveby-deleting-';
 
 /// Why this is not a usable destination folder name, or null when it is.
 ///
@@ -84,7 +86,9 @@ export function folderNameError(name) {
   if (n === '.' || n === '..') return 'dots';
   if (/[\\/]/.test(n)) return 'separator';
   if (/[<>:"|?*\x00-\x1f]/.test(n)) return 'character';
-  if (RESERVED_NAMES.includes(n.toLowerCase())) return 'reserved';
+  if (RESERVED_NAMES.includes(n.toLowerCase()) || n.toLowerCase().startsWith(RESERVED_PREFIX)) {
+    return 'reserved';
+  }
   return null;
 }
 
@@ -233,4 +237,34 @@ export function keepVersionsDays(task) {
   const n = Number(task?.keepVersionsDays);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.min(Math.floor(n), 1000);
+}
+
+/// What the next run would delete from a destination holding `dayNames`
+/// (`YYYY-MM-DD`, any order) once the task keeps `keepDays` days: 'off' when
+/// versions are off and there are days — all but the newest go, and the
+/// newest becomes the backup — 'fewer' when a day falls out of the window,
+/// null when nothing goes.
+///
+/// The rule of `snapshot::expired` in src-tauri/src/snapshot.rs: the window
+/// ends `keepDays` before today, or before the newest day when the clock
+/// reads earlier, and the newest day always stays.
+export function versionsAtRisk(dayNames, keepDays, today = new Date()) {
+  const days = (dayNames ?? []).map(parseDay).filter(Boolean).sort((a, b) => a - b);
+  if (days.length === 0) return null;
+  if (!(keepDays > 0)) return 'off';
+  const newest = days[days.length - 1];
+  const clock = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const day = clock > newest ? clock : newest;
+  const cutoff = new Date(day.getFullYear(), day.getMonth(), day.getDate() - keepDays);
+  return days.slice(0, -1).some((d) => d < cutoff) ? 'fewer' : null;
+}
+
+/// A day's folder name as a local date, or null for any other name. Parsed by
+/// parts, as `formatDay` does: `new Date('YYYY-MM-DD')` is UTC midnight.
+function parseDay(name) {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(name ?? ''));
+  if (!parts) return null;
+  const [y, m, d] = parts.slice(1).map(Number);
+  const date = new Date(y, m - 1, d);
+  return date.getMonth() === m - 1 && date.getDate() === d ? date : null;
 }

@@ -11,6 +11,7 @@ import {
   taskDestinations,
   taskSources,
   usesSubfolders,
+  versionsAtRisk,
   VERSION_CHOICES,
 } from '../task';
 
@@ -119,6 +120,7 @@ describe('folderNameError', () => {
   test('refuses the names Driveby keeps at a destination', () => {
     expect(folderNameError('.driveby-snapshots')).toBe('reserved');
     expect(folderNameError('.DriveBy-In-Progress')).toBe('reserved');
+    expect(folderNameError('.driveby-deleting-2026-09-01')).toBe('reserved');
     expect(folderNameError('driveby')).toBe(null);
   });
 });
@@ -309,5 +311,39 @@ describe('keepVersionsDays', () => {
 
   test('offers off and four lengths', () => {
     expect(VERSION_CHOICES).toEqual([0, 7, 30, 90, 365]);
+  });
+});
+
+describe('versionsAtRisk', () => {
+  // 23 September 2026, local time; the window of 7 days starts on the 16th.
+  const today = new Date(2026, 8, 23, 15, 30);
+
+  test('is null for a destination that holds no day', () => {
+    expect(versionsAtRisk([], 0, today)).toBeNull();
+    expect(versionsAtRisk([], 7, today)).toBeNull();
+  });
+
+  test('is off when versions are off and the destination holds days', () => {
+    expect(versionsAtRisk(['2026-09-22'], 0, today)).toBe('off');
+    expect(versionsAtRisk(['2026-09-22', '2026-09-21'], 0, today)).toBe('off');
+  });
+
+  test('is fewer when a day falls out of the window', () => {
+    // Newest first, as list_snapshots gives them.
+    expect(versionsAtRisk(['2026-09-22', '2026-09-15'], 7, today)).toBe('fewer');
+    expect(versionsAtRisk(['2025-09-23', '2026-09-22'], 30, today)).toBe('fewer');
+  });
+
+  test('is null when every day is inside the window', () => {
+    expect(versionsAtRisk(['2026-09-22', '2026-09-16'], 7, today)).toBeNull();
+    expect(versionsAtRisk(['2026-09-22', '2025-09-23'], 365, today)).toBeNull();
+  });
+
+  test('never counts the newest day, which retention always keeps', () => {
+    expect(versionsAtRisk(['2026-01-01'], 7, today)).toBeNull();
+  });
+
+  test('counts from the newest day when the clock reads earlier, as a run does', () => {
+    expect(versionsAtRisk(['2026-12-01', '2026-09-20'], 7, today)).toBe('fewer');
   });
 });

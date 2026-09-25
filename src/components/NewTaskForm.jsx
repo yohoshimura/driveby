@@ -15,6 +15,7 @@ import {
   taskDestinations,
   taskSources,
   usesSubfolders,
+  versionsAtRisk,
   VERSION_CHOICES,
 } from '../lib/task';
 import {
@@ -202,26 +203,6 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       const key = foreign.kind === 'source' ? 'form.error.dest_holds_source' : 'form.error.dest_foreign';
       return showToast?.(t(key, { name: foreign.name, path: foreign.path }), 'error');
     }
-    // Fewer days, or none, deletes versions at the next run. Asked here,
-    // while it is still a choice: the run itself asks nobody.
-    const before = keepVersionsDays(initialTask);
-    const after = task.keepVersionsDays;
-    if (isEdit && before > 0 && after < before && confirm) {
-      const ok = await confirm(after === 0
-        ? {
-            title: t('form.versions.off_confirm.title'),
-            body: t('form.versions.off_confirm.body'),
-            confirmLabel: t('form.versions.off_confirm.action'),
-            danger: true,
-          }
-        : {
-            title: t('form.versions.fewer_confirm.title'),
-            body: t('form.versions.fewer_confirm.body', { n: after, count: after }),
-            confirmLabel: t('form.versions.fewer_confirm.action'),
-            danger: true,
-          });
-      if (!ok) return;
-    }
     // Folder names are stored trimmed, the way both sides read them, so
     // tasks.json says what the run will write.
     const named = { ...task, sources: task.sources.map((s) => ({ ...s, folder: s.folder.trim() })) };
@@ -232,6 +213,41 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     const resolved = named.destinations.length > 0
       ? named
       : { ...named, destinations: defaultDestination ? [defaultDestination] : [] };
+    // Fewer days, or none, deletes versions at the next run. Asked here,
+    // while it is still a choice: the run itself asks nobody. Asked of the
+    // days the destinations hold as well as of this task's own setting: a new
+    // or re-created task pointed at a destination that already keeps days
+    // deletes them just the same. A destination that is not plugged in lists
+    // nothing, so a setting that went down still asks on its own.
+    if (confirm) {
+      const before = keepVersionsDays(initialTask);
+      const after = task.keepVersionsDays;
+      let risk = isEdit && before > 0 && after < before ? (after === 0 ? 'off' : 'fewer') : null;
+      if (!risk) {
+        const listed = await Promise.all(
+          resolved.destinations.map((d) => bridge.listSnapshots(d).catch(() => [])),
+        );
+        risk = listed
+          .map((days) => versionsAtRisk((days ?? []).map((day) => day?.name), after))
+          .find(Boolean) ?? null;
+      }
+      if (risk) {
+        const ok = await confirm(risk === 'off'
+          ? {
+              title: t('form.versions.off_confirm.title'),
+              body: t('form.versions.off_confirm.body'),
+              confirmLabel: t('form.versions.off_confirm.action'),
+              danger: true,
+            }
+          : {
+              title: t('form.versions.fewer_confirm.title'),
+              body: t('form.versions.fewer_confirm.body', { n: after, count: after }),
+              confirmLabel: t('form.versions.fewer_confirm.action'),
+              danger: true,
+            });
+        if (!ok) return;
+      }
+    }
     if (isEdit) {
       onSave(resolved);
       return;
