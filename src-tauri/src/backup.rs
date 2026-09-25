@@ -1,14 +1,14 @@
 use crate::fsutil::{
-    apply_attrs, available_space, blocking, clear_readonly, finish_copy, long_path,
-    mirror_dir_attrs, path_contains, read_attrs, reject_overlap, scratch_path,
-    CASE_INSENSITIVE_FS,
+    apply_attrs, available_space, blocking, clear_readonly, finish_copy, finish_scratch,
+    hard_link_supported, long_path, mirror_dir_attrs, path_contains, read_attrs, reject_overlap,
+    remove_link_safe, replace_link_safe, scratch_path, CASE_INSENSITIVE_FS,
 };
 use crate::glob;
 use crate::persist;
 use crate::ratelimit;
 use crate::snapshot;
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use dashmap::DashMap;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -340,6 +340,18 @@ pub struct DestinationOutcome {
     pub needed_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
+    /// With daily versions: the day this run wrote, committed or updated in
+    /// place. None for a mirror, and for a run stopped before its day was
+    /// committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// The task keeps versions, but this drive cannot make hard links, so it
+    /// was backed up as a plain mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions_unavailable: Option<bool>,
+    /// How many of the oldest days were deleted to make room for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_snapshots: Option<u32>,
 }
 
 impl DestinationOutcome {
@@ -360,6 +372,9 @@ impl DestinationOutcome {
             unreadable: None,
             needed_bytes: None,
             available_bytes: None,
+            snapshot: None,
+            versions_unavailable: None,
+            evicted_snapshots: None,
         }
     }
 
@@ -610,6 +625,12 @@ struct RunCtx<'a, R: Runtime> {
     backup_id: &'a str,
     task_id: &'a str,
     target: &'a Path,
+    /// The destination root. Progress events name it even when `target` is a
+    /// day's folder inside it: the root is what the user picked.
+    destination: &'a Path,
+    /// The run writes a day: replacing and deleting must leave alone the
+    /// attributes of files shared with earlier days (`fsutil::replace_link_safe`).
+    link_safe: bool,
     settings: &'a Settings,
     token: &'a CancellationToken,
     started: Instant,
@@ -655,7 +676,7 @@ impl<R: Runtime> RunCtx<'_, R> {
                 speed_bps: 0,
                 eta_seconds,
                 phase,
-                destination: self.target.to_string_lossy().to_string(),
+                destination: self.destination.to_string_lossy().to_string(),
                 dest_index: self.dest_index,
                 dest_count: self.dest_count,
             },
@@ -707,7 +728,7 @@ impl<R: Runtime> RunCtx<'_, R> {
                 speed_bps: speed,
                 eta_seconds: eta,
                 phase,
-                destination: self.target.to_string_lossy().to_string(),
+                destination: self.destination.to_string_lossy().to_string(),
                 dest_index: self.dest_index,
                 dest_count: self.dest_count,
             },
@@ -1489,12 +1510,19 @@ async fn copy_one<R: Runtime>(
         return FileOutcome::Unchanged;
     }
 
-    let result = copy_with_retries(&file.path, &dest_path, abort, ctx.settings, &mut |delta| {
-        live.on_delta(delta);
-        if delta > 0 {
-            ctx.maybe_emit(live, "copying");
-        }
-    })
+    let result = copy_with_retries(
+        &file.path,
+        &dest_path,
+        abort,
+        ctx.settings,
+        ctx.link_safe,
+        &mut |delta| {
+            live.on_delta(delta);
+            if delta > 0 {
+                ctx.maybe_emit(live, "copying");
+            }
+        },
+    )
     .await;
 
     match result {
@@ -1584,7 +1612,9 @@ async fn prune_phase<R: Runtime>(
     stats: &mut PhaseStats,
 ) -> Result<()> {
     ctx.emit_phase("pruning", stats.copied_bytes, stats.copied_files, None);
-    if let Err(e) = prune_destination(ctx.target, keep, protected, ctx.token, stats).await {
+    let pruned =
+        prune_destination(ctx.target, keep, protected, ctx.token, stats, ctx.link_safe).await;
+    if let Err(e) = pruned {
         ctx.check_cancelled()?;
         warn!("prune destination failed: {}", e);
     }
@@ -1652,8 +1682,15 @@ async fn verify_icons_phase<R: Runtime>(
             if let Some(parent) = dest_path.parent() {
                 let _ = fs::create_dir_all(long_path(parent)).await;
             }
-            match copy_with_retries(&f.path, &dest_path, ctx.token, ctx.settings, &mut |_| {})
-                .await
+            match copy_with_retries(
+                &f.path,
+                &dest_path,
+                ctx.token,
+                ctx.settings,
+                ctx.link_safe,
+                &mut |_| {},
+            )
+            .await
             {
                 Ok(_) => stats.icon_resyncs += 1,
                 Err(e) => warn!("icon descriptor resync of {} failed: {}", f.rel, e),
@@ -1807,6 +1844,9 @@ async fn execute_all<R: Runtime>(
 
     let dest_count = destinations.len() as u32;
     let mut outcomes: Vec<DestinationOutcome> = Vec::with_capacity(destinations.len());
+    // One "today" for the whole run, so two destinations written either side
+    // of midnight keep the same day.
+    let clock = snapshot::clock_today();
     for (index, destination) in destinations.iter().enumerate() {
         // Stopping mid-run leaves the destinations we never reached marked
         // cancelled rather than silently absent from the report.
@@ -1838,6 +1878,7 @@ async fn execute_all<R: Runtime>(
             &protected,
             &keep,
             settings,
+            clock,
             token,
         )
         .await;
@@ -1862,7 +1903,8 @@ async fn execute_all<R: Runtime>(
     Ok(fold_outcomes(backup_id, task, started, outcomes))
 }
 
-/// Mirror the walked source into one destination.
+/// Mirror the walked source into one destination — into its root, or with
+/// daily versions into the day's folder (`snapshot.rs`).
 #[allow(clippy::too_many_arguments)]
 async fn execute_one<R: Runtime>(
     app: &AppHandle<R>,
@@ -1875,16 +1917,45 @@ async fn execute_one<R: Runtime>(
     protected: &ProtectedSet<'_>,
     keep: &KeepSet,
     settings: &Settings,
+    clock: NaiveDate,
     token: &CancellationToken,
 ) -> Result<DestinationOutcome> {
+    let started = Instant::now();
+    let sources = task.sources();
+
+    // Where this run writes. With versions off, a destination that still
+    // holds daily versions becomes a mirror again first: a mirror prune would
+    // otherwise delete every day as an orphan. A copy 1.7.6 left one level
+    // down is put back while the root is still a mirror, so the mirror is
+    // whole before anything else happens to it.
+    let plan = match task.keep_versions_days() {
+        None => {
+            snapshot::leave(destination, token).await?;
+            put_nested_copy_back(destination, &sources, walked).await;
+            snapshot::Plan::Mirror { versions_unavailable: false }
+        }
+        Some(days) => {
+            if snapshot::read_marker(destination).await?.is_none() {
+                put_nested_copy_back(destination, &sources, walked).await;
+            }
+            let probe = destination.to_path_buf();
+            let can_link = blocking(move || hard_link_supported(&probe)).await;
+            snapshot::prepare(destination, days, clock, can_link, token).await?
+        }
+    };
+    let target = plan.target(destination).to_path_buf();
+    let versions = matches!(plan, snapshot::Plan::Snapshot { .. });
+
     let ctx = RunCtx {
         app,
         backup_id,
         task_id: &task.id,
-        target: destination,
+        target: &target,
+        destination,
+        link_safe: versions,
         settings,
         token,
-        started: Instant::now(),
+        started,
         total_bytes: walked.total_bytes,
         total_files: walked.files.len() as u64,
         dest_index,
@@ -1892,40 +1963,36 @@ async fn execute_one<R: Runtime>(
     };
     let mut stats = PhaseStats::default();
 
-    // Before the copy compares anything: a single source whose backup 1.7.6
-    // wrote one level down gets it back where this layout keeps it, so the
-    // run finds its files in place instead of copying all of them again.
-    let sources = task.sources();
-    if let Some(nested) = find_nested_copy(destination, &sources, walked).await {
-        let moved = move_nested_copy_up(destination, &nested).await;
-        info!(
-            dest = %destination.display(),
-            "moved {} entries back up from the per-source folder {}", moved, nested.folder
-        );
-    }
-
-    // After the move, so a backup that is merely one level down is not
-    // counted as a full copy to make; before the copy, so a destination that
-    // cannot take it is refused with nothing written, instead of filling up
-    // hours in and failing with half a copy. Checked per destination, just
-    // before its turn: an earlier destination on the same volume has used
-    // its share by then.
-    if let Some(short) = room_check(
-        destination,
-        &walked.files,
-        settings.parallel_copies(),
-        true,
-        token,
-    )
-    .await?
-    {
+    // After the move and the clone, so a backup that is merely one level down,
+    // or already in yesterday's version, is not counted as a full copy to make.
+    // Before the copy, so a destination that cannot take it is refused with
+    // nothing written, instead of filling up hours in and failing with half a
+    // copy. Checked per destination, just before its turn: an earlier
+    // destination on the same volume has used its share by then. With
+    // versions, the oldest days make room first.
+    let parallel = settings.parallel_copies();
+    let (evicted, short) = if versions {
+        let probe = target.clone();
+        fit_by_evicting(destination, &target, &walked.files, parallel, token, || {
+            let probe = probe.clone();
+            async move { blocking(move || available_space(&probe)).await }
+        })
+        .await?
+    } else {
+        (0, room_check(destination, &walked.files, parallel, true, token).await?)
+    };
+    let evicted_snapshots = (evicted > 0).then_some(evicted);
+    if let Some(short) = short {
         warn!(
             dest = %destination.display(),
             "not enough space: {} needed, {} free — nothing copied",
             gigabytes(short.needed),
             gigabytes(short.available)
         );
-        return Ok(DestinationOutcome::no_space(destination, short));
+        return Ok(DestinationOutcome {
+            evicted_snapshots,
+            ..DestinationOutcome::no_space(destination, short)
+        });
     }
 
     let hashes = copy_phase(&ctx, &walked.files, &mut stats).await?;
@@ -1955,6 +2022,17 @@ async fn execute_one<R: Runtime>(
         warn!("file error: {}", e);
     }
 
+    // A run stopped after its last checkpoint still gets here. It leaves
+    // `.driveby-in-progress` for the next run rather than naming a day it did
+    // not finish.
+    let snapshot_day = match &plan {
+        snapshot::Plan::Snapshot { day, .. } if !token.is_cancelled() => {
+            snapshot::commit(destination, &plan).await?;
+            Some(day.clone())
+        }
+        _ => None,
+    };
+
     Ok(DestinationOutcome {
         path: destination.to_string_lossy().to_string(),
         status: if stats.failed == 0 {
@@ -1978,7 +2056,24 @@ async fn execute_one<R: Runtime>(
         unreadable: Some(walked.unreadable.len() as u64),
         needed_bytes: None,
         available_bytes: None,
+        snapshot: snapshot_day,
+        versions_unavailable: matches!(plan, snapshot::Plan::Mirror { versions_unavailable: true })
+            .then_some(true),
+        evicted_snapshots,
     })
+}
+
+/// A single source's backup 1.7.6 wrote one level down, moved back up to
+/// where the flat layout keeps it — before the copy compares anything, so the
+/// run finds its files in place instead of copying all of them again.
+async fn put_nested_copy_back(destination: &Path, sources: &[Source], walked: &WalkResult) {
+    if let Some(nested) = find_nested_copy(destination, sources, walked).await {
+        let moved = move_nested_copy_up(destination, &nested).await;
+        info!(
+            dest = %destination.display(),
+            "moved {} entries back up from the per-source folder {}", moved, nested.folder
+        );
+    }
 }
 
 /// Fold the per-destination outcomes into the run-level payload the toast,
@@ -2252,6 +2347,7 @@ async fn prune_destination(
     protected: &ProtectedSet<'_>,
     token: &CancellationToken,
     stats: &mut PhaseStats,
+    link_safe: bool,
 ) -> Result<()> {
     // The entry-by-entry guard below can never match the root's own empty
     // relative path, which is what once made prune wipe whole destinations.
@@ -2335,8 +2431,15 @@ async fn prune_destination(
                         // source file that has since been deleted would
                         // otherwise be un-prunable forever.
                         let outgoing = path.clone();
-                        blocking(move || clear_readonly(&outgoing)).await;
-                        if fs::remove_file(&path).await.is_ok() {
+                        let removed = if link_safe {
+                            // Today's link only. Clearing +R first would clear
+                            // it on every earlier day sharing the file.
+                            blocking(move || remove_link_safe(&outgoing)).await.is_ok()
+                        } else {
+                            blocking(move || clear_readonly(&outgoing)).await;
+                            fs::remove_file(&path).await.is_ok()
+                        };
+                        if removed {
                             stats.deleted += 1;
                         }
                     }
@@ -2826,13 +2929,14 @@ async fn copy_with_retries<F: FnMut(i64)>(
     dest: &Path,
     token: &CancellationToken,
     settings: &Settings,
+    link_safe: bool,
     on_progress: &mut F,
 ) -> Result<u64> {
     let mut attempts = 0;
     let max = 3;
     loop {
         attempts += 1;
-        let res = copy_file(src, dest, token, settings, on_progress).await;
+        let res = copy_file(src, dest, token, settings, link_safe, on_progress).await;
         match res {
             Ok(hash) => return Ok(hash),
             Err(e) => {
@@ -2858,6 +2962,7 @@ async fn copy_file<F: FnMut(i64)>(
     dest: &Path,
     token: &CancellationToken,
     settings: &Settings,
+    link_safe: bool,
     on_progress: &mut F,
 ) -> Result<u64> {
     let src_l = long_path(src);
@@ -2946,10 +3051,21 @@ async fn copy_file<F: FnMut(i64)>(
         .preserve_mtime()
         .then(|| src_meta.modified().ok())
         .flatten();
-    finish_copy(src.to_path_buf(), tmp, dest_l.clone(), mtime).await;
-    fs::rename(&tmp_l, &dest_l)
-        .await
-        .context("commit destination")?;
+    if link_safe {
+        // With daily versions the file being replaced is usually a hard link
+        // shared with earlier days, and on Windows its ReadOnly bit is theirs
+        // too: leave it, and replace with the rename that does not need it gone.
+        finish_scratch(src.to_path_buf(), tmp, mtime).await;
+        let (from, to) = (tmp_l.clone(), dest_l.clone());
+        blocking(move || replace_link_safe(&from, &to))
+            .await
+            .context("commit destination")?;
+    } else {
+        finish_copy(src.to_path_buf(), tmp, dest_l.clone(), mtime).await;
+        fs::rename(&tmp_l, &dest_l)
+            .await
+            .context("commit destination")?;
+    }
     Ok(hasher.digest())
 }
 
@@ -3036,6 +3152,20 @@ mod tests {
         settings: &Settings,
         token: &CancellationToken,
     ) -> Result<DestinationOutcome> {
+        let today = crate::snapshot::clock_today();
+        run_one_destination_on(app, backup_id, task, dest, settings, token, today).await
+    }
+
+    /// `run_one_destination` on a given day, for the daily-versions tests.
+    async fn run_one_destination_on<R: Runtime>(
+        app: &AppHandle<R>,
+        backup_id: &str,
+        task: &Task,
+        dest: &Path,
+        settings: &Settings,
+        token: &CancellationToken,
+        day: NaiveDate,
+    ) -> Result<DestinationOutcome> {
         let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
         let sources = preflight_sources(task)?;
         let folders = destination_folders(&sources);
@@ -3053,6 +3183,7 @@ mod tests {
             &protected,
             &keep,
             settings,
+            day,
             token,
         )
         .await
@@ -3468,6 +3599,9 @@ mod tests {
             unreadable: Some(5),
             needed_bytes: None,
             available_bytes: None,
+            snapshot: None,
+            versions_unavailable: None,
+            evicted_snapshots: None,
         };
         let task = task_with("fold", Path::new("C:/src"), &[]);
 
@@ -4189,6 +4323,7 @@ mod tests {
             &ProtectedSet::from_parts(&excluded, &unreadable, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4232,6 +4367,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4270,6 +4406,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4308,6 +4445,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4346,6 +4484,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4380,7 +4519,7 @@ mod tests {
 
         let token = CancellationToken::new();
         let settings = Settings::default();
-        copy_with_retries(&src, &dest, &token, &settings, &mut |_| {})
+        copy_with_retries(&src, &dest, &token, &settings, false, &mut |_| {})
             .await
             .expect("read-only destination must be overwritable");
 
@@ -4662,6 +4801,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &empty, &glob::PatternSet::new(&[])),
             &CancellationToken::new(),
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -4855,6 +4995,7 @@ mod tests {
             &ProtectedSet::from_parts(&empty, &unreadable, &glob::PatternSet::new(&[])),
             &token,
             &mut stats,
+            false,
         )
         .await
         .unwrap();
@@ -5364,5 +5505,251 @@ mod tests {
         assert_eq!(evicted, 1);
         assert_eq!(short, Some(Shortfall { needed: 8192, available: 100 }));
         assert!(dest.join("2026-09-22").exists(), "the newest day is never given up");
+    }
+
+    fn keeping(task: Task, days: u32) -> Task {
+        Task { keep_versions_days: Some(days), ..task }
+    }
+
+    async fn run_on_day(
+        task: &Task,
+        dest: &Path,
+        day: &str,
+        token: &CancellationToken,
+    ) -> Result<DestinationOutcome> {
+        let app = tauri::test::mock_app();
+        let day = crate::snapshot::parse_day(day).unwrap();
+        run_one_destination_on(
+            app.handle(),
+            "versions",
+            task,
+            dest,
+            &Settings::default(),
+            token,
+            day,
+        )
+        .await
+    }
+
+    fn go() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    #[tokio::test]
+    async fn the_first_run_with_versions_makes_the_mirror_its_first_day_without_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let task = task_with("v-first", &source, &dests);
+        run_on_day(&task, dest, "2026-09-20", &go()).await.unwrap();
+
+        let outcome = run_on_day(&keeping(task, 30), dest, "2026-09-21", &go()).await.unwrap();
+
+        assert_eq!(outcome.snapshot.as_deref(), Some("2026-09-21"));
+        assert_eq!(outcome.unchanged, Some(2), "the mirror was moved in, not copied again");
+        assert_eq!(std::fs::read(dest.join("2026-09-21/sub/b.txt")).unwrap(), b"beta");
+        assert!(!dest.join("a.txt").exists());
+        assert!(dest.join(crate::snapshot::MARKER).exists());
+    }
+
+    #[tokio::test]
+    async fn the_next_day_keeps_yesterday_as_it_was() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        std::fs::write(source.join("same.txt"), b"same").unwrap();
+        let task = keeping(task_with("v-next", &source, &dests), 30);
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+
+        std::fs::write(source.join("a.txt"), b"alpha, edited").unwrap();
+        std::fs::remove_file(source.join("sub/b.txt")).unwrap();
+        let outcome = run_on_day(&task, dest, "2026-09-22", &go()).await.unwrap();
+
+        let (day1, day2) = (dest.join("2026-09-21"), dest.join("2026-09-22"));
+        assert_eq!(outcome.snapshot.as_deref(), Some("2026-09-22"));
+        assert_eq!(std::fs::read(day2.join("a.txt")).unwrap(), b"alpha, edited");
+        assert_eq!(std::fs::read(day1.join("a.txt")).unwrap(), b"alpha");
+        assert!(!day2.join("sub/b.txt").exists());
+        assert_eq!(std::fs::read(day1.join("sub/b.txt")).unwrap(), b"beta");
+        assert!(
+            crate::fsutil::same_file(&day1.join("same.txt"), &day2.join("same.txt")),
+            "an unchanged file costs no room"
+        );
+        assert!(!dest.join(crate::snapshot::IN_PROGRESS).exists());
+    }
+
+    #[tokio::test]
+    async fn a_later_run_the_same_day_updates_that_day() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let task = keeping(task_with("v-same-day", &source, &dests), 30);
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+
+        std::fs::write(source.join("a.txt"), b"alpha, again").unwrap();
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+
+        assert_eq!(std::fs::read(dest.join("2026-09-21/a.txt")).unwrap(), b"alpha, again");
+        assert_eq!(crate::snapshot::list(dest).await.unwrap().len(), 1);
+    }
+
+    /// Stopped once the walk is done, as the clone starts — the long part on a
+    /// large backup. A token cancelled before the walk would stop the walk
+    /// itself and never reach the destination, which is not what this is about.
+    #[tokio::test]
+    async fn a_stopped_run_names_no_day_and_the_next_run_finishes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let task = keeping(task_with("v-stop", &source, &dests), 30);
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha, edited").unwrap();
+
+        let app = tauri::test::mock_app();
+        let settings = Settings::default();
+        let patterns = glob::PatternSet::from_input(&settings.exclude_patterns);
+        let sources = preflight_sources(&task).unwrap();
+        let mut walked = walk_all(&sources, &patterns, &go()).await.unwrap();
+        let protected = ProtectedSet::new(&walked, &patterns, &destination_folders(&sources));
+        let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
+        let stopped = go();
+        stopped.cancel();
+        let day = crate::snapshot::parse_day("2026-09-22").unwrap();
+        let result = execute_one(
+            app.handle(),
+            "versions",
+            &task,
+            dest,
+            0,
+            1,
+            &mut walked,
+            &protected,
+            &keep,
+            &settings,
+            day,
+            &stopped,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!dest.join("2026-09-22").exists(), "a stopped run names no day");
+        assert!(dest.join(crate::snapshot::IN_PROGRESS).exists());
+
+        let outcome = run_on_day(&task, dest, "2026-09-23", &go()).await.unwrap();
+        assert_eq!(outcome.snapshot.as_deref(), Some("2026-09-23"));
+        assert_eq!(std::fs::read(dest.join("2026-09-23/a.txt")).unwrap(), b"alpha, edited");
+        assert!(!dest.join(crate::snapshot::IN_PROGRESS).exists());
+    }
+
+    /// A source whose drive is unplugged today is carried into today's
+    /// version from yesterday's, as the mirror leaves its folder alone.
+    #[tokio::test]
+    async fn a_source_missing_today_keeps_yesterdays_copy_in_todays_version() {
+        let root = tempfile::tempdir().unwrap();
+        let (here, gone, dest) =
+            (root.path().join("here"), root.path().join("gone"), root.path().join("dest"));
+        for (dir, file) in [(&here, "h.txt"), (&gone, "g.txt")] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        std::fs::create_dir_all(&dest).unwrap();
+        let task = Task {
+            source: None,
+            sources: Some(vec![
+                Source { path: here.to_string_lossy().into(), folder: "Here".into() },
+                Source { path: gone.to_string_lossy().into(), folder: "Gone".into() },
+            ]),
+            ..keeping(task_with("v-missing", &here, &[dest.clone()]), 30)
+        };
+        run_on_day(&task, &dest, "2026-09-21", &go()).await.unwrap();
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        run_on_day(&task, &dest, "2026-09-22", &go()).await.unwrap();
+
+        assert_eq!(std::fs::read(dest.join("2026-09-22/Gone/g.txt")).unwrap(), b"x");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_today_keeps_yesterdays_version() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        std::fs::write(source.join("vm.bin"), b"yesterday").unwrap();
+        let task = keeping(task_with("v-locked", &source, &dests), 30);
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+
+        std::fs::write(source.join("vm.bin"), b"today, and locked").unwrap();
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(source.join("vm.bin"))
+            .unwrap();
+        let outcome = run_on_day(&task, dest, "2026-09-22", &go()).await.unwrap();
+
+        assert_eq!(outcome.failed, Some(1), "the staged failure has to have happened");
+        assert_eq!(std::fs::read(dest.join("2026-09-22/vm.bin")).unwrap(), b"yesterday");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_readonly_file_keeps_its_bit_in_yesterdays_version() {
+        use crate::fsutil::read_attrs;
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        for name in ["edited.txt", "deleted.txt"] {
+            std::fs::write(source.join(name), b"v1").unwrap();
+            apply_attrs(&source.join(name), 0x1);
+        }
+        let task = keeping(task_with("v-readonly", &source, &dests), 30);
+        run_on_day(&task, dest, "2026-09-21", &go()).await.unwrap();
+
+        clear_readonly(&source.join("edited.txt"));
+        std::fs::write(source.join("edited.txt"), b"version two").unwrap();
+        apply_attrs(&source.join("edited.txt"), 0x1);
+        clear_readonly(&source.join("deleted.txt"));
+        std::fs::remove_file(source.join("deleted.txt")).unwrap();
+        let outcome = run_on_day(&task, dest, "2026-09-22", &go()).await.unwrap();
+
+        let day1 = dest.join("2026-09-21");
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(std::fs::read(dest.join("2026-09-22/edited.txt")).unwrap(), b"version two");
+        assert_eq!(std::fs::read(day1.join("edited.txt")).unwrap(), b"v1");
+        assert!(!dest.join("2026-09-22/deleted.txt").exists());
+        for name in ["edited.txt", "deleted.txt"] {
+            assert_ne!(read_attrs(&day1.join(name)).unwrap() & 0x1, 0, "{name} lost its +R");
+        }
+        for path in [
+            day1.join("edited.txt"),
+            day1.join("deleted.txt"),
+            dest.join("2026-09-22/edited.txt"),
+            source.join("edited.txt"),
+        ] {
+            clear_readonly(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn turning_versions_off_makes_the_newest_day_the_backup_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let task = task_with("v-off", &source, &dests);
+        run_on_day(&keeping(task.clone(), 30), dest, "2026-09-21", &go()).await.unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha, edited").unwrap();
+        run_on_day(&keeping(task.clone(), 30), dest, "2026-09-22", &go()).await.unwrap();
+
+        let outcome = run_on_day(&task, dest, "2026-09-23", &go()).await.unwrap();
+
+        assert_eq!(outcome.snapshot, None);
+        assert_eq!(outcome.unchanged, Some(2), "the newest day came up by renaming");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha, edited");
+        let mut names: Vec<String> = std::fs::read_dir(dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "sub"]);
     }
 }
