@@ -34,6 +34,51 @@ pub(crate) fn is_reserved_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(MARKER) || name.eq_ignore_ascii_case(IN_PROGRESS)
 }
 
+/// Root entries that belong to the operating system, not to the backup:
+/// Windows' restore points and recycle bins, ext4's `lost+found`, macOS's
+/// trash, search index, event log and version store. At the root of a whole
+/// drive they sit beside the backup, and the process may not rename them —
+/// a first move that tried would fail the destination on every run. So they
+/// stay where they are, and are never part of a day.
+const SYSTEM_ENTRIES: [&str; 9] = [
+    "System Volume Information",
+    "$RECYCLE.BIN",
+    "RECYCLER",
+    "lost+found",
+    ".Trashes",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
+];
+
+/// One of `SYSTEM_ENTRIES`, whatever the case, or a Linux per-user trash
+/// (`.Trash-1000`).
+fn is_system_entry(name: &str) -> bool {
+    SYSTEM_ENTRIES.iter().any(|s| s.eq_ignore_ascii_case(name))
+        || starts_with_ignore_case(name, ".Trash-")
+}
+
+/// Files a file manager writes into a folder it shows: its icon, its view
+/// settings, its thumbnails. Browsing the days puts them at the destination
+/// root, so one there says nothing about the backup, and a day's own copy is
+/// the source's, which the mirror copies again.
+const FOLDER_CLUTTER: [&str; 3] = ["desktop.ini", ".DS_Store", "Thumbs.db"];
+
+fn is_folder_clutter(name: &str) -> bool {
+    FOLDER_CLUTTER.iter().any(|s| s.eq_ignore_ascii_case(name))
+}
+
+/// What the first move leaves at the root: Driveby's own folder, the
+/// operating system's entries and folder clutter.
+fn stays_at_root(name: &str) -> bool {
+    name.eq_ignore_ascii_case(IN_PROGRESS) || is_system_entry(name) || is_folder_clutter(name)
+}
+
+fn starts_with_ignore_case(name: &str, prefix: &str) -> bool {
+    name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct Marker {
     pub(crate) version: u32,
@@ -364,9 +409,9 @@ pub(crate) struct Moved {
     pub(crate) blocked: Vec<String>,
 }
 
-/// Rename every entry of `from` into `into`, except the names in `skip`
-/// (compared without case). Renames only, on one volume: instant, no room
-/// needed, nothing deleted.
+/// Rename every entry of `from` into `into`, except the names `skip` answers
+/// true for. Renames only, on one volume: instant, no room needed, nothing
+/// deleted.
 ///
 /// A name already taken in `into` is left where it is and reported. That is
 /// asked again right before each rename, because `fs::rename` replaces an
@@ -376,13 +421,13 @@ pub(crate) struct Moved {
 pub(crate) async fn move_entries(
     from: &Path,
     into: &Path,
-    skip: &[&str],
+    skip: impl Fn(&str) -> bool,
 ) -> Result<Moved> {
     let mut report = Moved::default();
     // Listed before anything moves: renaming out of a directory while its
     // listing is still being read can skip entries.
     for name in entry_names(from).await {
-        if skip.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+        if skip(&name) {
             continue;
         }
         let to = into.join(&name);
@@ -463,7 +508,7 @@ pub(crate) async fn prepare(
         fs::create_dir_all(long_path(&in_progress))
             .await
             .with_context(|| format!("create {}", in_progress.display()))?;
-        let moved = move_entries(destination, &in_progress, &[IN_PROGRESS, "desktop.ini"]).await?;
+        let moved = move_entries(destination, &in_progress, stays_at_root).await?;
         // The marker says the root holds nothing but days. Written over a root
         // the move did not empty — a name already taken in the first day, a
         // listing cut short — it would strand mirror entries where nothing
@@ -533,7 +578,7 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
     let in_progress = destination.join(IN_PROGRESS);
     let Some(mut marker) = read_marker(destination).await? else {
         if folder_state(&in_progress).await? {
-            come_up(destination, &in_progress).await?;
+            come_up(destination, &in_progress, token).await?;
         }
         return Ok(());
     };
@@ -576,7 +621,7 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
             .with_context(|| format!("set the version of {} aside", leaving))?;
     }
     if folder_state(&in_progress).await? {
-        come_up(destination, &in_progress).await?;
+        come_up(destination, &in_progress, token).await?;
     }
     info!(
         dest = %destination.display(),
@@ -587,16 +632,15 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
 }
 
 /// Move `from`'s entries up to `destination`, then remove the emptied folder.
-async fn come_up(destination: &Path, from: &Path) -> Result<()> {
-    let moved = move_entries(from, destination, &[]).await?;
+async fn come_up(destination: &Path, from: &Path, token: &CancellationToken) -> Result<()> {
+    let moved = move_entries(from, destination, |_| false).await?;
     for name in &moved.blocked {
-        // The destination root's own folder icon stays. A snapshot's
-        // `desktop.ini` is the source's, which the mirror copies again anyway.
-        if name.eq_ignore_ascii_case("desktop.ini") {
-            let copy = from.join(name);
-            blocking(move || remove_link_safe(&copy))
-                .await
-                .with_context(|| format!("remove {}", from.join(name).display()))?;
+        // The root's own folder clutter stays (its icon, its view settings):
+        // the day's copy is the source's, which the mirror copies again. So do
+        // the system's own folders, which a day only holds when its source was
+        // a whole drive.
+        if is_folder_clutter(name) || is_system_entry(name) {
+            drop_entry(&from.join(name), token).await?;
             continue;
         }
         return Err(anyhow!(
@@ -616,11 +660,22 @@ async fn come_up(destination: &Path, from: &Path) -> Result<()> {
     .with_context(|| format!("remove {}", from.display()))
 }
 
+/// Remove one entry of a day: a folder as a whole tree, a file as one link.
+async fn drop_entry(path: &Path, token: &CancellationToken) -> Result<()> {
+    if folder_state(path).await? {
+        return remove_tree(path, token).await;
+    }
+    let copy = path.to_path_buf();
+    blocking(move || remove_link_safe(&copy))
+        .await
+        .with_context(|| format!("remove {}", path.display()))
+}
+
 /// What the first move left at the destination root, besides what may stay
-/// there: the in-progress folder, the root's own `desktop.ini`, and the
-/// scratch files of an interrupted marker write or link probe. Symlinks are
-/// left alone by the move, and here too. Unlike `backup::entry_names`, a
-/// listing error is an error: "could not tell" must not read as "empty".
+/// there: what `stays_at_root` names, and the scratch files of an
+/// interrupted marker write or link probe. Symlinks are left alone by the
+/// move, and here too. Unlike `backup::entry_names`, a listing error is an
+/// error: "could not tell" must not read as "empty".
 async fn leftovers_at_root(destination: &Path) -> Result<Vec<String>> {
     let root = long_path(destination);
     let mut entries = fs::read_dir(&root)
@@ -637,8 +692,7 @@ async fn leftovers_at_root(destination: &Path) -> Result<Vec<String>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let stays = name.eq_ignore_ascii_case(IN_PROGRESS)
-            || name.eq_ignore_ascii_case("desktop.ini")
+        let stays = stays_at_root(&name)
             || name.starts_with(".driveby-link-probe")
             || (name.starts_with(".driveby-snapshots.") && name.ends_with(".tmp"));
         if !stays {
@@ -798,6 +852,92 @@ mod tests {
     fn untouched(outside: &Path) {
         assert_eq!(names_at(outside), ["keep.txt"], "something was written through the link");
         assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"outside");
+    }
+
+    /// At the root of a whole drive, the operating system's own folders sit
+    /// beside the backup, and the process may not rename them. The first move
+    /// leaves them where they are, and so it does a file manager's clutter.
+    #[tokio::test]
+    async fn the_first_move_leaves_the_system_s_own_folders_at_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(
+            dest,
+            &[
+                ("System Volume Information/x", "x"),
+                ("$RECYCLE.BIN/y", "y"),
+                ("a.txt", "a"),
+                (".DS_Store", "root"),
+            ],
+        );
+        std::fs::create_dir(dest.join("lost+found")).unwrap();
+
+        let plan = prepare(dest, 30, d("2026-09-21"), true, &go()).await.unwrap();
+
+        assert_eq!(plan, in_progress_on(dest, "2026-09-21"));
+        assert_eq!(names_at(&dest.join(IN_PROGRESS)), ["a.txt"]);
+        assert_eq!(std::fs::read(dest.join("System Volume Information/x")).unwrap(), b"x");
+        assert_eq!(std::fs::read(dest.join("$RECYCLE.BIN/y")).unwrap(), b"y");
+        assert!(names_at(&dest.join("lost+found")).is_empty());
+        assert_eq!(std::fs::read(dest.join(".DS_Store")).unwrap(), b"root");
+        assert!(read_marker(dest).await.unwrap().is_some());
+    }
+
+    /// Browsing the days puts a file manager's clutter at the root. Turning
+    /// off keeps the root's and drops the day's, which is the source's and
+    /// comes back with the mirror; a system folder only a whole-drive source
+    /// brought into the day goes the same way, as a whole tree.
+    #[tokio::test]
+    async fn turning_off_keeps_the_root_s_own_clutter_and_system_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(
+            &dest.join("2026-09-22"),
+            &[
+                ("a.txt", "a"),
+                (".DS_Store", "day"),
+                ("Thumbs.db", "day"),
+                ("$RECYCLE.BIN/S-1/day.txt", "day"),
+            ],
+        );
+        tree(
+            dest,
+            &[(".DS_Store", "root"), ("Thumbs.db", "root"), ("$RECYCLE.BIN/root.txt", "root")],
+        );
+        mark(dest).await;
+
+        leave(dest, &go()).await.unwrap();
+
+        assert_eq!(names_at(dest), ["$RECYCLE.BIN", ".DS_Store", "Thumbs.db", "a.txt"]);
+        assert_eq!(std::fs::read(dest.join(".DS_Store")).unwrap(), b"root");
+        assert_eq!(std::fs::read(dest.join("Thumbs.db")).unwrap(), b"root");
+        assert_eq!(names_at(&dest.join("$RECYCLE.BIN")), ["root.txt"]);
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    #[test]
+    fn the_system_s_own_root_entries_and_folder_clutter_are_known_whatever_the_case() {
+        for name in [
+            "System Volume Information",
+            "$Recycle.Bin",
+            "RECYCLER",
+            "lost+found",
+            ".Trashes",
+            ".Spotlight-V100",
+            ".fseventsd",
+            ".TemporaryItems",
+            ".DocumentRevisions-V100",
+            ".Trash-1000",
+        ] {
+            assert!(is_system_entry(name), "{name}");
+        }
+        for name in ["Photos", "lost+found (copy)", ".Trash", "System", "desktop.ini"] {
+            assert!(!is_system_entry(name), "{name}");
+        }
+        for name in ["desktop.ini", "Desktop.INI", ".DS_Store", "thumbs.db"] {
+            assert!(is_folder_clutter(name), "{name}");
+        }
+        assert!(!is_folder_clutter("Thumbs.db.bak"));
     }
 
     /// A link named `.driveby-in-progress` beside a marker and a day: turning
@@ -1424,7 +1564,7 @@ mod tests {
         tree(root, &[("clash", "root copy")]);
         std::fs::create_dir_all(into.join("clash")).unwrap();
 
-        let moved = move_entries(root, &into, &[IN_PROGRESS, "desktop.ini"]).await.unwrap();
+        let moved = move_entries(root, &into, stays_at_root).await.unwrap();
 
         assert_eq!(moved.moved, 2);
         assert_eq!(moved.blocked, ["clash"]);
