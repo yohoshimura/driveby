@@ -49,7 +49,7 @@ impl RestoreState {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePayload {
     pub backup_path: String,
@@ -163,6 +163,12 @@ async fn restore<R: Runtime>(
     // not, even though it is reachable from the UI in two clicks (History →
     // Restore → pick the backup folder as the destination).
     reject_overlap(&backup_path, &destination)?;
+
+    // A backup with daily versions holds one whole backup per day; restoring
+    // its root would pour every day into one folder. The UI asks which day.
+    if crate::snapshot::read_marker(&backup_path).await?.is_some() {
+        return Err(anyhow!("This backup keeps daily versions; choose a day to restore"));
+    }
 
     let mut tree = walk(&backup_path).await?;
     let files = &tree.files;
@@ -439,6 +445,28 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_root_of_a_backup_with_daily_versions_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(backup.join("2026-09-21")).unwrap();
+        std::fs::write(backup.join("2026-09-21/a.txt"), b"a").unwrap();
+        std::fs::write(backup.join(crate::snapshot::MARKER), b"{}").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let app = tauri::test::mock_app();
+
+        let err = restore(app.handle(), &CancellationToken::new(), backup.clone(), dest.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("choose a day"), "{err}");
+
+        restore(app.handle(), &CancellationToken::new(), backup.join("2026-09-21"), dest.clone())
+            .await
+            .unwrap();
+        assert!(dest.join("a.txt").exists(), "a day restores like any backup");
+    }
 
     /// The backup's directory structure has to come back whole. An empty
     /// folder has no file to bring it into being, so `create_dir_all` on each

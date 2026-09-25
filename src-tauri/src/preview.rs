@@ -17,6 +17,7 @@ use crate::backup::{
 };
 use crate::fsutil::{available_space, blocking, long_path};
 use crate::glob;
+use crate::snapshot;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,10 @@ pub struct DestinationPreview {
     /// What the volume has free for this process, or none when it would not
     /// say — in which case the run does not check either.
     pub available_bytes: Option<u64>,
+    /// The task keeps daily versions: what the run leaves out of today's
+    /// version stays in the earlier days, so it is not a deletion to warn
+    /// about.
+    pub versions: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -159,6 +164,8 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     let protected = ProtectedSet::new(&walked, &patterns, &folders);
     let keep = KeepSet::new(walked.files.iter().map(|f| f.rel.clone()));
 
+    let clock = snapshot::clock_today();
+
     let mut previews = Vec::with_capacity(destinations.len());
     for destination in &destinations {
         check_cancelled(token)?;
@@ -174,23 +181,35 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
             });
             continue;
         }
+        // The tree the run would start from: with daily versions, today's day
+        // or the newest one, which today's is cloned from. The preview moves
+        // and clones nothing, so it looks there instead.
+        let versions = task.keep_versions_days().is_some();
+        let base = snapshot::preview_base(destination, versions, clock).await?;
         // The run moves a copy 1.7.6 left one level down back up before it
         // compares anything. The preview does not move it — a dry run that
         // renames is not dry — but counts as if it had, or it would show
-        // that whole copy as deleted and every file as new.
-        let nested = find_nested_copy(destination, &sources, &walked).await;
-        previews.push(
-            plan_one(
-                destination,
-                &walked,
-                &keep,
-                &protected,
-                nested.as_ref(),
-                settings.parallel_copies(),
-                token,
-            )
-            .await?,
-        );
+        // that whole copy as deleted and every file as new. Only a mirror
+        // root can hold one.
+        let nested = if base == *destination {
+            find_nested_copy(destination, &sources, &walked).await
+        } else {
+            None
+        };
+        let mut preview = plan_one(
+            &base,
+            &walked,
+            &keep,
+            &protected,
+            nested.as_ref(),
+            settings.parallel_copies(),
+            !versions,
+            token,
+        )
+        .await?;
+        preview.path = destination.to_string_lossy().to_string();
+        preview.versions = versions;
+        previews.push(preview);
     }
 
     info!(task = %task.name, "previewed {} destination(s)", previews.len());
@@ -210,6 +229,7 @@ async fn plan_one(
     protected: &ProtectedSet<'_>,
     nested: Option<&NestedCopy>,
     parallel: usize,
+    credit_replaced: bool,
     token: &CancellationToken,
 ) -> Result<DestinationPreview> {
     // New, modified or unchanged: the same question `copy_one` asks before
@@ -222,7 +242,8 @@ async fn plan_one(
     // nothing the user could observe — counting it as "modified" on every
     // single preview would be noise standing in front of the numbers that
     // matter.
-    let writes = plan_writes(destination, &walked.files, nested, parallel, true, token).await?;
+    let writes =
+        plan_writes(destination, &walked.files, nested, parallel, credit_replaced, token).await?;
     let probe = destination.to_path_buf();
     let mut preview = DestinationPreview {
         path: destination.to_string_lossy().to_string(),
@@ -601,6 +622,36 @@ mod tests {
         assert_eq!((d.deleted_files, d.deleted_bytes), (1, 16), "only the leftover goes");
         assert!(nested.join("same.txt").exists(), "the preview moved nothing");
         assert!(!dest.join("same.txt").exists());
+    }
+
+    /// With daily versions the run starts from the newest day, so that is
+    /// what the preview compares against. A file gone from the source is not
+    /// in today's version, but it is not deleted.
+    #[tokio::test]
+    async fn a_preview_with_versions_counts_against_the_newest_day() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        let day = dest.join("2026-09-21");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(dest.join(crate::snapshot::MARKER), b"{}").unwrap();
+        std::fs::write(source.join("same.txt"), b"identical").unwrap();
+        std::fs::copy(source.join("same.txt"), day.join("same.txt")).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(source.join("same.txt")).unwrap(),
+        );
+        filetime::set_file_mtime(day.join("same.txt"), mtime).unwrap();
+        std::fs::write(source.join("new.txt"), b"brand new").unwrap();
+        std::fs::write(day.join("old.txt"), b"gone from source").unwrap();
+        let task = Task { keep_versions_days: Some(30), ..task_for(&source, &[&dest]) };
+
+        let payload = plan(&task, &Settings::default(), &CancellationToken::new()).await.unwrap();
+
+        let d = &payload.destinations[0];
+        assert!(d.versions);
+        assert_eq!(d.path, dest.to_string_lossy());
+        assert_eq!((d.unchanged_files, d.new_files, d.deleted_files), (1, 1, 1));
     }
 
     /// The dialog has to be able to say a destination lacks the room before

@@ -246,6 +246,15 @@ async fn cancel_restore(state: tauri::State<'_, RestoreState>) -> Result<(), Str
     Ok(())
 }
 
+/// The days a destination with daily versions can be restored from, newest
+/// first — empty for a plain mirror, whose root is the backup.
+#[tauri::command]
+async fn list_snapshots(destination: String) -> Result<Vec<snapshot::DayInfo>, String> {
+    snapshot::restorable_days(std::path::Path::new(&destination))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Show a desktop notification. On Windows and Linux its `actions` become
 /// buttons that Rust acts on when clicked; on macOS they are dropped (see
 /// notification.rs).
@@ -372,6 +381,7 @@ fn main() {
         cancel_backup,
         restore_backup,
         cancel_restore,
+        list_snapshots,
         reveal_logs_folder,
         notify,
         appearance::system_accent,

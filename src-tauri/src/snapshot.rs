@@ -600,6 +600,60 @@ pub(crate) async fn commit(destination: &Path, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// The tree a run would start from, for the preview. The preview writes
+/// nothing, so it cannot move or clone anything; it looks where the run would
+/// find the files instead: today's day, else the newest one (today's is
+/// cloned from it), else the snapshot a turning-off is bringing up, else
+/// `.driveby-in-progress`. A mirror, or a destination whose versions are
+/// about to begin, is its own root.
+pub(crate) async fn preview_base(
+    destination: &Path,
+    versions: bool,
+    clock: NaiveDate,
+) -> Result<PathBuf> {
+    let Some(marker) = read_marker(destination).await? else {
+        return Ok(destination.to_path_buf());
+    };
+    let snapshots = list(destination).await?;
+    if versions {
+        let today = destination.join(day_name(effective_day(clock, &snapshots)));
+        if is_dir(&today).await {
+            return Ok(today);
+        }
+    }
+    if let Some(leaving) = marker.leaving {
+        return Ok(destination.join(leaving));
+    }
+    let in_progress = destination.join(IN_PROGRESS);
+    Ok(match snapshots.last() {
+        Some(newest) => newest.path.clone(),
+        None if is_dir(&in_progress).await => in_progress,
+        None => destination.to_path_buf(),
+    })
+}
+
+/// One day a destination can be restored from.
+#[derive(Serialize, Debug, PartialEq)]
+pub(crate) struct DayInfo {
+    pub(crate) name: String,
+    pub(crate) path: String,
+}
+
+/// The days a destination with daily versions can be restored from, newest
+/// first; none for a mirror, whose root is the backup. The path is built
+/// here so the frontend never joins paths.
+pub(crate) async fn restorable_days(destination: &Path) -> Result<Vec<DayInfo>> {
+    if read_marker(destination).await?.is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(list(destination)
+        .await?
+        .into_iter()
+        .rev()
+        .map(|s| DayInfo { name: s.name(), path: s.path.to_string_lossy().to_string() })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +1007,44 @@ mod tests {
         assert!(is_reserved_name(".DriveBy-In-Progress"));
         assert!(!is_reserved_name("driveby-snapshots"));
         assert!(!is_reserved_name("Photos"));
+    }
+
+    #[tokio::test]
+    async fn the_days_to_restore_are_the_committed_ones_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        for day in ["2026-09-21", "2026-09-23"] {
+            tree(&dest.join(day), &[("a.txt", "a")]);
+        }
+        tree(&dest.join(IN_PROGRESS), &[("a.txt", "a")]);
+        mark(dest).await;
+
+        let days = restorable_days(dest).await.unwrap();
+
+        let names: Vec<&str> = days.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["2026-09-23", "2026-09-21"]);
+        assert_eq!(days[0].path, dest.join("2026-09-23").to_string_lossy());
+
+        let mirror = tempfile::tempdir().unwrap();
+        tree(&mirror.path().join("2026-09-21"), &[("a.txt", "a")]);
+        assert!(restorable_days(mirror.path()).await.unwrap().is_empty(), "a mirror has no days");
+    }
+
+    #[tokio::test]
+    async fn the_preview_looks_where_the_run_will_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        assert_eq!(preview_base(dest, true, d("2026-09-23")).await.unwrap(), dest);
+
+        tree(&dest.join("2026-09-21"), &[("a.txt", "a")]);
+        mark(dest).await;
+        let newest = dest.join("2026-09-21");
+        assert_eq!(preview_base(dest, true, d("2026-09-23")).await.unwrap(), newest);
+        assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), newest);
+
+        tree(&dest.join("2026-09-23"), &[("a.txt", "a")]);
+        let today = dest.join("2026-09-23");
+        assert_eq!(preview_base(dest, true, d("2026-09-23")).await.unwrap(), today);
     }
 
     #[tokio::test]
