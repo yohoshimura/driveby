@@ -81,6 +81,25 @@ pub(crate) async fn remove_marker(destination: &Path) -> Result<()> {
     }
 }
 
+/// The folder a turning-off is bringing up, as the marker names it:
+/// `.driveby-in-progress` or a day, and nothing else. The marker is a file
+/// anyone can edit, and `leave` renames what it names into the destination
+/// and brings its contents up to the root, where the mirror prune deletes
+/// what the source does not have: an absolute path, or `..`, would reach
+/// outside the destination.
+fn leaving_of(destination: &Path, marker: &Marker) -> Result<Option<String>> {
+    match marker.leaving.as_deref() {
+        None => Ok(None),
+        Some(name) if name == IN_PROGRESS || parse_day(name).is_some() => {
+            Ok(Some(name.to_string()))
+        }
+        Some(_) => Err(anyhow!(
+            "The versions marker at {} names a folder Driveby did not make; nothing was changed",
+            destination.join(MARKER).display()
+        )),
+    }
+}
+
 /// A committed snapshot: a folder at the destination root named for its day.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Snapshot {
@@ -128,8 +147,27 @@ pub(crate) async fn list(destination: &Path) -> Result<Vec<Snapshot>> {
     Ok(snapshots)
 }
 
-pub(crate) async fn is_dir(path: &Path) -> bool {
-    fs::metadata(long_path(path)).await.is_ok_and(|m| m.is_dir())
+/// What is at `path`, the link itself rather than what it points to:
+/// `Ok(true)` for a folder, `Ok(false)` for nothing there — or a file, which
+/// is no folder of Driveby's either.
+///
+/// A symlink or a junction is an error. One named like a day or
+/// `.driveby-in-progress` would have Driveby write, move and delete through
+/// it, in a folder that can be anywhere. So is a path that cannot be looked
+/// at: answering "not there" would, say, remove the marker while a day is
+/// still in it.
+pub(crate) async fn folder_state(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(long_path(path)).await {
+        // std reports a Windows junction as a symlink too.
+        Ok(meta) if meta.file_type().is_symlink() => Err(link_refused(path)),
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("look at {}", path.display())),
+    }
+}
+
+fn link_refused(path: &Path) -> anyhow::Error {
+    anyhow!("{} is a link, not a folder Driveby made; nothing was changed", path.display())
 }
 
 /// Today's local date — or, in a debug build, `DRIVEBY_TODAY` (YYYY-MM-DD),
@@ -177,7 +215,9 @@ pub(crate) fn evictable(snapshots: &[Snapshot]) -> Vec<Snapshot> {
 /// Files go through `remove_link_safe`: prune's clear-then-delete would strip
 /// `+R` from every snapshot sharing the file. A symlink is removed as a link
 /// and never followed. Directories are never shared, so their own `+R` (a
-/// custom folder icon) is cleared before they go, deepest first.
+/// custom folder icon) is cleared before they go, deepest first. A `root`
+/// that is itself a link is refused: listing it would list the folder it
+/// points to.
 ///
 /// One hop onto the blocking pool for the whole tree: a snapshot is as large
 /// as the backup, and a hop per file would cost more than the work.
@@ -186,8 +226,13 @@ pub(crate) async fn remove_tree(root: &Path, token: &CancellationToken) -> Resul
     blocking(move || remove_tree_sync(&root, &token)).await
 }
 
-fn remove_tree_sync(root: &Path, token: &CancellationToken) -> Result<()> {
-    let root = long_path(root);
+fn remove_tree_sync(root_path: &Path, token: &CancellationToken) -> Result<()> {
+    let root = long_path(root_path);
+    let meta = std::fs::symlink_metadata(&root)
+        .with_context(|| format!("remove {}", root_path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(link_refused(root_path));
+    }
     let mut dirs = vec![root.clone()];
     let mut stack = vec![root];
     while let Some(dir) = stack.pop() {
@@ -386,11 +431,17 @@ pub(crate) async fn prepare(
     token: &CancellationToken,
 ) -> Result<Plan> {
     let mut marker = read_marker(destination).await?;
+    let in_progress = destination.join(IN_PROGRESS);
+    // Before anything moves: a link there would take the first day, or
+    // today's clone, wherever it points.
+    folder_state(&in_progress).await?;
     // Turned off, then on again before turning off had finished: the user
     // confirmed deleting those versions, so that is finished first.
-    if marker.as_ref().is_some_and(|m| m.leaving.is_some()) {
-        leave(destination, token).await?;
-        marker = None;
+    if let Some(m) = &marker {
+        if leaving_of(destination, m)?.is_some() {
+            leave(destination, token).await?;
+            marker = None;
+        }
     }
     if !can_link {
         if marker.is_some() {
@@ -405,12 +456,13 @@ pub(crate) async fn prepare(
         return Ok(Plan::Mirror { versions_unavailable: true });
     }
 
-    let in_progress = destination.join(IN_PROGRESS);
     if marker.is_none() {
         // The first run with versions: the mirror at the root becomes the
         // first snapshot, by renaming. The marker goes last, so a move that
         // stops half-way is simply carried on by the next run.
-        fs::create_dir_all(long_path(&in_progress)).await?;
+        fs::create_dir_all(long_path(&in_progress))
+            .await
+            .with_context(|| format!("create {}", in_progress.display()))?;
         let moved = move_entries(destination, &in_progress, &[IN_PROGRESS, "desktop.ini"]).await?;
         // The marker says the root holds nothing but days. Written over a root
         // the move did not empty — a name already taken in the first day, a
@@ -434,20 +486,25 @@ pub(crate) async fn prepare(
     let snapshots = list(destination).await?;
     let day = effective_day(clock, &snapshots);
     let name = day_name(day);
+    let today = destination.join(&name);
+    // Asked before retention deletes anything: a link named like today would
+    // have the run write through it.
+    let today_there = folder_state(&today).await?;
     for old in expired(&snapshots, day, keep_days) {
         info!(dest = %destination.display(), "deleting the version of {}", old.name());
         remove_tree(&old.path, token).await?;
     }
-    let today = destination.join(&name);
-    if is_dir(&today).await {
+    if today_there {
         // A later run on the same day updates that day in place, and a
         // `.driveby-in-progress` beside it can only be a leftover.
-        if is_dir(&in_progress).await {
+        if folder_state(&in_progress).await? {
             remove_tree(&in_progress, token).await?;
         }
         return Ok(Plan::Snapshot { target: today, day: name, in_progress: false });
     }
-    fs::create_dir_all(long_path(&in_progress)).await?;
+    fs::create_dir_all(long_path(&in_progress))
+        .await
+        .with_context(|| format!("create {}", in_progress.display()))?;
     // Retention never deletes the newest, so it is still there to clone.
     if let Some(newest) = snapshots.last() {
         let cloned = clone_tree(&newest.path, &in_progress, token).await?;
@@ -475,17 +532,20 @@ pub(crate) async fn prepare(
 pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Result<()> {
     let in_progress = destination.join(IN_PROGRESS);
     let Some(mut marker) = read_marker(destination).await? else {
-        if is_dir(&in_progress).await {
+        if folder_state(&in_progress).await? {
             come_up(destination, &in_progress).await?;
         }
         return Ok(());
     };
-    let leaving = match marker.leaving.clone() {
+    // Both refused before anything is deleted or moved.
+    let leaving = leaving_of(destination, &marker)?;
+    let in_progress_there = folder_state(&in_progress).await?;
+    let leaving = match leaving {
         Some(name) => name,
         None => {
             let name = match list(destination).await?.last() {
                 Some(newest) => newest.name(),
-                None if is_dir(&in_progress).await => IN_PROGRESS.to_string(),
+                None if in_progress_there => IN_PROGRESS.to_string(),
                 None => return remove_marker(destination).await,
             };
             marker.leaving = Some(name.clone());
@@ -499,7 +559,7 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
                 remove_tree(&snapshot.path, token).await?;
             }
         }
-        if leaving != IN_PROGRESS && is_dir(&in_progress).await {
+        if leaving != IN_PROGRESS && folder_state(&in_progress).await? {
             remove_tree(&in_progress, token).await?;
         }
         marker.cleared = true;
@@ -510,12 +570,12 @@ pub(crate) async fn leave(destination: &Path, token: &CancellationToken) -> Resu
     // day's own folder at the root and block turning off for ever, and no
     // source can bring the reserved name. A resumed run finds it already there.
     let day = destination.join(&leaving);
-    if leaving != IN_PROGRESS && is_dir(&day).await {
+    if leaving != IN_PROGRESS && folder_state(&day).await? {
         fs::rename(long_path(&day), long_path(&in_progress))
             .await
             .with_context(|| format!("set the version of {} aside", leaving))?;
     }
-    if is_dir(&in_progress).await {
+    if folder_state(&in_progress).await? {
         come_up(destination, &in_progress).await?;
     }
     info!(
@@ -619,12 +679,12 @@ pub(crate) async fn preview_base(
     // name, or already set aside under `.driveby-in-progress` by `leave`, or
     // already back at the root. The day list is not consulted here: a source
     // folder named like a date may already have come up to the root.
-    if let Some(leaving) = marker.leaving {
+    let in_progress = destination.join(IN_PROGRESS);
+    if let Some(leaving) = leaving_of(destination, &marker)? {
         let day = destination.join(&leaving);
-        let in_progress = destination.join(IN_PROGRESS);
-        return Ok(if is_dir(&day).await {
+        return Ok(if folder_state(&day).await? {
             day
-        } else if is_dir(&in_progress).await {
+        } else if folder_state(&in_progress).await? {
             in_progress
         } else {
             destination.to_path_buf()
@@ -633,14 +693,13 @@ pub(crate) async fn preview_base(
     let snapshots = list(destination).await?;
     if versions {
         let today = destination.join(day_name(effective_day(clock, &snapshots)));
-        if is_dir(&today).await {
+        if folder_state(&today).await? {
             return Ok(today);
         }
     }
-    let in_progress = destination.join(IN_PROGRESS);
     Ok(match snapshots.last() {
         Some(newest) => newest.path.clone(),
-        None if is_dir(&in_progress).await => in_progress,
+        None if folder_state(&in_progress).await? => in_progress,
         None => destination.to_path_buf(),
     })
 }
@@ -656,9 +715,10 @@ pub(crate) struct DayInfo {
 /// first; none for a mirror, whose root is the backup. The path is built
 /// here so the frontend never joins paths.
 pub(crate) async fn restorable_days(destination: &Path) -> Result<Vec<DayInfo>> {
-    if read_marker(destination).await?.is_none() {
+    let Some(marker) = read_marker(destination).await? else {
         return Ok(Vec::new());
-    }
+    };
+    leaving_of(destination, &marker)?;
     Ok(list(destination)
         .await?
         .into_iter()
@@ -709,6 +769,136 @@ mod tests {
 
     fn in_progress_on(dest: &Path, day: &str) -> Plan {
         Plan::Snapshot { target: dest.join(IN_PROGRESS), day: day.into(), in_progress: true }
+    }
+
+    /// A link at `link` to the folder `target`: a junction on Windows, which
+    /// needs no privilege, a symlink elsewhere.
+    fn link_to(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink /J failed: {made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// A folder beside the destination, holding one file no step may touch.
+    fn outside(root: &Path) -> PathBuf {
+        let outside = root.join("outside");
+        tree(&outside, &[("keep.txt", "outside")]);
+        outside
+    }
+
+    fn untouched(outside: &Path) {
+        assert_eq!(names_at(outside), ["keep.txt"], "something was written through the link");
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"outside");
+    }
+
+    /// A link named `.driveby-in-progress` beside a marker and a day: turning
+    /// off would delete it as a leftover, and empty the folder it points to.
+    #[tokio::test]
+    async fn turning_off_refuses_a_link_named_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, outside) = (dir.path().join("dest"), outside(dir.path()));
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        mark(&dest).await;
+        link_to(&outside, &dest.join(IN_PROGRESS));
+
+        let err = leave(&dest, &go()).await.unwrap_err();
+
+        assert!(err.to_string().contains("is a link"), "{err}");
+        untouched(&outside);
+        assert!(dest.join("2026-09-22/a.txt").exists());
+    }
+
+    /// Versions off and no marker: the link would come up as an interrupted
+    /// first move, bringing what it points to into a root the mirror prunes.
+    #[tokio::test]
+    async fn a_mirror_run_refuses_a_link_named_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, outside) = (dir.path().join("dest"), outside(dir.path()));
+        tree(&dest, &[("a.txt", "a")]);
+        link_to(&outside, &dest.join(IN_PROGRESS));
+
+        assert!(leave(&dest, &go()).await.is_err());
+
+        untouched(&outside);
+        assert!(!dest.join("keep.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_run_with_versions_refuses_a_link_named_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, outside) = (dir.path().join("dest"), outside(dir.path()));
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        mark(&dest).await;
+        link_to(&outside, &dest.join(IN_PROGRESS));
+
+        assert!(prepare(&dest, 30, d("2026-09-23"), true, &go()).await.is_err());
+        untouched(&outside);
+
+        // No marker yet: the first move would move the mirror into it.
+        let first = dir.path().join("first");
+        tree(&first, &[("a.txt", "a")]);
+        link_to(&outside, &first.join(IN_PROGRESS));
+        assert!(prepare(&first, 30, d("2026-09-23"), true, &go()).await.is_err());
+        untouched(&outside);
+        assert!(first.join("a.txt").exists());
+        assert_eq!(read_marker(&first).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_link_named_like_today_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, outside) = (dir.path().join("dest"), outside(dir.path()));
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        mark(&dest).await;
+        link_to(&outside, &dest.join("2026-09-23"));
+
+        assert!(prepare(&dest, 30, d("2026-09-23"), true, &go()).await.is_err());
+
+        untouched(&outside);
+    }
+
+    #[tokio::test]
+    async fn remove_tree_refuses_a_root_that_is_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = outside(dir.path());
+        let link = dir.path().join("2026-09-01");
+        link_to(&outside, &link);
+
+        assert!(remove_tree(&link, &go()).await.is_err());
+
+        untouched(&outside);
+    }
+
+    /// The marker is a file anyone can edit. A `leaving` that names neither a
+    /// day nor `.driveby-in-progress` is refused, never renamed in: what it
+    /// names would come up to a root the mirror prunes.
+    #[tokio::test]
+    async fn a_marker_naming_a_folder_outside_the_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dest, outside) = (dir.path().join("dest"), outside(dir.path()));
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        for leaving in [outside.to_string_lossy().to_string(), "../outside".to_string()] {
+            let marker = Marker { leaving: Some(leaving.clone()), ..Marker::default() };
+            write_marker(&dest, &marker).await.unwrap();
+
+            assert!(preview_base(&dest, false, d("2026-09-23")).await.is_err(), "{leaving}");
+            assert!(restorable_days(&dest).await.is_err(), "{leaving}");
+            assert!(prepare(&dest, 30, d("2026-09-23"), true, &go()).await.is_err(), "{leaving}");
+            let err = leave(&dest, &go()).await.unwrap_err();
+
+            assert!(err.to_string().contains("did not make"), "{err}");
+            untouched(&outside);
+            assert_eq!(names_at(&dest), [MARKER, "2026-09-22"], "{leaving}");
+        }
     }
 
     #[tokio::test]
@@ -1301,11 +1491,7 @@ mod tests {
         std::fs::create_dir_all(&tree_root).unwrap();
         let junction = tree_root.join("junction");
 
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), outside.to_str().unwrap()])
-            .status()
-            .expect("mklink command failed");
-        assert!(status.success(), "junction creation failed");
+        link_to(&outside, &junction);
 
         remove_tree(&tree_root, &go()).await.unwrap();
 
@@ -1327,11 +1513,7 @@ mod tests {
         std::fs::create_dir_all(&from).unwrap();
         let junction = from.join("junction");
 
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J", junction.to_str().unwrap(), outside.to_str().unwrap()])
-            .status()
-            .expect("mklink command failed");
-        assert!(status.success(), "junction creation failed");
+        link_to(&outside, &junction);
 
         let into = dir.path().join("into");
         clone_tree(&from, &into, &go()).await.unwrap();
