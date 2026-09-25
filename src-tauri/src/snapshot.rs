@@ -602,10 +602,11 @@ pub(crate) async fn commit(destination: &Path, plan: &Plan) -> Result<()> {
 
 /// The tree a run would start from, for the preview. The preview writes
 /// nothing, so it cannot move or clone anything; it looks where the run would
-/// find the files instead: today's day, else the newest one (today's is
-/// cloned from it), else the snapshot a turning-off is bringing up, else
-/// `.driveby-in-progress`. A mirror, or a destination whose versions are
-/// about to begin, is its own root.
+/// find the files instead: the snapshot a turning-off is bringing up (decided
+/// first, when the marker has `leaving` set), then today's day, else the
+/// newest one (today's is cloned from it), else `.driveby-in-progress`, else
+/// the root. A mirror, or a destination whose versions are about to begin, is
+/// its own root.
 pub(crate) async fn preview_base(
     destination: &Path,
     versions: bool,
@@ -614,15 +615,27 @@ pub(crate) async fn preview_base(
     let Some(marker) = read_marker(destination).await? else {
         return Ok(destination.to_path_buf());
     };
+    // Turning off: the day coming up is where the run starts — under its own
+    // name, or already set aside under `.driveby-in-progress` by `leave`, or
+    // already back at the root. The day list is not consulted here: a source
+    // folder named like a date may already have come up to the root.
+    if let Some(leaving) = marker.leaving {
+        let day = destination.join(&leaving);
+        let in_progress = destination.join(IN_PROGRESS);
+        return Ok(if is_dir(&day).await {
+            day
+        } else if is_dir(&in_progress).await {
+            in_progress
+        } else {
+            destination.to_path_buf()
+        });
+    }
     let snapshots = list(destination).await?;
     if versions {
         let today = destination.join(day_name(effective_day(clock, &snapshots)));
         if is_dir(&today).await {
             return Ok(today);
         }
-    }
-    if let Some(leaving) = marker.leaving {
-        return Ok(destination.join(leaving));
     }
     let in_progress = destination.join(IN_PROGRESS);
     Ok(match snapshots.last() {
@@ -1045,6 +1058,34 @@ mod tests {
         tree(&dest.join("2026-09-23"), &[("a.txt", "a")]);
         let today = dest.join("2026-09-23");
         assert_eq!(preview_base(dest, true, d("2026-09-23")).await.unwrap(), today);
+    }
+
+    /// Mid turn-off, the preview follows the day coming up wherever `leave`
+    /// has put it, and never mistakes a source folder named like a date that
+    /// already came up for a day.
+    #[tokio::test]
+    async fn the_preview_follows_a_turning_off_wherever_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let marker =
+            Marker { leaving: Some("2026-09-22".into()), cleared: true, ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+        tree(dest, &[("2030-01-01/inside.txt", "a source folder that came up")]);
+
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        assert_eq!(
+            preview_base(dest, false, d("2026-09-23")).await.unwrap(),
+            dest.join("2026-09-22")
+        );
+
+        std::fs::rename(dest.join("2026-09-22"), dest.join(IN_PROGRESS)).unwrap();
+        assert_eq!(
+            preview_base(dest, false, d("2026-09-23")).await.unwrap(),
+            dest.join(IN_PROGRESS)
+        );
+
+        std::fs::remove_dir_all(dest.join(IN_PROGRESS)).unwrap();
+        assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), dest);
     }
 
     #[tokio::test]
