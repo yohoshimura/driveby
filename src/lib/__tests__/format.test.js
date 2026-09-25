@@ -29,6 +29,12 @@ describe('makeFormatters (fr)', () => {
   test('a timestamp that is not a date renders as nothing', () => {
     expect(fr.formatTime('not a date')).toBe('');
   });
+
+  test('a day of daily versions reads with its weekday', () => {
+    expect(fr.formatDay('2026-09-23')).toBe('mer. 23/09/2026');
+    expect(makeFormatters('en').formatDay('2026-09-23')).toBe('Wed 23/09/2026');
+    expect(fr.formatDay('not a day')).toBe('not a day');
+  });
 });
 
 describe('makeFormatters (en)', () => {

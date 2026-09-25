@@ -9,11 +9,13 @@ import {
   findForeignOverlap,
   findOverlap,
   folderNameError,
+  keepVersionsDays,
   pathContains,
   sourceFolderName,
   taskDestinations,
   taskSources,
   usesSubfolders,
+  VERSION_CHOICES,
 } from '../lib/task';
 import {
   DEFAULT_SCHEDULE_TIME,
@@ -29,9 +31,10 @@ const INITIAL = {
   schedule: 'manual',
   scheduleDays: [],
   scheduleTime: DEFAULT_SCHEDULE_TIME,
+  keepVersionsDays: 0,
 };
 
-export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, initialTask, dataState, otherTasks = [] }) {
+export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestination, showToast, confirm, initialTask, dataState, otherTasks = [] }) {
   const t = useT();
   const { formatTime, formatWeekdays } = useFormat();
   const isEdit = !!initialTask;
@@ -44,6 +47,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           schedule: initialTask.schedule || 'manual',
           scheduleDays: normalizeDays(initialTask.scheduleDays),
           scheduleTime: initialTask.scheduleTime || DEFAULT_SCHEDULE_TIME,
+          keepVersionsDays: keepVersionsDays(initialTask),
         }
       : INITIAL
   );
@@ -147,7 +151,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     ? nextOccurrence(task.scheduleDays, task.scheduleTime)
     : null;
 
-  const submit = () => {
+  const submit = async () => {
     if (!task.name.trim()) return showToast?.(t('form.error.name'), 'error');
     if (task.sources.length === 0) return showToast?.(t('form.error.source'), 'error');
     // A custom schedule that cannot fire would leave a task looking
@@ -197,6 +201,26 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     if (foreign) {
       const key = foreign.kind === 'source' ? 'form.error.dest_holds_source' : 'form.error.dest_foreign';
       return showToast?.(t(key, { name: foreign.name, path: foreign.path }), 'error');
+    }
+    // Fewer days, or none, deletes versions at the next run. Asked here,
+    // while it is still a choice: the run itself asks nobody.
+    const before = keepVersionsDays(initialTask);
+    const after = task.keepVersionsDays;
+    if (isEdit && before > 0 && after < before && confirm) {
+      const ok = await confirm(after === 0
+        ? {
+            title: t('form.versions.off_confirm.title'),
+            body: t('form.versions.off_confirm.body'),
+            confirmLabel: t('form.versions.off_confirm.action'),
+            danger: true,
+          }
+        : {
+            title: t('form.versions.fewer_confirm.title'),
+            body: t('form.versions.fewer_confirm.body', { n: after, count: after }),
+            confirmLabel: t('form.versions.fewer_confirm.action'),
+            danger: true,
+          });
+      if (!ok) return;
     }
     // Folder names are stored trimmed, the way both sides read them, so
     // tasks.json says what the run will write.
@@ -409,6 +433,24 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           </div>
         </FormField>
       )}
+
+      <FormField label={t('form.label.versions')} hint={t('form.hint.versions')}>
+        <select
+          className="field"
+          value={task.keepVersionsDays}
+          onChange={(e) => setTask({ ...task, keepVersionsDays: Number(e.target.value) })}
+        >
+          {VERSION_CHOICES.map((days) => (
+            <option key={days} value={days}>
+              {days === 0
+                ? t('form.versions.off')
+                : days === 365
+                  ? t('form.versions.year')
+                  : t('form.versions.days', { n: days, count: days })}
+            </option>
+          ))}
+        </select>
+      </FormField>
 
       <div className="card__actions">
         <Button onClick={onCancel}>{t('common.cancel')}</Button>

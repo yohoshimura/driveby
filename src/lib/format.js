@@ -67,6 +67,15 @@ export function makeFormatters(lang) {
     return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} - ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
 
+  // A day of daily versions ("YYYY-MM-DD", a folder name) as the restore
+  // dialog lists it: the weekday first, since "the version from three days
+  // ago" is how the day is remembered, then the date as formatTime writes one.
+  const formatDay = (dayKey) => {
+    const [y, m, d] = String(dayKey).split('-').map(Number);
+    if (!y || !m || !d) return String(dayKey);
+    return `${weekdayShort.format(new Date(y, m - 1, d))} ${pad(d)}/${pad(m)}/${y}`;
+  };
+
   // dayKey is "YYYY-MM-DD". Parse the parts ourselves so the label can't
   // shift a day across timezones the way `new Date('YYYY-MM-DD')` (UTC
   // midnight) can.
@@ -102,6 +111,7 @@ export function makeFormatters(lang) {
     formatBytes,
     formatDuration,
     formatTime,
+    formatDay,
     formatDayLabel,
     formatNumber,
     formatWeekdays,

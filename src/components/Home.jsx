@@ -12,7 +12,7 @@ import { useT } from '../hooks/useT';
 export default function Home() {
   const {
     tasks, settings,
-    startBackup, cancelBackup, addTask, editTask, deleteTask, showToast, destinationStatus,
+    startBackup, cancelBackup, addTask, editTask, deleteTask, showToast, destinationStatus, confirm,
   } = useApp();
   const { activeBackups } = useProgress();
   const t = useT();
@@ -73,6 +73,7 @@ export default function Home() {
           onCancel={closeForm}
           defaultDestination={settings.defaultDestination}
           showToast={showToast}
+          confirm={confirm}
         />
       )}
 

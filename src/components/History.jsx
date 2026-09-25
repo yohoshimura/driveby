@@ -174,7 +174,7 @@ export default function History({ focus = null, onFocusHandled }) {
                           <Button
                             size="small"
                             variant="borderless"
-                            onClick={() => restoreBackup(dest.path)}
+                            onClick={() => restoreBackup(dest.path, dest.snapshot)}
                             disabled={!!activeRestore}
                           >
                             {t('common.restore')}
@@ -226,6 +226,16 @@ export default function History({ focus = null, onFocusHandled }) {
                       {t('history.unreadable', { n: entry.unreadable, count: entry.unreadable })}
                     </div>
                   )}
+                  {destinations.filter((d) => d.versionsUnavailable).map((d, i) => (
+                    <div key={`nv-${i}`} className="history-path" style={{ color: 'var(--system-orange)' }}>
+                      {t('history.versions_unavailable', { path: d.path })}
+                    </div>
+                  ))}
+                  {destinations.filter((d) => d.evictedSnapshots > 0).map((d, i) => (
+                    <div key={`ev-${i}`} className="history-path" style={{ color: 'var(--system-orange)' }}>
+                      {t('history.evicted', { n: d.evictedSnapshots, count: d.evictedSnapshots, path: d.path })}
+                    </div>
+                  ))}
                 </td>
                 <td className="td--center">
                   <span className={`badge badge--${entry.status}`}>
@@ -241,7 +251,7 @@ export default function History({ focus = null, onFocusHandled }) {
                       <Button
                         size="small"
                         variant="borderless"
-                        onClick={() => restoreBackup(only.path)}
+                        onClick={() => restoreBackup(only.path, only.snapshot)}
                         disabled={!!activeRestore}
                       >
                         {t('common.restore')}

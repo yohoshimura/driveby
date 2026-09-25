@@ -17,6 +17,8 @@ export const bridge = {
   cancelBackup: (taskId) => invoke('cancel_backup', { taskId }),
   restoreBackup: (backupPath, destination) => invoke('restore_backup', { backupPath, destination }),
   cancelRestore: () => invoke('cancel_restore'),
+  // [{ name: 'YYYY-MM-DD', path }], newest first; [] for a plain mirror.
+  listSnapshots: (destination) => invoke('list_snapshots', { destination }),
   revealLogsFolder: () => invoke('reveal_logs_folder'),
   // '#rrggbb' on a Linux desktop that sets an accent colour, null elsewhere.
   systemAccent: () => invoke('system_accent'),

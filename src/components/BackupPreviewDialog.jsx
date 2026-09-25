@@ -43,7 +43,7 @@ export default function BackupPreviewDialog({ state, onConfirm, onCancel }) {
   const totals = destinations.reduce(
     (acc, d) => ({
       changes: acc.changes + d.newFiles + d.modifiedFiles + d.deletedFiles,
-      deletions: acc.deletions + d.deletedFiles,
+      deletions: acc.deletions + (d.versions ? 0 : d.deletedFiles),
     }),
     { changes: 0, deletions: 0 },
   );
@@ -91,8 +91,10 @@ export default function BackupPreviewDialog({ state, onConfirm, onCancel }) {
                     {/* The only destructive number in the dialog, and the
                         reason the dialog exists: coloured when it is not
                         zero, plain when it is. */}
-                    <span className={`preview-stat ${d.deletedFiles > 0 ? 'preview-stat--danger' : ''}`}>
-                      <b>{formatNumber(d.deletedFiles)}</b> {t('preview.label.deleted')}
+                    {/* With daily versions, what today's version leaves out
+                        stays in the earlier days: counted, not a warning. */}
+                    <span className={`preview-stat ${d.deletedFiles > 0 && !d.versions ? 'preview-stat--danger' : ''}`}>
+                      <b>{formatNumber(d.deletedFiles)}</b> {t(d.versions ? 'preview.label.deleted_versions' : 'preview.label.deleted')}
                       <em>{formatBytes(d.deletedBytes)}</em>
                     </span>
                     <span className="preview-stat preview-stat--muted">

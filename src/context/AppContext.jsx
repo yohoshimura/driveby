@@ -229,9 +229,16 @@ export function AppProvider({ children }) {
         if (data.success) {
           showToast(tr('backup.toast.complete'));
           if (settingsRef.current.showNotifications) {
+            const name = existingTask?.name || tr('view.tasks').toLowerCase();
+            // The task keeps daily versions, and this drive cannot. The backup
+            // is fine, but the user is counting on something that is not there,
+            // and a scheduled run has no other way to say so.
+            const noVersions = (data.destinations || []).find((d) => d.versionsUnavailable);
             bridge.notify(
               tr('backup.notification.title'),
-              tr('backup.notification.body', { name: existingTask?.name || tr('view.tasks').toLowerCase() }),
+              noVersions
+                ? tr('backup.notification.body_no_versions', { name, path: noVersions.path })
+                : tr('backup.notification.body', { name }),
               [
                 // `path` is the first destination written; with several,
                 // the others are one click away in the History row.
@@ -459,10 +466,27 @@ export function AppProvider({ children }) {
     if (!res.success) showToast(tr('reveal.cannot_open', { error: res.error }), 'error');
   }, [showToast, tr]);
 
-  const restoreBackup = useCallback(async (backupPath) => {
+  const restoreBackup = useCallback(async (backupPath, preferredDay = null) => {
     if (restoreBusy.current) {
       showToast(tr('restore.busy'), 'error');
       return;
+    }
+    // A destination with daily versions holds one whole backup per day, and
+    // the backend refuses to restore its root. Ask which day, preselecting the
+    // one this History row wrote while it is still kept.
+    let source = backupPath;
+    const days = await bridge.listSnapshots(backupPath).catch(() => []);
+    if (days.length > 0) {
+      const { formatDay } = makeFormatters(currentLanguage());
+      const picked = await confirm({
+        title: tr('restore.day.title'),
+        body: tr('restore.day.body'),
+        choices: days.map((d) => ({ value: d.path, label: formatDay(d.name) })),
+        initialChoice: (days.find((d) => d.name === preferredDay) || days[0]).path,
+        confirmLabel: tr('restore.day.action'),
+      });
+      if (!picked) return;
+      source = picked;
     }
     const destination = await bridge.selectDirectory(tr('restore.dialog.select'));
     if (!destination) return;
@@ -470,14 +494,14 @@ export function AppProvider({ children }) {
       title: tr('restore.dialog.title'),
       // Naming only the destination made it impossible to notice that a
       // shifted History row had selected a different backup (#F7).
-      body: tr('restore.dialog.body', { source: backupPath, destination }),
+      body: tr('restore.dialog.body', { source, destination }),
       confirmLabel: tr('restore.dialog.action'),
     });
     if (!ok) return;
     restoreBusy.current = true;
     beginRestore();
     try {
-      const res = await bridge.restoreBackup(backupPath, destination);
+      const res = await bridge.restoreBackup(source, destination);
       if (res.cancelled) {
         showToast(tr('restore.toast.cancelled'));
       } else if (res.success) {
