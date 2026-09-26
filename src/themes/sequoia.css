@@ -244,3 +244,4 @@
 :root[data-style='ios'] .modal__content--wide { max-width: 560px; }
 :root[data-style='ios'] .modal__title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
 :root[data-style='ios'] .modal__body { font-size: 11px; color: var(--label-primary); margin-bottom: 16px; }
+:root[data-style='ios'] .modal__choice { margin-bottom: 16px; }

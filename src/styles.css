@@ -1189,6 +1189,10 @@ input, textarea { user-select: text; }
   display: flex; gap: 8px; justify-content: stretch;
 }
 .modal__actions .btn { flex: 1; }
+/* A dialog asking for a choice sets its list between the message and the
+   buttons, as far from the buttons as the message is from it. Each style
+   repeats its own .modal__body margin here. */
+.modal__choice { margin-bottom: 18px; }
 
 /* ─── Pre-run preview ─── */
 /* Wider than a confirmation: this one carries a line of figures per

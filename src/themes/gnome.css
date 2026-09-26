@@ -417,6 +417,7 @@
 }
 :root[data-style='gnome'] .modal__title { font-size: 16px; font-weight: 700; margin-bottom: 10px; }
 :root[data-style='gnome'] .modal__body { font-size: 13px; color: var(--label-primary); margin-bottom: 24px; }
+:root[data-style='gnome'] .modal__choice { margin-bottom: 24px; }
 :root[data-style='gnome'] .modal__actions { gap: 12px; }
 :root[data-style='gnome'] .modal__actions .btn { height: 40px; border-radius: var(--radius-xl); }
 

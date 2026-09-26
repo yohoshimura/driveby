@@ -479,6 +479,7 @@
   color: var(--label-primary);
   margin-bottom: 24px;
 }
+:root[data-style='windows'] .modal__choice { margin-bottom: 24px; }
 :root[data-style='windows'] .modal__actions {
   margin: 0 -24px -24px;
   padding: 24px;

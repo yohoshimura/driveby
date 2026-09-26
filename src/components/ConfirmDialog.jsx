@@ -69,11 +69,10 @@ export default function ConfirmDialog({ state, onResolve }) {
         <p className="modal__body">{visible.body}</p>
         {visible.choices && (
           <select
-            className="field"
+            className="field modal__choice"
             value={choice ?? ''}
             onChange={(e) => setChoice(e.target.value)}
             aria-label={visible.title}
-            style={{ width: '100%', marginTop: 12 }}
           >
             {visible.choices.map((c) => (
               <option key={c.value} value={c.value}>{c.label}</option>
