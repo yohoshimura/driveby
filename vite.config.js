@@ -19,7 +19,11 @@ export default defineConfig({
       ignored: ['**/src-tauri/**'],
     },
   },
-  envPrefix: ['VITE_', 'TAURI_'],
+  // Only these prefixes reach import.meta.env. A bare 'TAURI_' also matched
+  // TAURI_SIGNING_PRIVATE_KEY(_PASSWORD), which `tauri build` passes on to
+  // beforeBuildCommand: any `import.meta.env` object access would inline the
+  // updater signing key into the shipped bundle (the CVE-2023-46115 pattern).
+  envPrefix: ['VITE_', 'TAURI_ENV_'],
   build: {
     target: 'es2021',
     minify: 'esbuild',

@@ -1,0 +1,41 @@
+# Local, pre-commit gate for Driveby (OWASP DevSecOps 2-2-1-1 Pre-commit,
+# 2-2-1-2 Secrets Management, 2-2-1-3 Linting).
+#
+#   pipx install pre-commit      # or: pip install pre-commit
+#   pre-commit install           # once per clone
+#   pre-commit run --all-files   # whole tree, e.g. after changing this file
+#
+# Hooks are fast (<15 s) and advisory on the developer's machine; `--no-verify`
+# skips them, so CI repeats the same checks (gitleaks job).
+#
+# Every `rev` is a commit SHA, not a tag: a moved tag cannot change what runs
+# here. `pre-commit autoupdate --freeze` refreshes them in this format.
+
+default_install_hook_types: [pre-commit]
+minimum_pre_commit_version: "3.2.0"
+
+repos:
+  # Secrets first: the one mistake that cannot be undone by a later commit.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-case-conflict # Driveby is built and tested on case-insensitive NTFS/APFS too
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      # Generated icon XML is left as the Tauri icon tool writes it.
+      # `excluded patterns.txt` lacks a final newline today; the hook fixes it
+      # the first time it is committed.
+      - id: end-of-file-fixer
+        exclude: ^src-tauri/icons/

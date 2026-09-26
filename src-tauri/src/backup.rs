@@ -5783,7 +5783,7 @@ mod tests {
                 Source { path: here.to_string_lossy().into(), folder: "Here".into() },
                 Source { path: gone.to_string_lossy().into(), folder: "Gone".into() },
             ]),
-            ..keeping(task_with("v-missing", &here, &[dest.clone()]), 30)
+            ..keeping(task_with("v-missing", &here, std::slice::from_ref(&dest)), 30)
         };
         run_on_day(&task, &dest, "2026-09-21", &go()).await.unwrap();
 

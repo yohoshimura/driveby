@@ -231,6 +231,7 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plan_one(
     destination: &Path,
     walked: &WalkResult,

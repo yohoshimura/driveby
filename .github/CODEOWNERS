@@ -1,0 +1,30 @@
+# CODEOWNERS (OWASP DevSecOps 2-2-1-4 Repository Hardening, 2-3-6-3 CI/CD
+# Pipeline Security: changes to the pipeline and the supply chain get a
+# deliberate review).
+#
+# With one maintainer this mostly documents which paths are sensitive: do not
+# turn on "Require review from Code Owners" until a second maintainer can
+# approve, or every PR will wait for a review nobody else can give. Add that
+# person to the entries below when they join.
+
+# Everything
+*                               @yohoshimura
+
+# The pipeline, and what it trusts
+/.github/                       @yohoshimura
+/.pre-commit-config.yaml        @yohoshimura
+/src-tauri/deny.toml            @yohoshimura
+
+# What gets compiled in
+/package.json                   @yohoshimura
+/package-lock.json              @yohoshimura
+/src-tauri/Cargo.toml           @yohoshimura
+/src-tauri/Cargo.lock           @yohoshimura
+
+# What the webview may do, and how the app updates itself
+/src-tauri/capabilities/        @yohoshimura
+/src-tauri/tauri*.conf.json     @yohoshimura
+/vite.config.js                 @yohoshimura
+
+# The disclosure policy
+/SECURITY.md                    @yohoshimura

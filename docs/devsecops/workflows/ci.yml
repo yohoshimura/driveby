@@ -1,0 +1,287 @@
+name: CI
+
+# Security controls, with the OWASP DevSecOps Guideline section each answers:
+#   - `permissions: contents: read` for the whole workflow (2-2-1-4, 2-3-6-3)
+#   - every action pinned to a commit SHA, version in the comment (2-2-1-4)
+#   - `rustup` on the runner instead of a third-party toolchain action
+#     (2-3-6-3, CICD-SEC-8), toolchain pinned (reproducible)
+#   - checkout with `persist-credentials: false` (2-3-6-3)
+#   - `npm ci --ignore-scripts`: dependency install scripts do not run (CICD-SEC-6)
+#   - caches written by master only (save-if), read-only elsewhere
+#   - lint (2-2-1-3), sca + cargo-deny (2-3-2), secrets (2-2-1-2),
+#     dependency-review (2-3-2, 2-3-5), workflows/zizmor (2-3-1-1, 2-3-6-3);
+#     SAST lives in codeql.yml (2-3-1-1)
+#
+# Make lint, sca, cargo-deny (bans licenses sources), secrets and
+# dependency-review required status checks on master to turn them into a
+# gate (2-3-5).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bump deliberately, in its own PR; the release workflow uses the same value.
+  RUST_TOOLCHAIN: "1.98.1"
+  NODE_VERSION: "22"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows — tests + frontend
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      # The Windows-only code (notification.rs toasts, windows-sys calls) is
+      # invisible to the Linux clippy in `lint`. Advisory until it is known
+      # clean, then drop continue-on-error.
+      - name: Clippy (Windows code paths)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+  # The case-*sensitive* half of the contract, and the only runner that can
+  # build the fixture for it: two directories differing only in case. It also
+  # compiles the readdir-based NameResolver, which is shared with macOS.
+  linux:
+    name: Linux — tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential curl wget file libxdo-dev \
+            libssl-dev libgtk-3-dev
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # tauri::generate_context! reads frontendDist, so dist/ must exist
+      # before the Rust tests compile.
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+  # Driveby ships a universal .dmg, so until now the only thing that ever
+  # compiled the macOS target was the release build — after the tag, when a
+  # failure is expensive. The case-folding paths (recase_dirs_phase, the
+  # NameResolver, the overlap fold) are live on APFS and reachable nowhere
+  # else, and ActivationPolicy is macOS-only by definition.
+  macos:
+    name: macOS — tests
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Clippy (macOS code paths)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+  # 2-2-1-3 Linting. rustfmt is not gated: the tree has never been
+  # machine-formatted, and a one-off reformat belongs in its own commit.
+  lint:
+    name: Lint — clippy + eslint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential curl wget file libxdo-dev \
+            libssl-dev libgtk-3-dev
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Errors block; warnings are reported until burned down, then add
+      # --max-warnings 0.
+      - run: npm run lint
+      - run: npm run build
+      - name: clippy
+        run: cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+  # 2-3-2 SCA, npm side. The shipped app bundles the production tree; the dev
+  # tree (vite, esbuild, the Tauri CLI) runs inside the release pipeline next
+  # to the signing key, so it is gated too, at a higher bar.
+  sca:
+    name: SCA — npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: npm audit (production dependencies, high+)
+        run: npm audit --omit=dev --audit-level=high
+      - name: npm audit (build toolchain, critical)
+        run: npm audit --audit-level=critical
+      # Registry signatures and provenance attestations of every installed
+      # package: catches a tarball that did not come from the registry.
+      - run: npm ci --ignore-scripts
+      - run: npm audit signatures
+
+  # 2-3-2 SCA + licence policy, Rust side, driven by src-tauri/deny.toml
+  # (policy as code, 3-1-2). A newly published advisory must not turn every
+  # unrelated PR red, so advisories are advisory on PRs and blocking on
+  # master; the release workflow re-checks them as a hard gate.
+  cargo-deny:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    continue-on-error: ${{ matrix.checks == 'advisories' && github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check ${{ matrix.checks }}
+
+  # 2-2-1-2 Secrets Management, layer 2 (CI) and layer 4 (history): the same
+  # gitleaks as the pre-commit hook, over the full history (~1 s here). The
+  # CLI is used directly: no licence key needed, nothing but a checksummed
+  # binary runs.
+  secrets:
+    name: Secret scan — gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan every commit
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="--all" .'
+
+  # 2-3-2 / 2-3-5: block a PR that *adds* a vulnerable or badly licensed
+  # dependency (npm, Cargo and Actions alike), before it merges.
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          # Same allow-list as src-tauri/deny.toml plus what the npm tree uses.
+          allow-licenses: >-
+            MIT, MIT-0, Apache-2.0, Apache-2.0 WITH LLVM-exception,
+            BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, Zlib, Unicode-3.0,
+            MPL-2.0, BSL-1.0, CC0-1.0, Unlicense
+          show-openssf-scorecard: true
+          warn-on-openssf-scorecard-level: 3
+
+  # 2-3-1-1 (SAST for pipeline definitions) and 2-3-6-3: zizmor finds script
+  # injection, unpinned actions, over-broad permissions, cache poisoning and
+  # dangerous triggers in .github/workflows.
+  workflows:
+    name: Workflow lint — zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor
+        env:
+          # Read-only token: lets the online audits check that every pinned
+          # SHA really belongs to the action's repository (impostor commits)
+          # and is not a known-vulnerable version.
+          GH_TOKEN: ${{ github.token }}
+        run: pipx run zizmor==1.30.1 --format github .github/workflows

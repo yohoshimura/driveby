@@ -1,0 +1,405 @@
+name: Release
+
+# The tag/manifest check, the tag-only guard (#F8), max-parallel: 1 (#F9),
+# draft-then-publish, the portable Windows build and the CHANGELOG notes are
+# joined by these controls (OWASP DevSecOps Guideline sections in brackets):
+#   - token scopes split per job; `permissions: {}` by default (2-3-6-3)
+#   - actions pinned to SHAs; toolchain pinned; no dtolnay action (2-2-1-4)
+#   - no caches in the release: nothing a CI run on master (or a poisoned
+#     dependency in one) wrote can reach a signed build (2-3-6-3)
+#   - the updater signing key is out of reach of the JavaScript toolchain:
+#     `npm ci --ignore-scripts`, and the frontend is built in its own step
+#     before tauri-action, which then skips beforeBuildCommand (CICD-SEC-6)
+#   - the key lives in the `release` environment, not in repository secrets
+#     (CICD-SEC-4; see the setup notes on the build job)
+#   - a published release is never modified: preflight refuses to touch one
+#     (2-5-1 immutability), and `--clobber` can only ever hit a draft
+#   - final gate before building: cargo-deny advisories + npm audit (2-5-1)
+#   - CycloneDX SBOMs for the Rust and npm trees (2-3-6-1)
+#   - SHA256SUMS for every asset, and a Sigstore-signed SLSA build-provenance
+#     attestation plus SBOM attestations for all of them (2-3-6-2)
+#   - publish verifies checksums and provenance before flipping the draft
+#     (2-3-6-2 "verify before you trust")
+#
+# Users verify an installer with:
+#   sha256sum --check --ignore-missing SHA256SUMS
+#   gh attestation verify Driveby_2.1.0_x64-setup.exe --repo yohoshimura/driveby
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions: {}
+
+# One run per tag. A manual re-dispatch must not race the tag-push run over
+# the same draft and its latest.json.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.98.1" # same value as ci.yml
+  NODE_VERSION: "22"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: Preflight — tag, manifests, published state, advisories
+    # workflow_dispatch runs against whatever ref was picked, so a manual run
+    # from master used to draft a release literally tagged `master`, complete
+    # with installers and a latest.json that the updater endpoint would then
+    # serve (#F8). Dispatch is still available — it just has to target a tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # tauri.conf.json deliberately carries no version; the bundle version
+      # comes from Cargo.toml, which only scripts/bump-version.mjs updates —
+      # by hand. Tagging without running it produced a green release named
+      # v1.7.0 that shipped 1.6.1 binaries and a latest.json pinned to
+      # 1.6.1, so every client reported "up to date" forever (#F3).
+      - name: Tag must match the manifests
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          cargo="$(grep -m1 '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag  package.json=$pkg  Cargo.toml=$cargo"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$cargo" ]; then
+            echo "::error::version mismatch - run 'npm run bump-version $tag', commit, and re-tag"
+            exit 1
+          fi
+
+      # Re-running this workflow for a tag whose release is already public
+      # would re-upload (tauri-action) and --clobber (portable build) assets
+      # people have already downloaded and latest.json already points at.
+      # A released artifact never changes; a fix is a new version (2-5-1).
+      - name: Release must not be published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if draft="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" \
+             && [ "$draft" = false ]; then
+            echo "::error::$GITHUB_REF_NAME is already published - releases are immutable, tag a new version"
+            exit 1
+          fi
+
+      # Final gate (2-5-1, 2-3-5): no known vulnerability ships. Exceptions go
+      # in src-tauri/deny.toml [advisories].ignore with a reason and a date.
+      - name: Rust advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check advisories
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: npm advisories
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm audit --audit-level=critical
+
+  build:
+    name: ${{ matrix.label }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Setup (once, in Settings → Environments → release):
+    #   - move TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+    #     here from the repository secrets, then delete the repository copies;
+    #   - Deployment branches and tags → Selected → tag pattern `v*`.
+    # A workflow pushed on any branch can read repository secrets; it cannot
+    # read these. Pair with a tag ruleset so only maintainers create `v*`.
+    environment: release
+    permissions:
+      contents: write # tauri-action drafts the release and uploads; gh release upload
+    strategy:
+      fail-fast: false
+      # Each job merges its own platform into the shared latest.json and
+      # re-uploads it. Running them one at a time removes any chance of two
+      # read-modify-writes overlapping and dropping a platform's entry, at
+      # the cost of a slower release (#F9).
+      max-parallel: 1
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows (msi + nsis)
+            args: ''
+          - os: macos-latest
+            label: macOS (universal)
+            args: '--target universal-apple-darwin'
+          - os: ubuntu-22.04
+            label: Linux (AppImage + deb)
+            args: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: bash
+        env:
+          TARGETS: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin x86_64-apple-darwin' || '' }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          if [ -n "$TARGETS" ]; then rustup target add $TARGETS; fi
+
+      # No Swatinem/rust-cache and no npm cache here on purpose: a tag build
+      # can restore caches saved on master, so anything that ever executed in
+      # a master CI job could plant compiled artifacts in the signed release.
+      # The release is slower; it is also built from nothing but the tag.
+
+      - name: Install Tauri system dependencies (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential curl wget file libxdo-dev \
+            libssl-dev libgtk-3-dev
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      # Install scripts do not run: no package gets to execute code at
+      # install time in a job that holds a write token.
+      - run: npm ci --ignore-scripts
+
+      # Vite and its plugins run here, where neither the signing key nor the
+      # write token is in the environment. tauri-action is then told to skip
+      # beforeBuildCommand (src-tauri/tauri.release.conf.json), so the
+      # JavaScript toolchain never runs next to the key. The output is the
+      # same dist/ that beforeBuildCommand would have produced.
+      - name: Build the frontend
+        run: npm run build
+
+      # Set both secrets to sign the update artifacts. A fork without them
+      # still builds, with no updater bundle, because tauri.updater.conf.json
+      # is only layered in when the key is present. The canonical repository
+      # fails instead: a release without latest.json would leave every
+      # installed copy unable to update.
+      - name: Choose the updater config
+        id: updater
+        shell: bash
+        env:
+          HAS_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          CANONICAL: ${{ github.repository == 'yohoshimura/driveby' }}
+        run: |
+          if [ "$HAS_KEY" = true ]; then
+            echo "args=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_OUTPUT"
+          elif [ "$CANONICAL" = true ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not available to this job - is it in the release environment?"
+            exit 1
+          else
+            echo "::warning::no updater signing key - building without updater artifacts"
+          fi
+
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Driveby ${{ github.ref_name }}'
+          releaseBody: 'See CHANGELOG.md for what changed in this release.'
+          releaseDraft: true
+          prerelease: false
+          # `-- --locked`: cargo builds exactly the reviewed Cargo.lock and
+          # fails rather than resolving anything new.
+          args: >-
+            ${{ matrix.args }}
+            ${{ steps.updater.outputs.args }}
+            --config src-tauri/tauri.release.conf.json
+            -- --locked
+
+      # The portable Windows build: the very binary the two installers wrap,
+      # attached on its own for anyone who wants Driveby on a USB stick or on
+      # a machine they cannot install software on. Tauri bundles no such
+      # target, so it is lifted out of the build directory by hand.
+      #
+      # The name has to say `portable`: the NSIS installer is also an .exe,
+      # and downloading the wrong one means either installing when you meant
+      # not to, or double-clicking an installer that never arrives.
+      #
+      # --clobber only ever replaces an asset on a draft: preflight refuses to
+      # run for a published release.
+      - name: Attach the portable Windows build
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          portable="Driveby_${version}_x64-portable.exe"
+          cp src-tauri/target/release/driveby.exe "$portable"
+          gh release upload "$GITHUB_REF_NAME" "$portable" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # 2-3-6-1: CycloneDX SBOMs from the exact lockfiles the build used. Runs
+  # beside the builds with a read-only token and no secrets.
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Generate SBOMs
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p sbom
+          # The npm tree bundled into the app (production dependencies),
+          # read from package-lock.json alone: nothing is installed.
+          npx --yes @cyclonedx/cyclonedx-npm@6.0.1 \
+            --package-lock-only --omit dev --mc-type application \
+            --output-reproducible --output-format JSON \
+            --output-file "sbom/Driveby_${version}_npm.cdx.json"
+          # Every crate compiled into the binary, on every shipped platform.
+          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo cyclonedx --manifest-path src-tauri/Cargo.toml \
+            --format json --spec-version 1.5 --target all \
+            --override-filename "Driveby_${version}_cargo.cdx"
+          mv "src-tauri/Driveby_${version}_cargo.cdx.json" sbom/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom/
+          retention-days: 7
+          if-no-files-found: error
+
+  # 2-3-6-2: once every platform is in the draft, checksum all of it and have
+  # GitHub sign a SLSA build-provenance attestation (Sigstore, keyless: no
+  # key to store or leak) over exactly those files, plus SBOM attestations.
+  # Nothing third-party runs in this job.
+  attest:
+    name: Checksums and attestations
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write     # read the draft's assets; attach SHA256SUMS and SBOMs
+      id-token: write     # OIDC token for the Sigstore signing certificate
+      attestations: write # store the attestations on the repository
+    steps:
+      - name: Download the draft's assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir assets
+          # A re-run finds its own earlier outputs in the draft; they are
+          # regenerated below, not checksummed.
+          rm -f assets/SHA256SUMS assets/*.cdx.json
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom
+          path: assets
+      - name: SHA256SUMS
+        id: sums
+        working-directory: assets
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' \
+            | LC_ALL=C sort | xargs -d '\n' sha256sum -- > SHA256SUMS
+          cat SHA256SUMS
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build provenance for every asset
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: assets/SHA256SUMS
+          create-storage-record: false
+      - name: Attest the Rust SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: assets/SHA256SUMS
+          sbom-path: assets/Driveby_${{ steps.sums.outputs.version }}_cargo.cdx.json
+          create-storage-record: false
+      - name: Attach SHA256SUMS and SBOMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: assets
+        run: |
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS ./*.cdx.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # tauri-action drafts the release, and every matrix job appends its own
+  # platform's assets to that same draft. Publishing from inside the matrix
+  # would therefore make the release public the moment the first job finished,
+  # leaving latest.json advertising Windows alone until macOS and Linux caught
+  # up a quarter of an hour later — an updater poll landing in that window
+  # finds no entry for its platform and reports "up to date". So the draft
+  # stays, and this job flips it once all three platforms are in. If any
+  # platform fails, `needs` skips this job and the release stays a draft.
+  publish:
+    name: Publish the release
+    needs: [build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write     # edit the draft into a published release
+      attestations: read  # gh attestation verify
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Verify before you trust (2-3-6-2): what is about to go public is
+      # byte-for-byte what was checksummed and attested by this workflow.
+      - name: Verify checksums and provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p verify && cd verify
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          sha256sum --check --strict SHA256SUMS
+          for f in $(cut -d' ' -f3- SHA256SUMS); do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" >/dev/null
+          done
+          echo "all $(wc -l < SHA256SUMS) assets verified"
+
+      # tauri-action only takes a literal string for the release body, so every
+      # release was drafted pointing at CHANGELOG.md — a file the reader is not
+      # looking at, rendered as plain text rather than a link. Lift the real
+      # section out instead, and keep the placeholder if the tag has no entry.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="${TAG#v}" '
+            $0 == "## " v { flag = 1; next }
+            /^## /        { flag = 0 }
+            flag' CHANGELOG.md > notes.md
+          if grep -q '[^[:space:]]' notes.md; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --latest --notes-file notes.md
+          else
+            echo "::warning::no CHANGELOG.md section for $TAG - publishing with the default body"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi
