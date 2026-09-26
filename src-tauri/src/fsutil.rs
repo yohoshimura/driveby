@@ -4,7 +4,6 @@
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use tracing::warn;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1055,6 +1054,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
     fn set_readonly(p: &Path, on: bool) {
         let mut perms = std::fs::metadata(p).unwrap().permissions();
         perms.set_readonly(on);
