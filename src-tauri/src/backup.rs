@@ -352,6 +352,10 @@ pub struct DestinationOutcome {
     /// How many of the oldest days were deleted to make room for this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted_snapshots: Option<u32>,
+    /// The newest day is dated after today by this computer's clock: this
+    /// run updated that day, and every run will until the date catches up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_behind: Option<String>,
 }
 
 impl DestinationOutcome {
@@ -375,6 +379,7 @@ impl DestinationOutcome {
             snapshot: None,
             versions_unavailable: None,
             evicted_snapshots: None,
+            clock_behind: None,
         }
     }
 
@@ -641,6 +646,38 @@ struct RunCtx<'a, R: Runtime> {
     /// "2 of 3" rather than show a bar that mysteriously starts over.
     dest_index: u32,
     dest_count: u32,
+}
+
+/// Tell the UI which destination the run has moved on to, before `RunCtx`
+/// exists: `phase` is "versions" while daily versions are readied, else
+/// "preparing". `dest` is the destination's index and the count.
+fn emit_destination_start<R: Runtime>(
+    app: &AppHandle<R>,
+    backup_id: &str,
+    task_id: &str,
+    destination: &Path,
+    dest: (u32, u32),
+    walked: &WalkResult,
+    phase: &'static str,
+) {
+    let _ = app.emit(
+        "backup-progress",
+        ProgressPayload {
+            backup_id: backup_id.to_string(),
+            task_id: task_id.to_string(),
+            progress: 0,
+            copied_bytes: 0,
+            total_bytes: walked.total_bytes,
+            copied_files: 0,
+            total_files: walked.files.len() as u64,
+            speed_bps: 0,
+            eta_seconds: None,
+            phase,
+            destination: destination.to_string_lossy().to_string(),
+            dest_index: dest.0,
+            dest_count: dest.1,
+        },
+    );
 }
 
 impl<R: Runtime> RunCtx<'_, R> {
@@ -1923,6 +1960,21 @@ async fn execute_one<R: Runtime>(
     let started = Instant::now();
     let sources = task.sources();
 
+    // Readying daily versions — a clone, the days retention or a turning-off
+    // deletes — can take minutes; until the copy's first event the card would
+    // still show the previous destination finishing.
+    let versions_work = task.keep_versions_days().is_some()
+        || snapshot::read_marker(destination).await?.is_some();
+    emit_destination_start(
+        app,
+        backup_id,
+        &task.id,
+        destination,
+        (dest_index, dest_count),
+        walked,
+        if versions_work { "versions" } else { "preparing" },
+    );
+
     // Where this run writes. With versions off, a destination that still
     // holds daily versions becomes a mirror again first: a mirror prune would
     // otherwise delete every day as an orphan. A copy 1.7.6 left one level
@@ -1939,7 +1991,7 @@ async fn execute_one<R: Runtime>(
                 put_nested_copy_back(destination, &sources, walked).await;
             }
             let probe = destination.to_path_buf();
-            let can_link = blocking(move || hard_link_supported(&probe)).await;
+            let can_link = blocking(move || hard_link_supported(&probe)).await?;
             snapshot::prepare(destination, days, clock, can_link, token).await?
         }
     };
@@ -1947,6 +1999,14 @@ async fn execute_one<R: Runtime>(
     let versions = matches!(plan, snapshot::Plan::Snapshot { .. });
     let versions_unavailable =
         matches!(plan, snapshot::Plan::Mirror { versions_unavailable: true }).then_some(true);
+    // A day after today: the clock reads earlier than when that day was
+    // written, and until the date catches up every run updates that day.
+    let clock_behind = match &plan {
+        snapshot::Plan::Snapshot { day, .. } if *day > snapshot::day_name(clock) => {
+            Some(day.clone())
+        }
+        _ => None,
+    };
 
     let ctx = RunCtx {
         app,
@@ -1994,6 +2054,7 @@ async fn execute_one<R: Runtime>(
         return Ok(DestinationOutcome {
             evicted_snapshots,
             versions_unavailable,
+            clock_behind,
             ..DestinationOutcome::no_space(destination, short)
         });
     }
@@ -2062,6 +2123,7 @@ async fn execute_one<R: Runtime>(
         snapshot: snapshot_day,
         versions_unavailable,
         evicted_snapshots,
+        clock_behind,
     })
 }
 
@@ -3604,6 +3666,7 @@ mod tests {
             snapshot: None,
             versions_unavailable: None,
             evicted_snapshots: None,
+            clock_behind: None,
         };
         let task = task_with("fold", Path::new("C:/src"), &[]);
 
@@ -5594,6 +5657,65 @@ mod tests {
 
         assert_eq!(std::fs::read(dest.join("2026-09-21/a.txt")).unwrap(), b"alpha, again");
         assert_eq!(crate::snapshot::list(dest).await.unwrap().len(), 1);
+    }
+
+    /// A clock that reads before the newest day — set wrong once, then put
+    /// right — makes every run update that day until the date catches up. The
+    /// run says so rather than quietly keeping no new version.
+    #[tokio::test]
+    async fn a_clock_behind_the_newest_day_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let task = keeping(task_with("v-clock", &source, &dests), 30);
+        let outcome = run_on_day(&task, dest, "2026-09-25", &go()).await.unwrap();
+        assert_eq!(outcome.clock_behind, None);
+
+        let outcome = run_on_day(&task, dest, "2026-09-23", &go()).await.unwrap();
+
+        assert_eq!(outcome.snapshot.as_deref(), Some("2026-09-25"));
+        assert_eq!(outcome.clock_behind.as_deref(), Some("2026-09-25"));
+    }
+
+    /// The progress events one run of `task` sends, in order.
+    async fn progress_of(task: &Task, dest: &Path, day: &str) -> Vec<serde_json::Value> {
+        use tauri::Listener;
+        let app = tauri::test::mock_app();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = events.clone();
+        app.listen_any("backup-progress", move |event| {
+            let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+            seen.lock().unwrap().push(payload);
+        });
+        let day = crate::snapshot::parse_day(day).unwrap();
+        run_one_destination_on(app.handle(), "p", task, dest, &Settings::default(), &go(), day)
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        events
+    }
+
+    /// Before anything is copied, the UI hears which destination the run has
+    /// moved on to — and, when there are versions to prepare (a clone, the
+    /// days retention deletes, a turning-off), that this is what it is doing,
+    /// which can take a while.
+    #[tokio::test]
+    async fn a_destination_announces_itself_and_its_versions_before_copying() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, dests) = tree_with_destinations(root.path(), 1);
+        let dest = &dests[0];
+        let path = dest.to_string_lossy().to_string();
+        let mirror = task_with("p-mirror", &source, &dests);
+
+        let first = progress_of(&mirror, dest, "2026-09-20").await[0].clone();
+        assert_eq!(first["phase"], "preparing");
+        assert_eq!(first["destination"].as_str(), Some(path.as_str()));
+
+        let first = progress_of(&keeping(mirror.clone(), 30), dest, "2026-09-21").await[0].clone();
+        assert_eq!(first["phase"], "versions");
+
+        let first = progress_of(&mirror, dest, "2026-09-22").await[0].clone();
+        assert_eq!(first["phase"], "versions", "turning off is versions work too");
     }
 
     /// Stopped once the walk is done, as the clone starts — the long part on a

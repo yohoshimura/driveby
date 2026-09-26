@@ -239,6 +239,28 @@ export function keepVersionsDays(task) {
   return Math.min(Math.floor(n), 1000);
 }
 
+/// The lengths the form lists for a task keeping `current` days: the usual
+/// ones, and `current` in its place when tasks.json holds another — a select
+/// with no option for its value shows the first one, Off, and says so wrongly.
+export function versionChoices(current) {
+  return VERSION_CHOICES.includes(current)
+    ? VERSION_CHOICES
+    : [...VERSION_CHOICES, current].sort((a, b) => a - b);
+}
+
+/// Whether saving `task` should look at what its destinations already hold
+/// before it deletes days there: for a new task, or when the days kept or the
+/// destinations changed. An edit that changes neither keeps the retention the
+/// task already had — asking again at every save, a rename included, would
+/// only teach the question to be clicked through.
+export function versionsNeedChecking(initialTask, task) {
+  if (!initialTask) return true;
+  if (keepVersionsDays(initialTask) !== keepVersionsDays(task)) return true;
+  const before = new Set(taskDestinations(initialTask));
+  const after = taskDestinations(task);
+  return after.length !== before.size || after.some((d) => !before.has(d));
+}
+
 /// What the next run would delete from a destination holding `dayNames`
 /// (`YYYY-MM-DD`, any order) once the task keeps `keepDays` days: 'off' when
 /// versions are off and there are days — all but the newest go, and the

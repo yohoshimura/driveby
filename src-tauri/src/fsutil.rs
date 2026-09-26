@@ -415,19 +415,24 @@ pub fn remove_link_safe(path: &Path) -> std::io::Result<()> {
 
 /// Whether `dir`'s filesystem can hard-link: make a file, link it, remove
 /// both. exFAT and FAT32 cannot, and neither can some network shares.
-pub fn hard_link_supported(dir: &Path) -> bool {
+///
+/// A folder that cannot take the probe file at all is an error, not a "no":
+/// it says nothing about links, and the run could not write there either.
+pub fn hard_link_supported(dir: &Path) -> Result<bool> {
     let a = dir.join(".driveby-link-probe");
     let b = dir.join(".driveby-link-probe-2");
     // Leftovers from a run killed mid-probe.
     let _ = std::fs::remove_file(long_path(&b));
     let _ = std::fs::remove_file(long_path(&a));
-    if std::fs::write(long_path(&a), b"probe").is_err() {
-        return false;
-    }
-    let linked = std::fs::hard_link(long_path(&a), long_path(&b)).is_ok();
+    std::fs::write(long_path(&a), b"probe")
+        .map_err(|e| anyhow!("could not write to {}: {}", dir.display(), e))?;
+    let linked = std::fs::hard_link(long_path(&a), long_path(&b));
     let _ = std::fs::remove_file(long_path(&b));
     let _ = std::fs::remove_file(long_path(&a));
-    linked
+    if let Err(e) = &linked {
+        warn!(dir = %dir.display(), "no hard links here: {}", e);
+    }
+    Ok(linked.is_ok())
 }
 
 /// Whether `a` and `b` are one file reached by two links.
@@ -1133,8 +1138,18 @@ mod tests {
     #[test]
     fn a_local_folder_can_hard_link_and_keeps_no_probe() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(hard_link_supported(dir.path()));
+        assert!(hard_link_supported(dir.path()).unwrap());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the probe files must go");
+    }
+
+    /// A folder that cannot be written to says nothing about hard links: the
+    /// destination fails with the reason instead of being called a drive
+    /// without them.
+    #[test]
+    fn a_folder_that_cannot_be_written_is_an_error_not_a_drive_without_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = hard_link_supported(&dir.path().join("missing")).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
     }
 
     #[test]

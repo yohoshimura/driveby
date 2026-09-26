@@ -165,8 +165,12 @@ async fn restore<R: Runtime>(
     reject_overlap(&backup_path, &destination)?;
 
     // A backup with daily versions holds one whole backup per day; restoring
-    // its root would pour every day into one folder. The UI asks which day.
-    if crate::snapshot::read_marker(&backup_path).await?.is_some() {
+    // its root would pour every day into one folder. The UI asks which day —
+    // unless versions are being turned off, which leaves no day to ask about.
+    if let Some(marker) = crate::snapshot::read_marker(&backup_path).await? {
+        if marker.leaving.is_some() {
+            return Err(crate::snapshot::turning_off(&backup_path));
+        }
         return Err(anyhow!("This backup keeps daily versions; choose a day to restore"));
     }
 
@@ -466,6 +470,28 @@ mod tests {
             .await
             .unwrap();
         assert!(dest.join("a.txt").exists(), "a day restores like any backup");
+    }
+
+    /// Mid turn-off the root is neither a day nor the backup yet: the refusal
+    /// says what ends that, not to choose a day there is none of.
+    #[tokio::test]
+    async fn a_backup_whose_versions_are_being_turned_off_is_refused_saying_so() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(backup.join("2026-09-21")).unwrap();
+        std::fs::write(backup.join("2026-09-21/a.txt"), b"a").unwrap();
+        let marker = br#"{"version":1,"leaving":"2026-09-21"}"#;
+        std::fs::write(backup.join(crate::snapshot::MARKER), marker).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let app = tauri::test::mock_app();
+
+        let err = restore(app.handle(), &CancellationToken::new(), backup.clone(), dest.clone())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("being turned off"), "{err}");
+        assert!(!dest.join("a.txt").exists());
     }
 
     /// The backup's directory structure has to come back whole. An empty

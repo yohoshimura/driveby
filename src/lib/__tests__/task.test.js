@@ -11,7 +11,9 @@ import {
   taskDestinations,
   taskSources,
   usesSubfolders,
+  versionChoices,
   versionsAtRisk,
+  versionsNeedChecking,
   VERSION_CHOICES,
 } from '../task';
 
@@ -345,5 +347,38 @@ describe('versionsAtRisk', () => {
 
   test('counts from the newest day when the clock reads earlier, as a run does', () => {
     expect(versionsAtRisk(['2026-12-01', '2026-09-20'], 7, today)).toBe('fewer');
+  });
+});
+
+describe('versionChoices', () => {
+  test('are the lengths the form offers', () => {
+    expect(versionChoices(0)).toEqual([0, 7, 30, 90, 365]);
+    expect(versionChoices(30)).toEqual([0, 7, 30, 90, 365]);
+  });
+
+  test('keep a stored length the form does not offer, in its place', () => {
+    // Written by hand in tasks.json: shown as it is, not as Off.
+    expect(versionChoices(14)).toEqual([0, 7, 14, 30, 90, 365]);
+    expect(versionChoices(1000)).toEqual([0, 7, 30, 90, 365, 1000]);
+  });
+});
+
+describe('versionsNeedChecking', () => {
+  const stored = { destinations: ['D:/Backup'], keepVersionsDays: 30 };
+
+  test('a new task is checked against what its destinations hold', () => {
+    expect(versionsNeedChecking(undefined, { destinations: ['D:/Backup'], keepVersionsDays: 0 })).toBe(true);
+  });
+
+  test('an edit that changes neither the days nor the destinations is not', () => {
+    // A task idle for longer than its window would be asked on every save,
+    // renaming included, about a retention it already chose.
+    expect(versionsNeedChecking(stored, { destinations: ['D:/Backup'], keepVersionsDays: 30 })).toBe(false);
+  });
+
+  test('an edit of the days or of the destinations is', () => {
+    expect(versionsNeedChecking(stored, { destinations: ['D:/Backup'], keepVersionsDays: 7 })).toBe(true);
+    expect(versionsNeedChecking(stored, { destinations: ['E:/Backup'], keepVersionsDays: 30 })).toBe(true);
+    expect(versionsNeedChecking(stored, { destinations: ['D:/Backup', 'E:/Backup'], keepVersionsDays: 30 })).toBe(true);
   });
 });

@@ -474,8 +474,17 @@ export function AppProvider({ children }) {
     // A destination with daily versions holds one whole backup per day, and
     // the backend refuses to restore its root. Ask which day, preselecting the
     // one this History row wrote while it is still kept.
+    // Refused here, before a folder is picked, when the days cannot be listed
+    // — versions being turned off, a marker that cannot be read. A drive that
+    // is not plugged in lists nothing and goes on to say so itself.
     let source = backupPath;
-    const days = await bridge.listSnapshots(backupPath).catch(() => []);
+    let days;
+    try {
+      days = await bridge.listSnapshots(backupPath);
+    } catch (e) {
+      showToast(tr('restore.toast.failed', { error: e }), 'error');
+      return;
+    }
     if (days.length > 0) {
       const { formatDay } = makeFormatters(currentLanguage());
       const picked = await confirm({

@@ -47,7 +47,7 @@ export default function History({ focus = null, onFocusHandled }) {
   const { history, deleteHistory, clearHistory, revealFolder, restoreBackup } = useApp();
   const { activeRestore } = useProgress();
   const t = useT();
-  const { formatTime, formatBytes, formatDuration, formatNumber } = useFormat();
+  const { formatTime, formatBytes, formatDuration, formatNumber, formatDay } = useFormat();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [focusedId, setFocusedId] = useState(null);
@@ -229,6 +229,11 @@ export default function History({ focus = null, onFocusHandled }) {
                   {destinations.filter((d) => d.versionsUnavailable).map((d, i) => (
                     <div key={`nv-${i}`} className="history-path" style={{ color: 'var(--system-orange)' }}>
                       {t('history.versions_unavailable', { path: d.path })}
+                    </div>
+                  ))}
+                  {destinations.filter((d) => d.clockBehind).map((d, i) => (
+                    <div key={`cb-${i}`} className="history-path" style={{ color: 'var(--system-orange)' }}>
+                      {t('history.clock_behind', { path: d.path, day: formatDay(d.clockBehind) })}
                     </div>
                   ))}
                   {destinations.filter((d) => d.evictedSnapshots > 0).map((d, i) => (

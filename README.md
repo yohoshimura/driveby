@@ -95,6 +95,10 @@ updated through your package manager, not by the app.
   format of USB sticks — are backed up as a mirror. On a drive with versions,
   a folder's Properties in Explorer counts every day at its full size; the
   drive's free space is the real figure.
+- **Going from one source to several, or back, costs one full copy.** One
+  source is backed up straight into the day's folder and several each into a
+  folder of their own, so the first day after the change shares no file with
+  the day before.
 - **Going back to Driveby 1.x deletes daily versions.** 1.x does not know the
   layout and removes every day's folder as something the source does not have.
   Turn versions off and run the task once before installing an older version.

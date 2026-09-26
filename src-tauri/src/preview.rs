@@ -98,10 +98,11 @@ pub struct DestinationPreview {
     /// What the volume has free for this process, or none when it would not
     /// say — in which case the run does not check either.
     pub available_bytes: Option<u64>,
-    /// The task keeps daily versions: what the run leaves out of today's
-    /// version stays in the earlier days, so it is not a deletion to warn
-    /// about.
-    pub versions: bool,
+    /// With daily versions, what the run leaves out of the version it writes
+    /// but an earlier day keeps: not a deletion to warn about. What no
+    /// earlier day keeps is counted in `deleted_*`, as a mirror's is.
+    pub kept_files: u64,
+    pub kept_bytes: u64,
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -184,8 +185,16 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
         // The tree the run would start from: with daily versions, today's day
         // or the newest one, which today's is cloned from. The preview moves
         // and clones nothing, so it looks there instead.
-        let versions = task.keep_versions_days().is_some();
+        let keep_days = task.keep_versions_days();
+        let versions = keep_days.is_some();
         let base = snapshot::preview_base(destination, versions, clock).await?;
+        // What the run leaves out of its version is kept by the day before it,
+        // if there is one — checked file by file, since a second run the same
+        // day may drop a file that day's first run added.
+        let earlier = match keep_days {
+            Some(days) => snapshot::earlier_day(destination, days, clock).await?,
+            None => None,
+        };
         // The run moves a copy 1.7.6 left one level down back up before it
         // compares anything. The preview does not move it — a dry run that
         // renames is not dry — but counts as if it had, or it would show
@@ -204,11 +213,11 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
             nested.as_ref(),
             settings.parallel_copies(),
             !versions,
+            earlier.as_deref(),
             token,
         )
         .await?;
         preview.path = destination.to_string_lossy().to_string();
-        preview.versions = versions;
         previews.push(preview);
     }
 
@@ -230,6 +239,7 @@ async fn plan_one(
     nested: Option<&NestedCopy>,
     parallel: usize,
     credit_replaced: bool,
+    earlier: Option<&Path>,
     token: &CancellationToken,
 ) -> Result<DestinationPreview> {
     // New, modified or unchanged: the same question `copy_one` asks before
@@ -258,7 +268,7 @@ async fn plan_one(
         ..Default::default()
     };
 
-    count_deletions(destination, keep, protected, nested, token, &mut preview).await?;
+    count_deletions(destination, keep, protected, nested, earlier, token, &mut preview).await?;
     Ok(preview)
 }
 
@@ -271,11 +281,15 @@ async fn plan_one(
 /// of that is how a dry run ends up not being dry. What the two share is the
 /// part that decides *whether* an entry is orphaned: the same `KeepSet` and
 /// the same `ProtectedSet`.
+///
+/// With daily versions, a file `earlier` (`snapshot::earlier_day`) also holds
+/// is only left out of this version, and counted as kept rather than deleted.
 async fn count_deletions(
     destination: &Path,
     keep: &KeepSet,
     protected: &ProtectedSet<'_>,
     nested: Option<&NestedCopy>,
+    earlier: Option<&Path>,
     token: &CancellationToken,
     preview: &mut DestinationPreview,
 ) -> Result<()> {
@@ -321,8 +335,20 @@ async fn count_deletions(
             if file_type.is_dir() {
                 stack.push(path);
             } else if file_type.is_file() && matches!(keep.status(rel), KeepStatus::Absent) {
-                preview.deleted_files += 1;
-                preview.deleted_bytes += entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                let kept = match earlier {
+                    Some(day) => fs::symlink_metadata(long_path(&day.join(rel)))
+                        .await
+                        .is_ok_and(|m| m.is_file()),
+                    None => false,
+                };
+                if kept {
+                    preview.kept_files += 1;
+                    preview.kept_bytes += size;
+                } else {
+                    preview.deleted_files += 1;
+                    preview.deleted_bytes += size;
+                }
             }
         }
     }
@@ -624,9 +650,57 @@ mod tests {
         assert!(!dest.join("same.txt").exists());
     }
 
+    /// A first versioned run moves the mirror into its first day: a file gone
+    /// from the source is not kept by any earlier day, so it is a deletion to
+    /// warn about like a mirror's.
+    #[tokio::test]
+    async fn a_first_versioned_preview_warns_about_what_it_deletes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(source.join("new.txt"), b"brand new").unwrap();
+        std::fs::write(dest.join("old.txt"), b"gone from source").unwrap();
+        let task = Task { keep_versions_days: Some(30), ..task_for(&source, &[&dest]) };
+
+        let payload = plan(&task, &Settings::default(), &CancellationToken::new()).await.unwrap();
+
+        let d = &payload.destinations[0];
+        assert_eq!((d.deleted_files, d.kept_files), (1, 0));
+    }
+
+    /// A second run the same day updates that day's version: a file gone from
+    /// the source since is deleted for good unless an earlier day has it.
+    #[tokio::test]
+    async fn a_same_day_preview_warns_only_about_what_no_earlier_day_keeps() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("dest");
+        let today = crate::snapshot::clock_today();
+        let before = today.checked_sub_days(chrono::Days::new(2)).unwrap();
+        let today_dir = dest.join(crate::snapshot::day_name(today));
+        let before_dir = dest.join(crate::snapshot::day_name(before));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&today_dir).unwrap();
+        std::fs::create_dir_all(&before_dir).unwrap();
+        std::fs::write(dest.join(crate::snapshot::MARKER), b"{}").unwrap();
+        std::fs::write(source.join("new.txt"), b"brand new").unwrap();
+        std::fs::write(before_dir.join("kept.txt"), b"kept").unwrap();
+        std::fs::write(today_dir.join("kept.txt"), b"kept").unwrap();
+        std::fs::write(today_dir.join("gone.txt"), b"added and removed today").unwrap();
+        let task = Task { keep_versions_days: Some(30), ..task_for(&source, &[&dest]) };
+
+        let payload = plan(&task, &Settings::default(), &CancellationToken::new()).await.unwrap();
+
+        let d = &payload.destinations[0];
+        assert_eq!((d.deleted_files, d.kept_files), (1, 1));
+        assert_eq!((d.deleted_bytes, d.kept_bytes), (23, 4));
+    }
+
     /// With daily versions the run starts from the newest day, so that is
     /// what the preview compares against. A file gone from the source is not
-    /// in today's version, but it is not deleted.
+    /// in today's version, but the day it is cloned from keeps it.
     #[tokio::test]
     async fn a_preview_with_versions_counts_against_the_newest_day() {
         let root = tempfile::tempdir().unwrap();
@@ -649,9 +723,9 @@ mod tests {
         let payload = plan(&task, &Settings::default(), &CancellationToken::new()).await.unwrap();
 
         let d = &payload.destinations[0];
-        assert!(d.versions);
         assert_eq!(d.path, dest.to_string_lossy());
-        assert_eq!((d.unchanged_files, d.new_files, d.deleted_files), (1, 1, 1));
+        assert_eq!((d.unchanged_files, d.new_files), (1, 1));
+        assert_eq!((d.deleted_files, d.kept_files), (0, 1));
     }
 
     /// The dialog has to be able to say a destination lacks the room before

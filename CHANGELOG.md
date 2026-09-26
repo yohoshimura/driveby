@@ -12,7 +12,9 @@ History, which now asks which day.
 
 A day costs only what changed. Files that did not change since the day before
 are hard links to the same copy, not copies, so thirty days of a folder where
-little changes take little more room than one. A file in a day's folder is the
+little changes take little more room than one — except the first day after a
+task goes from one source to several, or back, which moves every file and is a
+full copy. A file in a day's folder is the
 very same file as in every other day that kept it unchanged: copy it out
 before changing it, or every one of those days changes with it. Several runs
 on the same day update that day's version. When the drive runs out of room,

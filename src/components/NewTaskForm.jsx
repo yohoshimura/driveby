@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import Button from './common/Button';
 import FormField from './common/FormField';
 import { bridge } from '../lib/tauri';
@@ -15,8 +15,9 @@ import {
   taskDestinations,
   taskSources,
   usesSubfolders,
+  versionChoices,
   versionsAtRisk,
-  VERSION_CHOICES,
+  versionsNeedChecking,
 } from '../lib/task';
 import {
   DEFAULT_SCHEDULE_TIME,
@@ -52,6 +53,10 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         }
       : INITIAL
   );
+  // A save in flight (see `submit`), and a Cancel clicked while it was.
+  const [saving, setSaving] = useState(false);
+  const busy = useRef(false);
+  const cancelled = useRef(false);
 
   /// Pick a folder into source slot `index`, or append it when `index` is
   /// null, named after itself.
@@ -153,6 +158,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     : null;
 
   const submit = async () => {
+    if (busy.current) return;
     if (!task.name.trim()) return showToast?.(t('form.error.name'), 'error');
     if (task.sources.length === 0) return showToast?.(t('form.error.source'), 'error');
     // A custom schedule that cannot fire would leave a task looking
@@ -213,47 +219,67 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
     const resolved = named.destinations.length > 0
       ? named
       : { ...named, destinations: defaultDestination ? [defaultDestination] : [] };
-    // Fewer days, or none, deletes versions at the next run. Asked here,
-    // while it is still a choice: the run itself asks nobody. Asked of the
-    // days the destinations hold as well as of this task's own setting: a new
-    // or re-created task pointed at a destination that already keeps days
-    // deletes them just the same. A destination that is not plugged in lists
-    // nothing, so a setting that went down still asks on its own.
-    if (confirm) {
-      const before = keepVersionsDays(initialTask);
-      const after = task.keepVersionsDays;
-      let risk = isEdit && before > 0 && after < before ? (after === 0 ? 'off' : 'fewer') : null;
-      if (!risk) {
-        const listed = await Promise.all(
-          resolved.destinations.map((d) => bridge.listSnapshots(d).catch(() => [])),
-        );
-        risk = listed
-          .map((days) => versionsAtRisk((days ?? []).map((day) => day?.name), after))
-          .find(Boolean) ?? null;
+    // Listing the destinations waits on each drive — a disk spinning up
+    // takes seconds. Meanwhile a second click must not add the task twice,
+    // and a Cancel must not let the save go ahead once the form is gone.
+    busy.current = true;
+    cancelled.current = false;
+    setSaving(true);
+    try {
+      if (confirm && !(await versionsConfirmed(resolved))) return;
+      if (cancelled.current) return;
+      if (isEdit) {
+        onSave(resolved);
+        return;
       }
-      if (risk) {
-        const ok = await confirm(risk === 'off'
-          ? {
-              title: t('form.versions.off_confirm.title'),
-              body: t('form.versions.off_confirm.body'),
-              confirmLabel: t('form.versions.off_confirm.action'),
-              danger: true,
-            }
-          : {
-              title: t('form.versions.fewer_confirm.title'),
-              body: t('form.versions.fewer_confirm.body', { n: after, count: after }),
-              confirmLabel: t('form.versions.fewer_confirm.action'),
-              danger: true,
-            });
-        if (!ok) return;
-      }
+      const ok = onAdd(resolved);
+      if (ok) setTask(INITIAL);
+    } finally {
+      busy.current = false;
+      setSaving(false);
     }
-    if (isEdit) {
-      onSave(resolved);
-      return;
+  };
+
+  /// Fewer days, or none, deletes versions at the next run. Asked here,
+  /// while it is still a choice: the run itself asks nobody. Asked of the
+  /// days the destinations hold as well as of this task's own setting: a new
+  /// or re-created task pointed at a destination that already keeps days
+  /// deletes them just the same. A destination that is not plugged in lists
+  /// nothing, so a setting that went down still asks on its own. An edit that
+  /// changes neither the days nor the destinations keeps the retention the
+  /// task already had, and is not asked about it again.
+  const versionsConfirmed = async (resolved) => {
+    const before = keepVersionsDays(initialTask);
+    const after = task.keepVersionsDays;
+    let risk = isEdit && before > 0 && after < before ? (after === 0 ? 'off' : 'fewer') : null;
+    if (!risk && versionsNeedChecking(initialTask, resolved)) {
+      const listed = await Promise.all(
+        resolved.destinations.map((d) => bridge.listSnapshots(d).catch(() => [])),
+      );
+      if (cancelled.current) return false;
+      risk = listed
+        .map((days) => versionsAtRisk((days ?? []).map((day) => day?.name), after))
+        .find(Boolean) ?? null;
     }
-    const ok = onAdd(resolved);
-    if (ok) setTask(INITIAL);
+    if (!risk) return true;
+    return confirm(risk === 'off'
+      ? {
+          title: t('form.versions.off_confirm.title'),
+          body: t('form.versions.off_confirm.body'),
+          confirmLabel: t('form.versions.off_confirm.action'),
+          danger: true,
+        }
+      : {
+          title: t('form.versions.fewer_confirm.title'),
+          body: t('form.versions.fewer_confirm.body', { n: after, count: after }),
+          confirmLabel: t('form.versions.fewer_confirm.action'),
+          danger: true,
+        });
+  };
+
+  const cancel = () => {
+    cancelled.current = true;
+    onCancel();
   };
 
   const destinationLabel = defaultDestination
@@ -456,7 +482,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
           value={task.keepVersionsDays}
           onChange={(e) => setTask({ ...task, keepVersionsDays: Number(e.target.value) })}
         >
-          {VERSION_CHOICES.map((days) => (
+          {versionChoices(keepVersionsDays(initialTask)).map((days) => (
             <option key={days} value={days}>
               {days === 0
                 ? t('form.versions.off')
@@ -469,8 +495,8 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
       </FormField>
 
       <div className="card__actions">
-        <Button onClick={onCancel}>{t('common.cancel')}</Button>
-        <Button variant="primary" onClick={submit}>
+        <Button onClick={cancel}>{t('common.cancel')}</Button>
+        <Button variant="primary" onClick={submit} disabled={saving}>
           {isEdit ? t('form.action.save') : t('form.action.add')}
         </Button>
       </div>

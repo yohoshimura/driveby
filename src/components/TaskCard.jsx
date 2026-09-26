@@ -28,6 +28,9 @@ export default function TaskCard({ task, backup, missing, onRun, onCancel, onMod
               index: backup.destIndex + 1,
               total: backup.destCount,
             })}`}
+          {/* A clone, the days retention deletes or a turning-off can take
+              minutes with the bar at zero: this is what explains it. */}
+          {isRunning && backup.phase === 'versions' && ` · ${t('task.running.versions')}`}
         </div>
 
         {/* Whether a drive is there is checked once a minute by the

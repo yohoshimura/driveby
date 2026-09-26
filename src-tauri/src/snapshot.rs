@@ -130,7 +130,13 @@ pub(crate) async fn read_marker(destination: &Path) -> Result<Option<Marker>> {
 }
 
 pub(crate) async fn write_marker(destination: &Path, marker: &Marker) -> Result<()> {
-    persist::write_json_atomic(&long_path(&destination.join(MARKER)), marker).await
+    let path = destination.join(MARKER);
+    persist::write_json_atomic(&long_path(&path), marker).await?;
+    // Hidden on Windows, as a dot-file is elsewhere: a stray file at the root
+    // of a backup drive invites deleting, and without it every day reads as
+    // a source folder a mirror prune deletes. A no-op elsewhere.
+    crate::fsutil::apply_attrs(&path, 0x2 /*HIDDEN*/);
+    Ok(())
 }
 
 /// Remove the marker; nothing to do when it is already gone.
@@ -812,6 +818,15 @@ pub(crate) async fn preview_base(
     if let Some(leaving) = leaving_of(destination, &marker)? {
         if leaving != IN_PROGRESS {
             let day = destination.join(&leaving);
+            // Until the other days are cleared, `.driveby-in-progress` is a
+            // stopped run's leftover that `leave` removes before anything else.
+            if !marker.cleared {
+                return Ok(if folder_state(&day).await? {
+                    day
+                } else {
+                    destination.to_path_buf()
+                });
+            }
             match (folder_state(&day).await?, folder_state(&in_progress).await?) {
                 (true, true) => return Err(set_aside_clash(destination, &leaving)),
                 (true, false) => return Ok(day),
@@ -838,6 +853,41 @@ pub(crate) async fn preview_base(
     })
 }
 
+/// The day that keeps what a run leaves out of the version it writes: the
+/// newest committed day before that version's own day that the run's
+/// retention keeps. None when there is none — a first versioned run moves the
+/// root into its first day, a turning-off brings one day up, a mirror has no
+/// days — and what the run leaves out is then deleted for good.
+pub(crate) async fn earlier_day(
+    destination: &Path,
+    keep_days: u32,
+    clock: NaiveDate,
+) -> Result<Option<PathBuf>> {
+    let Some(marker) = read_marker(destination).await? else {
+        return Ok(None);
+    };
+    if leaving_of(destination, &marker)?.is_some() {
+        return Ok(None);
+    }
+    let snapshots = list(destination).await?;
+    let day = effective_day(clock, &snapshots);
+    let expired = expired(&snapshots, day, keep_days);
+    Ok(snapshots
+        .iter()
+        .rev()
+        .find(|s| s.date < day && !expired.iter().any(|e| e.date == s.date))
+        .map(|s| s.path.clone()))
+}
+
+/// Why a destination whose versions are being turned off cannot be restored:
+/// its data is split between a day and the root until the next run ends it.
+pub(crate) fn turning_off(destination: &Path) -> anyhow::Error {
+    anyhow!(
+        "Daily versions are being turned off at {}: restore it once its next backup has finished",
+        destination.display()
+    )
+}
+
 /// One day a destination can be restored from.
 #[derive(Serialize, Debug, PartialEq)]
 pub(crate) struct DayInfo {
@@ -846,9 +896,9 @@ pub(crate) struct DayInfo {
 }
 
 /// The days a destination with daily versions can be restored from, newest
-/// first; none for a mirror, whose root is the backup, nor while versions are
-/// being turned off. The path is built here so the frontend never joins
-/// paths.
+/// first; none for a mirror, whose root is the backup. While versions are
+/// being turned off, an error that says so. The path is built here so the
+/// frontend never joins paths.
 pub(crate) async fn restorable_days(destination: &Path) -> Result<Vec<DayInfo>> {
     let Some(marker) = read_marker(destination).await? else {
         return Ok(Vec::new());
@@ -856,7 +906,7 @@ pub(crate) async fn restorable_days(destination: &Path) -> Result<Vec<DayInfo>> 
     // Turning off: the other days are being deleted, and the one coming back
     // may be half-way up to the root already.
     if leaving_of(destination, &marker)?.is_some() {
-        return Ok(Vec::new());
+        return Err(turning_off(destination));
     }
     Ok(list(destination)
         .await?
@@ -1536,7 +1586,8 @@ mod tests {
     }
 
     /// Turning off deletes the other days and brings one up: none of them is
-    /// offered for restore meanwhile.
+    /// offered for restore meanwhile, and asking says why before a folder to
+    /// restore into is picked.
     #[tokio::test]
     async fn no_day_is_offered_for_restore_while_versions_are_being_turned_off() {
         let dir = tempfile::tempdir().unwrap();
@@ -1547,7 +1598,8 @@ mod tests {
         let marker = Marker { leaving: Some("2026-09-22".into()), ..Marker::default() };
         write_marker(dest, &marker).await.unwrap();
 
-        assert!(restorable_days(dest).await.unwrap().is_empty());
+        let err = restorable_days(dest).await.unwrap_err();
+        assert!(err.to_string().contains("being turned off"), "{err}");
     }
 
     /// The marker says the root holds nothing but days. When the move could
@@ -1670,6 +1722,109 @@ mod tests {
         );
         std::fs::remove_dir_all(dest.join(IN_PROGRESS)).unwrap();
         assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), dest);
+    }
+
+    /// Until the other days are cleared, `.driveby-in-progress` is what a
+    /// stopped run left behind and `leave` removes it first: the preview
+    /// neither takes it for the day set aside nor fails on it.
+    #[tokio::test]
+    async fn the_preview_ignores_a_stopped_run_s_leftover_until_the_days_are_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let marker = Marker { leaving: Some("2026-09-22".into()), ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        tree(&dest.join(IN_PROGRESS), &[("b.txt", "left by a stopped run")]);
+
+        assert_eq!(
+            preview_base(dest, false, d("2026-09-23")).await.unwrap(),
+            dest.join("2026-09-22")
+        );
+
+        std::fs::remove_dir_all(dest.join("2026-09-22")).unwrap();
+        assert_eq!(preview_base(dest, false, d("2026-09-23")).await.unwrap(), dest);
+    }
+
+    /// A marker that is there but cannot be read fails the destination: read
+    /// as "no marker", the root would be taken for a mirror and every day
+    /// moved or pruned.
+    #[tokio::test]
+    async fn a_marker_that_cannot_be_read_fails_the_destination_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        std::fs::create_dir(dest.join(MARKER)).unwrap();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+
+        assert!(read_marker(dest).await.is_err());
+        assert!(prepare(dest, 30, d("2026-09-23"), true, &go()).await.is_err());
+        assert!(leave(dest, &go()).await.is_err());
+        assert!(preview_base(dest, true, d("2026-09-23")).await.is_err());
+        assert_eq!(names_at(dest), [MARKER, "2026-09-22"]);
+        assert_eq!(names_at(&dest.join("2026-09-22")), ["a.txt"]);
+    }
+
+    /// One that can be read but not parsed still marks the layout: the day at
+    /// the root is cloned from, not moved into a first day.
+    #[tokio::test]
+    async fn a_marker_that_cannot_be_parsed_still_marks_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        std::fs::write(dest.join(MARKER), b"not json").unwrap();
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+
+        assert_eq!(read_marker(dest).await.unwrap(), Some(Marker::default()));
+        prepare(dest, 30, d("2026-09-23"), true, &go()).await.unwrap();
+        assert_eq!(names_at(&dest.join("2026-09-22")), ["a.txt"]);
+        assert_eq!(names_at(&dest.join(IN_PROGRESS)), ["a.txt"]);
+    }
+
+    /// Hidden on Windows, as a dot-file is elsewhere: deleting it by hand
+    /// would hand every day to a mirror prune. Rewritten and removed all the
+    /// same.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_marker_is_hidden_on_windows_and_still_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        let hidden = |p: &Path| crate::fsutil::read_attrs(p).unwrap() & 0x2 != 0;
+
+        mark(dest).await;
+        assert!(hidden(&dest.join(MARKER)));
+
+        let marker = Marker { leaving: Some("2026-09-22".into()), ..Marker::default() };
+        write_marker(dest, &marker).await.unwrap();
+        assert_eq!(read_marker(dest).await.unwrap(), Some(marker));
+        assert!(hidden(&dest.join(MARKER)));
+
+        remove_marker(dest).await.unwrap();
+        assert_eq!(read_marker(dest).await.unwrap(), None);
+    }
+
+    /// What a run leaves out of the version it writes is kept by the day
+    /// before that version — when there is one retention keeps.
+    #[tokio::test]
+    async fn the_day_before_keeps_what_a_run_leaves_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-10"), &[("a.txt", "a")]);
+        // No marker: a source folder named like a date; the first versioned
+        // run moves the whole root into its first day.
+        assert_eq!(earlier_day(dest, 30, d("2026-09-23")).await.unwrap(), None);
+
+        mark(dest).await;
+        tree(&dest.join("2026-09-21"), &[("a.txt", "a")]);
+        let before = Some(dest.join("2026-09-21"));
+        // Today's is cloned from the newest day.
+        assert_eq!(earlier_day(dest, 30, d("2026-09-23")).await.unwrap(), before);
+        // Today's is already there: the day before it.
+        tree(&dest.join("2026-09-23"), &[("a.txt", "a")]);
+        assert_eq!(earlier_day(dest, 30, d("2026-09-23")).await.unwrap(), before);
+        // Unless this very run's retention deletes it.
+        assert_eq!(earlier_day(dest, 1, d("2026-09-23")).await.unwrap(), None);
+
+        let leaving = Marker { leaving: Some("2026-09-23".into()), ..Marker::default() };
+        write_marker(dest, &leaving).await.unwrap();
+        assert_eq!(earlier_day(dest, 30, d("2026-09-23")).await.unwrap(), None);
     }
 
     #[tokio::test]
