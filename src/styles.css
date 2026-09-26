@@ -113,17 +113,6 @@ html, body {
   user-select: none;
 }
 
-/* Linux has no SF Pro, and past it the stack above lands on Nimbus Sans —
-   fontconfig's Helvetica — whose vertical metrics sit every label 2px high
-   in its line: in a button, a row, a sidebar item, anything centred. Inter,
-   and Adwaita Sans after it (GNOME's Inter), are the nearest free faces to
-   SF and measure centred in WebKitGTK: 7px above the caps, 7px below the
-   baseline in a 23px pill, against 5 and 9 for Nimbus Sans. */
-:root[data-platform='linux'][data-style='ios'] body {
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
-               'Inter', 'Adwaita Sans', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-}
-
 #root { height: 100%; }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: default; }

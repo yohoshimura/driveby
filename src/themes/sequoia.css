@@ -1,0 +1,246 @@
+/* ─────────────────────────────────────────────────────────────
+   Sequoia style — macOS 15, after the AppKit controls
+   Every rule is scoped to :root[data-style='ios'] (the stored id predates
+   the name), so styles.css stays the base the other styles build on and
+   this file only moves the look from iOS to the Mac. What stays Driveby's
+   own: the accent tint of the backgrounds, the motion, the toast and the
+   info bubble.
+
+   Control sizes are AppKit's, as WebKit draws them for native form
+   controls on the Mac: a push button is 20px tall (16 small, 28 large) and
+   a switch 38×22 (26×15 mini). System Settings sets its switches mini.
+   ───────────────────────────────────────────────────────────── */
+
+:root[data-style='ios'] {
+  /* The Mac's system green is its own, bluer and brighter than iOS's. */
+  --system-green: #28cd41;
+
+  /* The keyboard focus ring: 3px, in the accent, following the control's
+     own corners. The base ring was a fixed blue whatever the accent. */
+  --shadow-focus: 0 0 0 3px color-mix(in srgb, var(--accent) 50%, transparent);
+
+  --seq-button: #ffffff;
+  --seq-button-pressed: #e0e0e0;
+  --seq-button-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 0.5px 1.5px rgba(0, 0, 0, 0.2);
+  --seq-segment-track: rgba(0, 0, 0, 0.06);
+  --seq-segment-selected: #ffffff;
+  --seq-segment-divider: rgba(0, 0, 0, 0.1);
+  --seq-switch-off: rgba(0, 0, 0, 0.09);
+  --seq-search: rgba(0, 0, 0, 0.05);
+}
+
+:root[data-style='ios'][data-theme='dark'] {
+  /* The dark variants the base never set: it kept the light ones. */
+  --system-green: #32d74b;
+  --system-red: #ff453a;
+  --system-orange: #ff9f0a;
+  --system-yellow: #ffd60a;
+  --system-gray: #98989d;
+
+  --seq-button: rgba(255, 255, 255, 0.2);
+  --seq-button-pressed: rgba(255, 255, 255, 0.3);
+  --seq-button-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.3), 0 0.5px 1px rgba(0, 0, 0, 0.3), inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
+  --seq-segment-track: rgba(255, 255, 255, 0.07);
+  --seq-segment-selected: rgba(255, 255, 255, 0.24);
+  --seq-segment-divider: rgba(255, 255, 255, 0.12);
+  --seq-switch-off: rgba(255, 255, 255, 0.12);
+  --seq-search: rgba(255, 255, 255, 0.08);
+}
+
+/* Linux has no SF Pro, and past it the stack in styles.css lands on Nimbus
+   Sans — fontconfig's Helvetica — whose vertical metrics sit every label
+   2px high in its line: in a button, a row, a sidebar item, anything
+   centred. Inter, and Adwaita Sans after it (GNOME's Inter), are the
+   nearest free faces to SF and measure centred in WebKitGTK: 7px above the
+   caps, 7px below the baseline in a 23px pill, against 5 and 9 for Nimbus
+   Sans. */
+:root[data-platform='linux'][data-style='ios'] body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display',
+               'Inter', 'Adwaita Sans', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+/* ─── Headings ─── */
+/* The Mac heads a section with a bold line of body text, as System
+   Settings does; small spaced capitals are iOS's grouped lists. */
+:root[data-style='ios'] .group-title {
+  font-size: 13px; font-weight: 700;
+  color: var(--label-primary);
+  text-transform: none; letter-spacing: 0;
+  padding: 16px 2px 8px;
+}
+:root[data-style='ios'] .stat__head,
+:root[data-style='ios'] .stat-block__head,
+:root[data-style='ios'] .card__head {
+  font-size: 13px; font-weight: 700;
+  color: var(--label-primary);
+  text-transform: none; letter-spacing: 0;
+}
+:root[data-style='ios'] .chart__label { font-size: 10px; text-transform: none; letter-spacing: 0; }
+
+/* Labels are regular weight on the Mac; the medium weight was iOS's. */
+:root[data-style='ios'] .setting-row__label { font-weight: 400; }
+:root[data-style='ios'] .form-field__label { font-weight: 400; }
+:root[data-style='ios'] .task__name { font-size: 13px; }
+
+/* ─── Sidebar ─── */
+/* A section of the Finder's sidebar: bold 11px, in its own case. */
+:root[data-style='ios'] .sidebar__group-title {
+  font-size: 11px; font-weight: 700;
+  color: var(--label-secondary);
+  text-transform: none; letter-spacing: 0;
+}
+/* Sidebar symbols take the accent, and turn white on the selected row. */
+:root[data-style='ios'] .sidebar__item-icon { color: var(--accent); opacity: 1; }
+:root[data-style='ios'] .sidebar__item--active .sidebar__item-icon { color: inherit; }
+/* A search field in a sidebar is a soft fill, not a bordered box. */
+:root[data-style='ios'] .sidebar__search-input {
+  height: 22px;
+  font-size: 13px;
+  background: var(--seq-search);
+  box-shadow: none;
+}
+:root[data-style='ios'] .sidebar__search-input:focus { box-shadow: var(--shadow-focus); }
+
+/* ─── Buttons (push buttons) ─── */
+:root[data-style='ios'] .btn {
+  height: 20px;
+  padding: 0 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 400;
+  background: var(--seq-button);
+  box-shadow: var(--seq-button-shadow);
+}
+:root[data-style='ios'] .btn:hover { background: var(--seq-button); }
+:root[data-style='ios'] .btn:active { background: var(--seq-button-pressed); }
+:root[data-style='ios'] .btn:focus-visible { box-shadow: var(--seq-button-shadow), var(--shadow-focus); }
+
+/* The default button: the accent, with white text. */
+:root[data-style='ios'] .btn--primary,
+:root[data-style='ios'] .btn--primary:hover {
+  background: var(--accent);
+  color: var(--accent-label);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 0.5px 1.5px rgba(0, 0, 0, 0.2);
+}
+:root[data-style='ios'] .btn--primary:active { background: color-mix(in srgb, var(--accent) 85%, #000000); }
+:root[data-style='ios'] .btn--destructive.btn--primary,
+:root[data-style='ios'] .btn--destructive.btn--primary:hover { background: var(--system-red); color: #ffffff; }
+:root[data-style='ios'] .btn--destructive.btn--primary:active { background: color-mix(in srgb, var(--system-red) 85%, #000000); }
+
+/* Borderless buttons are text in the accent, with no bezel. */
+:root[data-style='ios'] .btn--borderless,
+:root[data-style='ios'] .btn--borderless:hover {
+  background: transparent;
+  box-shadow: none;
+  padding: 0 6px;
+}
+:root[data-style='ios'] .btn--borderless:hover { background: var(--bg-control-hover); }
+:root[data-style='ios'] .btn--borderless:active { background: var(--bg-control-pressed); }
+:root[data-style='ios'] .btn--borderless:focus-visible { box-shadow: var(--shadow-focus); }
+/* In the base, the borderless rule comes after the destructive one and
+   turns a destructive link (Clear) blue. */
+:root[data-style='ios'] .btn--borderless.btn--destructive { color: var(--system-red); }
+
+/* Driveby's small button is the one it sets beside a field or on a task —
+   the place a Mac app puts a regular push button. AppKit's own small size
+   (16px, 11px text) is kept for the links inside history rows, which are
+   as dense as a table's. */
+:root[data-style='ios'] .btn--small { height: 20px; padding: 0 10px; font-size: 13px; }
+:root[data-style='ios'] .btn--borderless.btn--small { padding: 0 5px; }
+:root[data-style='ios'] .history-table .btn--small { height: 16px; font-size: 11px; border-radius: 4px; }
+:root[data-style='ios'] .btn--large { height: 28px; padding: 0 14px; border-radius: 7px; }
+
+/* An alert's buttons are the large size, side by side across its width. */
+:root[data-style='ios'] .modal__actions .btn { height: 28px; border-radius: 7px; }
+
+/* Centring the line box centres the font's ascent and descent, and Segoe
+   UI's descent is deep: lowercase sat 1.3px below the middle of a bezel.
+   2px of bottom padding lifts every label 1px, borderless ones too so a row
+   keeps one baseline. SF Pro and Inter measure centred, so only Windows.
+   Last among the button rules, to win the ties that reset `padding`. */
+:root[data-platform='windows'][data-style='ios'] .btn { padding-bottom: 2px; }
+
+/* ─── Switch ─── */
+/* The mini switch System Settings uses, on in the accent rather than the
+   green iOS turns on. */
+:root[data-style='ios'] .toggle {
+  width: 26px; height: 15px;
+  border-radius: 7.5px;
+  background: var(--seq-switch-off);
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+:root[data-style='ios'] .toggle--on { background: var(--accent); box-shadow: none; }
+:root[data-style='ios'] .toggle__knob {
+  top: 1px; left: 1px;
+  width: 13px; height: 13px;
+  box-shadow: 0 0.5px 1.5px rgba(0, 0, 0, 0.3), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+:root[data-style='ios'] .toggle--on .toggle__knob { left: 12px; }
+:root[data-style='ios'] .toggle:focus-visible { box-shadow: var(--shadow-focus); }
+
+/* ─── Fields ─── */
+:root[data-style='ios'] .field { height: 22px; padding: 0 7px; border-radius: 5px; }
+:root[data-style='ios'] .field:focus { box-shadow: inset 0 0 0 0.5px var(--separator-opaque), var(--shadow-focus); }
+/* Restated, or the focus rule above would drop the red edge of a field
+   that is refusing what was typed. */
+:root[data-style='ios'] .field[aria-invalid='true']:focus { box-shadow: inset 0 0 0 1px var(--system-red), var(--shadow-focus); }
+:root[data-style='ios'] .field--compact { height: 20px; font-size: 12px; }
+/* A dark text field is a shade lighter than what it sits on; the base one
+   takes the group's own colour, and an empty one all but disappears. */
+:root[data-style='ios'][data-theme='dark'] .field:not(.field--readonly) { background: rgba(255, 255, 255, 0.05); }
+:root[data-style='ios'] .field--textarea { height: auto; padding: 5px 7px; }
+
+/* ─── Segmented control ─── */
+/* A grey track with the chosen segment raised in white, and a hairline
+   between the others. */
+:root[data-style='ios'] .segmented {
+  padding: 1px;
+  border-radius: 6px;
+  background: var(--seq-segment-track);
+  box-shadow: none;
+}
+:root[data-style='ios'] .segmented__btn {
+  position: relative;
+  padding: 1px 10px;
+  font-size: 13px;
+  font-weight: 400;
+  border-radius: 5px;
+}
+:root[data-style='ios'] .segmented__btn + .segmented__btn::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 25%;
+  width: 1px; height: 50%;
+  background: var(--seq-segment-divider);
+}
+:root[data-style='ios'] .segmented__btn--active::before,
+:root[data-style='ios'] .segmented__btn--active + .segmented__btn::before { display: none; }
+:root[data-style='ios'] .segmented__btn:hover:not(.segmented__btn--active) { background: transparent; }
+:root[data-style='ios'] .segmented__btn--active {
+  background: var(--seq-segment-selected);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.06), 0 0.5px 1.5px rgba(0, 0, 0, 0.18);
+}
+
+/* ─── History table ─── */
+/* A Mac table's header is the table's own ground, in small secondary text. */
+:root[data-style='ios'] .history-table th {
+  font-size: 11px; font-weight: 500;
+  text-transform: none; letter-spacing: 0;
+  background: transparent;
+}
+
+:root[data-style='ios'] .badge--success { background: color-mix(in srgb, var(--system-green) 15%, transparent); }
+:root[data-style='ios'] .badge--partial { background: color-mix(in srgb, var(--system-orange) 15%, transparent); }
+:root[data-style='ios'] .badge--error { background: color-mix(in srgb, var(--system-red) 15%, transparent); }
+
+/* ─── Modal (alert) ─── */
+/* An alert is narrow, its title bold at body size, its message small. The
+   preview keeps its width: it carries a line of figures per destination. */
+:root[data-style='ios'] .modal__content {
+  max-width: 260px;
+  padding: 20px 16px 16px;
+  border-radius: 12px;
+}
+:root[data-style='ios'] .modal__content--wide { max-width: 560px; }
+:root[data-style='ios'] .modal__title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+:root[data-style='ios'] .modal__body { font-size: 11px; color: var(--label-primary); margin-bottom: 16px; }

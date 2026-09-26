@@ -4,6 +4,7 @@ import App from './App.jsx';
 import ErrorBoundary from './components/ErrorBoundary.jsx';
 import './styles.css';
 // After the base: each style only overrides it, under its own data-style.
+import './themes/sequoia.css';
 import './themes/windows.css';
 import './themes/gnome.css';
 
