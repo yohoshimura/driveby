@@ -307,10 +307,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         />
       </FormField>
 
-      <FormField
-        label={t('form.label.sources')}
-        hint={t(nested ? 'form.hint.sources' : 'form.hint.source_single')}
-      >
+      <FormField label={t('form.label.sources')} tip={t('form.tip.sources')}>
         <div className="dest-list">
           {task.sources.length === 0 ? (
             <div className="field-row">
@@ -374,7 +371,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         </div>
       </FormField>
 
-      <FormField label={destinationLabel} hint={t('form.hint.destinations')}>
+      <FormField label={destinationLabel}>
         <div className="dest-list">
           {task.destinations.length === 0 ? (
             <div className="field-row">
@@ -422,7 +419,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         </div>
       </FormField>
 
-      <FormField label={t('form.label.schedule')} hint={t('form.hint.schedule')}>
+      <FormField label={t('form.label.schedule')}>
         <select
           className="field"
           value={task.schedule}
@@ -476,7 +473,7 @@ export default function NewTaskForm({ onAdd, onSave, onCancel, defaultDestinatio
         </FormField>
       )}
 
-      <FormField label={t('form.label.versions')} hint={t('form.hint.versions')}>
+      <FormField label={t('form.label.versions')} tip={t('form.tip.versions')}>
         <select
           className="field"
           value={task.keepVersionsDays}

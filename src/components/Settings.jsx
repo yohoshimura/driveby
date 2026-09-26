@@ -270,7 +270,6 @@ export default function Settings() {
             <div className="setting-row__label">{t('settings.label.history_retention')}</div>
           </div>
           <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.history_retention')} />
             <div className="segmented" role="radiogroup" aria-label={t('settings.label.history_retention')}>
               {HISTORY_RETENTIONS.map((key) => (
                 <button
@@ -291,10 +290,7 @@ export default function Settings() {
       <div className="group-title">{t('settings.section.filtering')}</div>
       <div className="group">
         <div className="setting-row setting-row--stacked">
-          <div className="setting-row__control" style={{ justifyContent: 'flex-start', justifySelf: 'start' }}>
-            <div className="setting-row__label">{t('settings.label.exclude')}</div>
-            <InfoTip placement="right" text={t('settings.tip.exclude')} />
-          </div>
+          <div className="setting-row__label">{t('settings.label.exclude')}</div>
           <textarea
             value={settings.excludePatterns}
             onChange={(e) => updateSetting('excludePatterns', e.target.value)}
@@ -340,7 +336,6 @@ export default function Settings() {
             <div className="setting-row__label">{t('settings.label.close_to_tray')}</div>
           </div>
           <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.close_to_tray')} />
             <Toggle
               value={!!settings.closeToTray}
               onChange={(v) => updateSetting('closeToTray', v)}
@@ -353,7 +348,6 @@ export default function Settings() {
             <div className="setting-row__label">{t('settings.label.autostart')}</div>
           </div>
           <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.autostart')} />
             <Toggle
               value={autostartOn}
               onChange={toggleAutostart}
@@ -455,7 +449,6 @@ export default function Settings() {
             <div className="setting-row__label">{t('settings.label.ui_style')}</div>
           </div>
           <div className="setting-row__control">
-            <InfoTip text={t('settings.tip.ui_style')} />
             <div className="segmented" role="radiogroup" aria-label={t('settings.label.ui_style')}>
               {UI_STYLES.map((opt) => (
                 <button

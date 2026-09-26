@@ -862,9 +862,13 @@ input, textarea { user-select: text; }
 .day-picker__time { width: 110px; }
 
 .form-field { margin-bottom: 12px; }
+.form-field__head {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 4px;
+}
 .form-field__label {
   display: block; font-size: 12px; font-weight: 500;
-  color: var(--label-secondary); margin-bottom: 4px;
+  color: var(--label-secondary);
 }
 .form-field__hint {
   font-size: 11px; color: var(--label-tertiary); margin-top: 4px;
