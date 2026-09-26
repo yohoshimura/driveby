@@ -578,8 +578,10 @@ export function translate(lang, key, params) {
   if (s === undefined) s = fallback[key];
   if (s === undefined) return key;
   if (params) {
+    // A function replacement: a value is inserted as it is, so a path or an
+    // error holding `$&` or `$'` is not read as a replacement pattern.
     for (const k of Object.keys(params)) {
-      s = s.replace(new RegExp(`\\{${k}\\}`, 'g'), String(params[k]));
+      s = s.replaceAll(`{${k}}`, () => String(params[k]));
     }
   }
   return s;

@@ -88,6 +88,14 @@ mod click {
     pub(super) fn run<R: Runtime>(app: &AppHandle<R>, action: Option<&Action>) {
         match action {
             Some(Action::OpenFolder { path, .. }) => {
+                // The path arrives from the webview, and the opener hands it
+                // to the platform's default handler — ShellExecute on
+                // Windows, which *runs* an .exe, .lnk or .bat. Only ever open
+                // a folder: that lands in the file manager whatever it holds.
+                if !is_openable_folder(std::path::Path::new(path)) {
+                    warn!(path = %path, "notification: refusing to open a path that is not a folder");
+                    return;
+                }
                 // The free function rather than `Opener::open_path`: it stats
                 // the path first, so a drive unplugged since the run ends up
                 // in the log instead of in front of the file manager.
@@ -103,9 +111,26 @@ mod click {
         }
     }
 
+    /// Whether an "open folder" button may hand `path` to the opener: an
+    /// absolute path to an existing directory, and nothing else.
+    pub(super) fn is_openable_folder(path: &std::path::Path) -> bool {
+        path.is_absolute() && std::fs::metadata(path).is_ok_and(|m| m.is_dir())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn only_an_existing_absolute_folder_is_opened() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("setup.exe");
+            std::fs::write(&exe, b"MZ").unwrap();
+            assert!(is_openable_folder(dir.path()));
+            assert!(!is_openable_folder(&exe), "a file would be run by its handler");
+            assert!(!is_openable_folder(&dir.path().join("gone")));
+            assert!(!is_openable_folder(std::path::Path::new("relative/dir")));
+        }
 
         fn both() -> Vec<Action> {
             vec![

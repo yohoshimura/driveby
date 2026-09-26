@@ -1,0 +1,83 @@
+# Dependabot version updates (OWASP DevSecOps 2-3-2 SCA, 2-7-4 Vulnerability
+# Management "dependency update PRs", 2-2-1-4 "Dependabot for Actions").
+#
+# Also switch on, in Settings → Code security: Dependency graph, Dependabot
+# alerts and Dependabot security updates. Security updates are separate from
+# this file, ignore the cooldown below and arrive as soon as an advisory does.
+#
+# Not covered by Dependabot (bump by hand): RUST_TOOLCHAIN in ci.yml and
+# release.yml, the gitleaks version + SHA-256 in ci.yml, cargo-cyclonedx and
+# @cyclonedx/cyclonedx-npm versions in release.yml, zizmor in ci.yml, and the
+# pre-commit revs (`pre-commit autoupdate --freeze`).
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    # Do not adopt a release in its first days: most malicious npm versions
+    # are caught and pulled within that window (CICD-SEC-6).
+    cooldown:
+      default-days: 7
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      # The JS API/plugins and the CLI must track the Rust `tauri` crates
+      # (the CLI warns on mismatched versions); review them together with
+      # the cargo `tauri` group below.
+      tauri:
+        patterns: ["@tauri-apps/*"]
+      frontend-build:
+        patterns: ["vite", "vitest", "esbuild", "@vitejs/*"]
+      react:
+        patterns: ["react", "react-dom"]
+      npm-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-patch-days: 3
+      semver-minor-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Keeps the SHA pins in .github/workflows current, including the
+  # `# vX.Y.Z` comments next to them.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]

@@ -122,6 +122,18 @@ impl Default for Marker {
 /// destination to a mirror prune, which deletes every snapshot as an orphan.
 pub(crate) async fn read_marker(destination: &Path) -> Result<Option<Marker>> {
     let path = long_path(&destination.join(MARKER));
+    // The marker is a few hundred bytes. One that is not a regular file (a
+    // FIFO on a tampered drive would block the read forever) fails the
+    // destination like any marker that cannot be read; one too large to be
+    // ours (it would be read whole into memory) reads as present with default
+    // contents, the same answer as unparseable JSON.
+    match fs::symlink_metadata(&path).await {
+        Ok(meta) if !meta.is_file() => {
+            return Err(anyhow!("{} is not a regular file", path.display()));
+        }
+        Ok(meta) if meta.len() > 64 * 1024 => return Ok(Some(Marker::default())),
+        _ => {}
+    }
     match fs::read(&path).await {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or_default())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -588,7 +600,11 @@ pub(crate) async fn prepare(
     // Asked before retention deletes anything: a link named like today would
     // have the run write through it.
     let today_there = folder_state(&today).await?;
-    for old in expired(&snapshots, day, keep_days) {
+    // The window is measured from the clock, not from `day`: a folder named
+    // `9999-12-31` on the drive (planted, or left by a clock that once ran
+    // ahead) would otherwise become "today" and put every real day outside
+    // the window.
+    for old in expired(&snapshots, clock, keep_days) {
         info!(dest = %destination.display(), "deleting the version of {}", old.name());
         discard_day(destination, &old, token).await?;
     }
@@ -871,7 +887,8 @@ pub(crate) async fn earlier_day(
     }
     let snapshots = list(destination).await?;
     let day = effective_day(clock, &snapshots);
-    let expired = expired(&snapshots, day, keep_days);
+    // Measured from the clock, exactly as `plan` does.
+    let expired = expired(&snapshots, clock, keep_days);
     Ok(snapshots
         .iter()
         .rev()
@@ -1265,6 +1282,23 @@ mod tests {
         );
         assert!(!dest.join("2026-09-20").exists());
         assert!(!dest.join(IN_PROGRESS).exists());
+    }
+
+    /// A planted `9999-12-31` folder is written into, but real days inside
+    /// the retention window survive the run.
+    #[tokio::test]
+    async fn a_future_dated_folder_does_not_delete_the_real_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+        tree(&dest.join("2026-09-20"), &[("a.txt", "a")]);
+        tree(&dest.join("2026-09-22"), &[("a.txt", "a")]);
+        std::fs::create_dir_all(dest.join("9999-12-31")).unwrap();
+        mark(dest).await;
+
+        prepare(dest, 7, d("2026-09-23"), true, &go()).await.unwrap();
+
+        assert!(dest.join("2026-09-20").is_dir());
+        assert!(dest.join("2026-09-22").is_dir());
     }
 
     #[tokio::test]
@@ -1765,6 +1799,15 @@ mod tests {
 
     /// One that can be read but not parsed still marks the layout: the day at
     /// the root is cloned from, not moved into a first day.
+    /// A marker far larger than ours is never read into memory.
+    #[tokio::test]
+    async fn an_oversized_marker_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = std::fs::File::create(dir.path().join(MARKER)).unwrap();
+        big.set_len(1 << 30).unwrap(); // sparse: costs nothing on disk
+        assert_eq!(read_marker(dir.path()).await.unwrap(), Some(Marker::default()));
+    }
+
     #[tokio::test]
     async fn a_marker_that_cannot_be_parsed_still_marks_the_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1884,6 +1927,21 @@ mod tests {
 
         let stale = vec![snap(root, "2026-01-01")];
         assert!(expired(&stale, d("2026-09-23"), 7).is_empty(), "the last day always stays");
+    }
+
+    /// A folder dated far in the future becomes the day a run writes into,
+    /// but must not become the day retention counts back from: measured
+    /// from the clock, every real day inside the window stays.
+    #[test]
+    fn a_future_dated_folder_does_not_expire_real_history() {
+        let root = Path::new("/b");
+        let snaps: Vec<Snapshot> = ["2026-09-20", "2026-09-22", "9999-12-31"]
+            .iter()
+            .map(|s| snap(root, s))
+            .collect();
+        let clock = d("2026-09-23");
+        assert_eq!(effective_day(clock, &snaps), d("9999-12-31"));
+        assert!(expired(&snaps, clock, 7).is_empty());
     }
 
     #[test]

@@ -598,8 +598,18 @@ async fn update_last_backup<R: Runtime>(app: &AppHandle<R>, task_id: &str) -> Re
     };
     // Serialise with the JS-side writer via the shared persist mutex (#7).
     persist::with_tasks_lock(|| async {
-        let mut value: serde_json::Value =
-            persist::read_json_or(&path, serde_json::Value::Array(vec![])).await;
+        // Not `read_json_or`: this writes the document back, and a file that
+        // could not be read (a lock, a permission, a bad sector) would come
+        // back as `[]` and be saved over every task the user has. Missing
+        // has no task to stamp either, so only a clean read is written.
+        let mut value: serde_json::Value = match persist::load_json(&path).await {
+            persist::Loaded::Ok(value) => value,
+            persist::Loaded::Missing => return Ok(()),
+            persist::Loaded::Damaged => {
+                warn!(task = %task_id, "tasks.json unreadable; lastBackup not recorded");
+                return Ok(());
+            }
+        };
         let now = Utc::now().to_rfc3339();
         let mut updated_task: Option<serde_json::Value> = None;
         if let Some(arr) = value.as_array_mut() {
@@ -1110,6 +1120,52 @@ async fn preflight_destination(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a destination that is the home folder or holds it. Its own check,
+/// not part of `preflight_destination`: that one's failures mean "not
+/// there" and are filed as Unreachable, while this is a destination the user
+/// has to change. The preview asks it too, so the dialog never offers a run
+/// the run would refuse.
+pub(crate) async fn refuse_home(destination: &Path) -> Result<()> {
+    #[allow(deprecated)] // std::env::home_dir is correct on every platform since 1.85
+    let Some(home) = std::env::home_dir() else {
+        return Ok(());
+    };
+    if holds_home(destination, &home).await {
+        return Err(anyhow!(
+            "{} is your home folder or contains it: a mirror there would delete everything the source does not have",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `destination` is `home` itself or one of its ancestors (`/`,
+/// `C:\`, `C:\Users`). The task arrives from the webview, and a mirror prunes
+/// whatever its destination holds that the source does not — pointed at the
+/// home folder, that is every document the user has. A drive root that does
+/// not hold the home folder (`E:\`, `/Volumes/Backup`) is a normal
+/// destination and stays allowed. Both sides are canonicalised so that case,
+/// `..` and symlinks cannot slip past the comparison; the raw paths are
+/// compared as well, because a volume `canonicalize` cannot resolve would
+/// leave only one side with Windows' `\\?\` prefix.
+async fn holds_home(destination: &Path, home: &Path) -> bool {
+    if home.starts_with(destination) {
+        return true;
+    }
+    let (Ok(dest), Ok(home)) = (fs::canonicalize(destination).await, fs::canonicalize(home).await)
+    else {
+        return false;
+    };
+    // macOS reaches the same folders through the data volume's firmlink:
+    // `/System/Volumes/Data/Users` is `/Users`.
+    #[cfg(target_os = "macos")]
+    let dest = match dest.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => dest,
+    };
+    home.starts_with(&dest)
+}
+
 /// Reject every nesting the run cannot survive, before a single byte moves.
 ///
 /// Source against destination is the long-standing guard (#3), shared with
@@ -1239,7 +1295,7 @@ pub(crate) struct WritePlan {
 /// the NTFS and ext4 default. Rounding every file up is what keeps a tree
 /// of many small files from fitting on paper and not on the disk.
 fn on_disk(size: u64) -> u64 {
-    size.div_ceil(4096) * 4096
+    size.div_ceil(4096).saturating_mul(4096)
 }
 
 /// Compare every walked file with what the destination holds, by the size
@@ -1282,8 +1338,8 @@ pub(crate) async fn plan_writes(
         match fs::metadata(long_path(&destination.join(at.as_deref().unwrap_or(&file.rel)))).await {
             Err(_) => {
                 plan.new_files += 1;
-                plan.new_bytes += file.size;
-                plan.required_bytes += on_disk(file.size);
+                plan.new_bytes = plan.new_bytes.saturating_add(file.size);
+                plan.required_bytes = plan.required_bytes.saturating_add(on_disk(file.size));
             }
             Ok(meta)
                 if meta.is_file()
@@ -1297,14 +1353,16 @@ pub(crate) async fn plan_writes(
             }
             Ok(meta) => {
                 plan.modified_files += 1;
-                plan.modified_bytes += file.size;
+                plan.modified_bytes = plan.modified_bytes.saturating_add(file.size);
                 // A directory in the way takes no room of its own to speak of.
                 let old = if meta.is_file() && credit_replaced {
                     on_disk(meta.len())
                 } else {
                     0
                 };
-                plan.required_bytes += on_disk(file.size).saturating_sub(old);
+                plan.required_bytes = plan
+                    .required_bytes
+                    .saturating_add(on_disk(file.size).saturating_sub(old));
                 rewritten.push(on_disk(file.size));
             }
         }
@@ -1316,7 +1374,7 @@ pub(crate) async fn plan_writes(
 /// The sum of the `n` largest sizes.
 fn largest(mut sizes: Vec<u64>, n: usize) -> u64 {
     sizes.sort_unstable_by(|a, b| b.cmp(a));
-    sizes.iter().take(n).sum()
+    sizes.iter().take(n).fold(0u64, |a, &b| a.saturating_add(b))
 }
 
 /// A destination whose volume cannot take what the run would write.
@@ -1342,7 +1400,12 @@ pub(crate) async fn decide_room(
     token: &CancellationToken,
 ) -> Result<Option<Shortfall>> {
     let sizes: Vec<u64> = files.iter().map(|f| on_disk(f.size)).collect();
-    let most = sizes.iter().sum::<u64>() + largest(sizes, parallel);
+    // Saturating: two files near 2^63 bytes (possible on XFS, btrfs, APFS)
+    // must not wrap the sum to a figure that fits.
+    let most = sizes
+        .iter()
+        .fold(0u64, |a, &b| a.saturating_add(b))
+        .saturating_add(largest(sizes, parallel));
     if most <= available {
         return Ok(None);
     }
@@ -1900,6 +1963,15 @@ async fn execute_all<R: Runtime>(
             outcomes.push(DestinationOutcome::stillborn(
                 destination,
                 DestinationStatus::Unreachable,
+                Some(e.to_string()),
+            ));
+            continue;
+        }
+        if let Err(e) = refuse_home(destination).await {
+            warn!(dest = %destination.display(), "refusing destination: {}", e);
+            outcomes.push(DestinationOutcome::stillborn(
+                destination,
+                DestinationStatus::Error,
                 Some(e.to_string()),
             ));
             continue;
@@ -2735,10 +2807,21 @@ fn listing_failure_is_fatal(dir: &Path, root: &Path) -> bool {
 }
 
 pub(crate) fn rel_of(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    rel_string(path.strip_prefix(root).unwrap_or(path))
+}
+
+/// A relative path as the `/`-separated string the pipeline keys on. Only
+/// on Windows is `\` a separator to translate. Elsewhere it is an ordinary
+/// character in a name, and turning it into `/` would let a file named
+/// `..\..\x` become `../../x` and be written outside the destination: it is
+/// kept as it is, so the name stays one component wherever it is joined.
+pub(crate) fn rel_string(rel: &Path) -> String {
+    let s = rel.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
 }
 
 /// Enumerate the source tree.
@@ -2851,7 +2934,7 @@ pub(crate) async fn walk(
                     }
                 };
                 let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                total += meta.len();
+                total = total.saturating_add(meta.len());
                 files.push(FileEntry {
                     path,
                     rel: rel_str,
@@ -3043,7 +3126,7 @@ async fn copy_file<F: FnMut(i64)>(
     // A scratch file left by a killed run may still carry +R.
     let leftover = tmp_l.clone();
     blocking(move || clear_readonly(&leftover)).await;
-    let mut writer = fs::File::create(&tmp_l)
+    let mut writer = crate::fsutil::create_scratch(&tmp_l)
         .await
         .context("create destination")?;
 
@@ -3167,6 +3250,71 @@ async fn hash_file(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mirror pointed at the home folder, or anything above it, would
+    /// prune every document the user has.
+    #[tokio::test]
+    async fn the_home_folder_and_its_ancestors_are_not_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home").join("me");
+        let drive = root.path().join("backup-drive");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&drive).unwrap();
+
+        assert!(holds_home(&home, &home).await);
+        assert!(holds_home(&root.path().join("home"), &home).await);
+        assert!(holds_home(root.path(), &home).await);
+        assert!(
+            holds_home(&drive.join(".."), &home).await,
+            "`..` must not hide an ancestor"
+        );
+        assert!(!holds_home(&drive, &home).await, "an unrelated drive is fine");
+        assert!(!holds_home(&home.join("Backups"), &home).await, "a folder inside home is fine");
+    }
+
+    /// On Linux and macOS `\` is an ordinary character in a name. A source
+    /// file named `..\..\ESCAPED.txt` is backed up under that very name,
+    /// inside the destination — it used to become `../../ESCAPED.txt` and be
+    /// written two folders above it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backslash_in_a_name_stays_inside_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("a").join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let name = "..\\..\\ESCAPED.txt";
+        std::fs::write(source.join(name), b"x").unwrap();
+
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "backslash".into(),
+            name: "backslash".into(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+            keep_versions_days: None,
+        };
+        let payload = execute_all(
+            app.handle(),
+            "backup-backslash",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(payload.success);
+        assert!(!root.path().join("ESCAPED.txt").exists(), "backup wrote outside its destination");
+        assert_eq!(std::fs::read(dest.join(name)).unwrap(), b"x");
+    }
 
     #[test]
     fn icon_descriptor_matches_desktop_ini_at_any_depth() {
@@ -5783,7 +5931,7 @@ mod tests {
                 Source { path: here.to_string_lossy().into(), folder: "Here".into() },
                 Source { path: gone.to_string_lossy().into(), folder: "Gone".into() },
             ]),
-            ..keeping(task_with("v-missing", &here, &[dest.clone()]), 30)
+            ..keeping(task_with("v-missing", &here, std::slice::from_ref(&dest)), 30)
         };
         run_on_day(&task, &dest, "2026-09-21", &go()).await.unwrap();
 

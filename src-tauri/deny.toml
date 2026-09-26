@@ -1,0 +1,79 @@
+# cargo-deny policy for Driveby (policy as code: OWASP DevSecOps 3-1-2,
+# enforced as a CI gate: 2-3-5; SCA + licence policy: 2-3-2).
+#
+# Lives next to Cargo.toml, so both of these find it without flags:
+#   cargo deny --manifest-path src-tauri/Cargo.toml check
+#   EmbarkStudios/cargo-deny-action with manifest-path: src-tauri/Cargo.toml
+#
+# Validated with cargo-deny 0.20.2 against src-tauri/Cargo.lock at 2.0.0.
+
+[graph]
+# The platforms Driveby ships on. Without this, cargo-deny also judges crates
+# that only exist for Android, iOS, WASI and so on.
+targets = [
+  "x86_64-pc-windows-msvc",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+]
+
+[output]
+feature-depth = 1
+
+[advisories]
+# The RustSec database, fetched fresh on every run.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Vulnerabilities always fail. For the informational kinds, only a crate
+# Driveby depends on *directly* fails the gate; the rest (the whole GTK3 and
+# html5ever stack Tauri pulls in) are reported, and decided upstream.
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "deny"
+# Every exception names a reason and a date to look again (2-3-5: time-boxed,
+# owned exceptions; never a silent `ignore`).
+ignore = [
+  # Nothing is ignored today. Template:
+  # { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply / what we wait for; revisit YYYY-MM-DD" },
+]
+
+[licenses]
+# Built from the licences actually present in Cargo.lock (cargo metadata,
+# 581 crates) and nothing more. Where a crate offers a choice (MIT OR
+# Apache-2.0), any allowed option is enough.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception", # target-lexicon (build-time only)
+  "BSD-3-Clause",                   # brotli, and via OR elsewhere
+  "ISC",                            # ring (Apache-2.0 AND ISC)
+  "Zlib",
+  "Unicode-3.0",                    # icu_* / unicode-ident data tables
+  "MPL-2.0",                        # cssparser, selectors, dtoa-short, option-ext: file-level copyleft, unmodified use is fine for an MIT app
+  "BSL-1.0",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+# driveby itself is not published to crates.io.
+ignore = true
+
+[bans]
+# Tauri's tree carries duplicate majors (windows-sys, bitflags, ...), which
+# Driveby cannot fix alone: report, do not block.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+  # Driveby talks TLS through rustls only (reqwest in the updater). Anything
+  # dragging OpenSSL in is a change worth a conversation.
+  { crate = "openssl-sys", reason = "TLS goes through rustls; OpenSSL would be a new native attack surface" },
+]
+
+[sources]
+# Only crates.io. A git or alternative-registry dependency must be added here
+# on purpose, in review (dependency confusion / CICD-SEC-6).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

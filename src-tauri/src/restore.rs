@@ -295,7 +295,8 @@ async fn walk(root: &Path) -> Result<Tree> {
                 continue;
             }
             let rel_str = match path.strip_prefix(root) {
-                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+                // Not a bare `\` → `/`: see `rel_string`.
+                Ok(rel) => crate::backup::rel_string(rel),
                 Err(_) => continue,
             };
             if ft.is_dir() {
@@ -391,7 +392,7 @@ async fn copy(src: &Path, dst: &Path, token: &CancellationToken) -> Result<()> {
     // A scratch file left by a killed run may still carry +R.
     let leftover = tmp.to_path_buf();
     blocking(move || clear_readonly(&leftover)).await;
-    let mut w = fs::File::create(tmp).await.context("create destination")?;
+    let mut w = crate::fsutil::create_scratch(tmp).await.context("create destination")?;
     let streamed = async {
         let mut buf = vec![0u8; 256 * 1024];
         loop {
@@ -498,6 +499,30 @@ mod tests {
     /// folder has no file to bring it into being, so `create_dir_all` on each
     /// file's parent never reached it — the restored tree quietly held fewer
     /// folders than the backup it came from, and nothing said so.
+    /// On Linux and macOS `\` is an ordinary character in a name. A backup
+    /// drive holding `..\..\x` restores it under that name, not as
+    /// `../../x` outside the chosen destination.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backslash_in_a_name_cannot_climb_out_of_the_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        let dest = root.path().join("a").join("dest");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(backup.join("..\\..\\ESCAPED.txt"), b"x").unwrap();
+        std::fs::write(backup.join("fine.txt"), b"ok").unwrap();
+
+        let app = tauri::test::mock_app();
+        restore(app.handle(), &CancellationToken::new(), backup, dest.clone())
+            .await
+            .unwrap();
+
+        assert!(dest.join("fine.txt").exists());
+        assert!(!root.path().join("ESCAPED.txt").exists(), "restore wrote outside its destination");
+        assert!(dest.join("..\\..\\ESCAPED.txt").exists(), "and the file is restored under its own name");
+    }
+
     #[tokio::test]
     async fn an_empty_directory_in_the_backup_is_restored() {
         let root = tempfile::tempdir().unwrap();

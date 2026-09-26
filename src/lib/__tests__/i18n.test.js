@@ -50,3 +50,11 @@ describe('locale parity', () => {
     }
   });
 });
+
+describe('translate interpolation', () => {
+  // A folder or error message holding `$&`, `$'` or `` $` `` is shown as it
+  // is, not read as a String.replace pattern.
+  test('a value is inserted literally', () => {
+    expect(translate('en', 'task.aria.run', { name: "Photos $& $' $`" })).toBe("Run Photos $& $' $`");
+  });
+});

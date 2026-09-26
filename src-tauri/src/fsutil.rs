@@ -68,6 +68,23 @@ pub fn scratch_path(dest: &Path) -> PathBuf {
     dest.with_file_name(name)
 }
 
+/// Open a fresh scratch file at `tmp`. Whatever already sits there — a
+/// leftover from a killed run, or a symlink planted on the drive to point the
+/// write at a file elsewhere — is removed first (a link itself, never what it
+/// points to), and `create_new` then fails rather than follow a link that
+/// reappeared in between.
+pub async fn create_scratch(tmp: &Path) -> std::io::Result<tokio::fs::File> {
+    match tokio::fs::remove_file(tmp).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .await
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Windows file attributes (preserves Hidden/System/ReadOnly so that
 // custom-folder-icon machinery — `desktop.ini` + the parent's System
@@ -728,6 +745,26 @@ pub fn reject_overlap(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A symlink planted at the scratch name is replaced, never written
+    /// through: the file it points to keeps its contents.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scratch_file_never_writes_through_a_planted_link() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let tmp = dir.path().join("a.txt.driveby-tmp");
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let mut f = create_scratch(&tmp).await.unwrap();
+        f.write_all(b"new").await.unwrap();
+        f.flush().await.unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(!std::fs::symlink_metadata(&tmp).unwrap().file_type().is_symlink());
+    }
 
     #[cfg(windows)]
     #[test]

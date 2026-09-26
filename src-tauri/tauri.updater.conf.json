@@ -5,8 +5,6 @@
   },
   "plugins": {
     "updater": {
-      "active": true,
-      "dialog": false,
       "endpoints": [
         "https://github.com/yohoshimura/driveby/releases/latest/download/latest.json"
       ],
