@@ -291,13 +291,12 @@ async fn walk(root: &Path) -> Result<Tree> {
                 .file_type()
                 .await
                 .with_context(|| format!("file_type {}", path.display()))?;
-            // A `\` in a name from the backup would turn into a `/` below
-            // and could climb out of the restore destination.
-            if ft.is_symlink() || crate::backup::has_foreign_separator(&path) {
+            if ft.is_symlink() {
                 continue;
             }
             let rel_str = match path.strip_prefix(root) {
-                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+                // Not a bare `\` → `/`: see `rel_string`.
+                Ok(rel) => crate::backup::rel_string(rel),
                 Err(_) => continue,
             };
             if ft.is_dir() {
@@ -501,8 +500,8 @@ mod tests {
     /// file's parent never reached it — the restored tree quietly held fewer
     /// folders than the backup it came from, and nothing said so.
     /// On Linux and macOS `\` is an ordinary character in a name. A backup
-    /// drive holding `..\..\x` must not restore it as `../../x`, outside
-    /// the chosen destination.
+    /// drive holding `..\..\x` restores it under that name, not as
+    /// `../../x` outside the chosen destination.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_backslash_in_a_name_cannot_climb_out_of_the_destination() {
@@ -521,6 +520,7 @@ mod tests {
 
         assert!(dest.join("fine.txt").exists());
         assert!(!root.path().join("ESCAPED.txt").exists(), "restore wrote outside its destination");
+        assert!(dest.join("..\\..\\ESCAPED.txt").exists(), "and the file is restored under its own name");
     }
 
     #[tokio::test]

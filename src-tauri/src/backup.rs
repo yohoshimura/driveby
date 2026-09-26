@@ -1117,13 +1117,24 @@ async fn preflight_destination(destination: &Path) -> Result<()> {
     if !dest_meta.is_dir() {
         return Err(anyhow!("Destination is not a directory"));
     }
+    Ok(())
+}
+
+/// Refuse a destination that is the home folder or holds it. Its own check,
+/// not part of `preflight_destination`: that one's failures mean "not
+/// there" and are filed as Unreachable, while this is a destination the user
+/// has to change. The preview asks it too, so the dialog never offers a run
+/// the run would refuse.
+pub(crate) async fn refuse_home(destination: &Path) -> Result<()> {
     #[allow(deprecated)] // std::env::home_dir is correct on every platform since 1.85
-    if let Some(home) = std::env::home_dir() {
-        if holds_home(destination, &home).await {
-            return Err(anyhow!(
-                "Destination is your home folder or contains it: a mirror would delete everything else in it"
-            ));
-        }
+    let Some(home) = std::env::home_dir() else {
+        return Ok(());
+    };
+    if holds_home(destination, &home).await {
+        return Err(anyhow!(
+            "{} is your home folder or contains it: a mirror there would delete everything the source does not have",
+            destination.display()
+        ));
     }
     Ok(())
 }
@@ -1134,13 +1145,24 @@ async fn preflight_destination(destination: &Path) -> Result<()> {
 /// home folder, that is every document the user has. A drive root that does
 /// not hold the home folder (`E:\`, `/Volumes/Backup`) is a normal
 /// destination and stays allowed. Both sides are canonicalised so that case,
-/// `..` and symlinks cannot slip past the comparison.
+/// `..` and symlinks cannot slip past the comparison; the raw paths are
+/// compared as well, because a volume `canonicalize` cannot resolve would
+/// leave only one side with Windows' `\\?\` prefix.
 async fn holds_home(destination: &Path, home: &Path) -> bool {
-    let canon = |p: &Path| {
-        let p = p.to_path_buf();
-        async move { fs::canonicalize(&p).await.unwrap_or(p) }
+    if home.starts_with(destination) {
+        return true;
+    }
+    let (Ok(dest), Ok(home)) = (fs::canonicalize(destination).await, fs::canonicalize(home).await)
+    else {
+        return false;
     };
-    let (dest, home) = (canon(destination).await, canon(home).await);
+    // macOS reaches the same folders through the data volume's firmlink:
+    // `/System/Volumes/Data/Users` is `/Users`.
+    #[cfg(target_os = "macos")]
+    let dest = match dest.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => dest,
+    };
     home.starts_with(&dest)
 }
 
@@ -1941,6 +1963,15 @@ async fn execute_all<R: Runtime>(
             outcomes.push(DestinationOutcome::stillborn(
                 destination,
                 DestinationStatus::Unreachable,
+                Some(e.to_string()),
+            ));
+            continue;
+        }
+        if let Err(e) = refuse_home(destination).await {
+            warn!(dest = %destination.display(), "refusing destination: {}", e);
+            outcomes.push(DestinationOutcome::stillborn(
+                destination,
+                DestinationStatus::Error,
                 Some(e.to_string()),
             ));
             continue;
@@ -2775,23 +2806,22 @@ fn listing_failure_is_fatal(dir: &Path, root: &Path) -> bool {
     dir == root
 }
 
-/// Whether an entry's own name holds a `\`. On Windows that cannot happen —
-/// it is a separator. Elsewhere it is an ordinary character, and `rel_of`
-/// turning it into `/` would let a file named `..\..\x` become the relative
-/// path `../../x` and be written outside the destination. Such an entry is
-/// skipped by every walk whose relative paths get joined back onto a root.
-pub(crate) fn has_foreign_separator(path: &Path) -> bool {
-    cfg!(not(windows))
-        && path
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().contains('\\'))
+pub(crate) fn rel_of(root: &Path, path: &Path) -> String {
+    rel_string(path.strip_prefix(root).unwrap_or(path))
 }
 
-pub(crate) fn rel_of(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+/// A relative path as the `/`-separated string the pipeline keys on. Only
+/// on Windows is `\` a separator to translate. Elsewhere it is an ordinary
+/// character in a name, and turning it into `/` would let a file named
+/// `..\..\x` become `../../x` and be written outside the destination: it is
+/// kept as it is, so the name stays one component wherever it is joined.
+pub(crate) fn rel_string(rel: &Path) -> String {
+    let s = rel.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
 }
 
 /// Enumerate the source tree.
@@ -2875,12 +2905,6 @@ pub(crate) async fn walk(
                 continue;
             }
             let rel_str = rel_of(&root_canonical, &path);
-            if has_foreign_separator(&path) {
-                warn!(path = %path.display(), "skipped: a `\\` in the name cannot be backed up safely");
-                unreadable.insert(rel_str);
-                skipped += 1;
-                continue;
-            }
             // A `desktop.ini` at the root is copied like any other file. It
             // was dropped here for as long as a source root mapped onto the
             // destination *root*, where its icon descriptor would have
@@ -3248,23 +3272,48 @@ mod tests {
         assert!(!holds_home(&home.join("Backups"), &home).await, "a folder inside home is fine");
     }
 
-    /// `rel_of` turns `\` into `/`, so on Linux and macOS a source file named
-    /// `..\..\x` would be copied to `<dest>/../../x`. The walk skips it, and
-    /// records it as unreadable so prune leaves the destination alone.
+    /// On Linux and macOS `\` is an ordinary character in a name. A source
+    /// file named `..\..\ESCAPED.txt` is backed up under that very name,
+    /// inside the destination — it used to become `../../ESCAPED.txt` and be
+    /// written two folders above it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_walk_skips_a_name_holding_a_backslash() {
+    async fn a_backslash_in_a_name_stays_inside_the_destination() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("..\\..\\ESCAPED.txt"), b"x").unwrap();
-        std::fs::write(root.path().join("fine.txt"), b"ok").unwrap();
+        let source = root.path().join("source");
+        let dest = root.path().join("a").join("dest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let name = "..\\..\\ESCAPED.txt";
+        std::fs::write(source.join(name), b"x").unwrap();
 
-        let walked = walk(root.path(), &glob::PatternSet::new(&[]), &CancellationToken::new())
-            .await
-            .unwrap();
+        let app = tauri::test::mock_app();
+        let task = Task {
+            id: "backslash".into(),
+            name: "backslash".into(),
+            source: Some(source.to_string_lossy().to_string()),
+            sources: None,
+            destination: None,
+            destinations: Some(vec![dest.to_string_lossy().to_string()]),
+            schedule: None,
+            schedule_days: None,
+            schedule_time: None,
+            last_backup: None,
+            keep_versions_days: None,
+        };
+        let payload = execute_all(
+            app.handle(),
+            "backup-backslash",
+            &task,
+            &Settings::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
 
-        let rels: Vec<&str> = walked.files.iter().map(|f| f.rel.as_str()).collect();
-        assert_eq!(rels, vec!["fine.txt"]);
-        assert_eq!(walked.unreadable.len(), 1);
+        assert!(payload.success);
+        assert!(!root.path().join("ESCAPED.txt").exists(), "backup wrote outside its destination");
+        assert_eq!(std::fs::read(dest.join(name)).unwrap(), b"x");
     }
 
     #[test]

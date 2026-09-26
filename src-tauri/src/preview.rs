@@ -182,6 +182,9 @@ async fn plan(task: &Task, settings: &Settings, token: &CancellationToken) -> Re
             });
             continue;
         }
+        // The run refuses it, so the preview says why instead of counting
+        // what a mirror there would delete.
+        crate::backup::refuse_home(destination).await?;
         // The tree the run would start from: with daily versions, today's day
         // or the newest one, which today's is cloned from. The preview moves
         // and clones nothing, so it looks there instead.
