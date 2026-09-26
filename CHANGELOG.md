@@ -1,5 +1,5 @@
 # Changelog
-
+## 2.0.1
 ## 2.0.0
 
 **Daily versions.** A task can now keep one version of its backup per day,
