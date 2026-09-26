@@ -8,6 +8,11 @@
 // only rewrites them on the next install, which is how 1.6.0 shipped with
 // a lockfile still claiming 1.5.0 — so this script writes them too.
 //
+// Cargo.lock records the crate's own version as well. The release builds
+// with `--locked`, which refuses to touch the lockfile, so a stale entry
+// there fails the release (as the first 2.0.1 tag did); it is written here
+// alongside Cargo.toml.
+//
 //   node scripts/bump-version.mjs 1.6.1
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -38,12 +43,22 @@ const cargoPath = join(root, 'src-tauri', 'Cargo.toml');
 const cargo = readFileSync(cargoPath, 'utf8');
 // Only the [package] version — the first `version = ` line — not any
 // dependency's.
-const bumped = cargo.replace(/^version = ".*"$/m, `version = "${version}"`);
-if (bumped === cargo) {
+const versionLine = /^version = ".*"$/m;
+if (!versionLine.test(cargo)) {
   console.error('could not find the [package] version line in src-tauri/Cargo.toml');
   process.exit(1);
 }
-writeFileSync(cargoPath, bumped);
+writeFileSync(cargoPath, cargo.replace(versionLine, `version = "${version}"`));
 
-console.log(`version set to ${version} in package.json, package-lock.json and src-tauri/Cargo.toml`);
+const cargoLockPath = join(root, 'src-tauri', 'Cargo.lock');
+const cargoLock = readFileSync(cargoLockPath, 'utf8');
+// The [[package]] entry named `driveby`, and only its version line.
+const lockEntry = /(\[\[package\]\]\r?\nname = "driveby"\r?\nversion = )".*"/;
+if (!lockEntry.test(cargoLock)) {
+  console.error('could not find the driveby package in src-tauri/Cargo.lock');
+  process.exit(1);
+}
+writeFileSync(cargoLockPath, cargoLock.replace(lockEntry, `$1"${version}"`));
+
+console.log(`version set to ${version} in package.json, package-lock.json, src-tauri/Cargo.toml and src-tauri/Cargo.lock`);
 console.log('next: commit, then tag with  git tag v' + version);
