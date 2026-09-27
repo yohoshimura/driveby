@@ -191,8 +191,11 @@ mod toast {
             // What the plugin sent until now: a short toast, and silent.
             .duration(Duration::Short)
             .sound(None);
+        // Labels go in as they are: since 0.8 the crate builds the toast
+        // through the Windows XML DOM, which escapes attribute values itself.
+        // Escaping here too would show `&apos;` on the button.
         for action in &actions {
-            toast = toast.add_button(&escape(action.label()), action.id());
+            toast = toast.add_button(action.label(), action.id());
         }
         let app = app.clone();
         toast
@@ -217,34 +220,6 @@ mod toast {
             Toast::POWERSHELL_APP_ID.to_string()
         } else {
             app.config().identifier.clone()
-        }
-    }
-
-    /// `add_button` pastes its label into a single-quoted XML attribute as
-    /// is — unlike `title` and `text1`, which escape theirs — so an
-    /// apostrophe or an ampersand in a label would leave the toast XML
-    /// unparseable.
-    fn escape(label: &str) -> String {
-        label
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('\'', "&apos;")
-            .replace('"', "&quot;")
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn a_label_cannot_break_out_of_its_attribute() {
-            assert_eq!(
-                escape(r#"Tom's <b> & "x""#),
-                "Tom&apos;s &lt;b&gt; &amp; &quot;x&quot;"
-            );
-            // The typographic apostrophe the French strings use is not markup.
-            assert_eq!(escape("Voir dans l’historique"), "Voir dans l’historique");
         }
     }
 }
