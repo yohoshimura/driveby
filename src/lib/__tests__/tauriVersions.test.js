@@ -9,8 +9,11 @@ import { describe, expect, test } from 'vitest';
 // 2.11 in npm would have passed every CI check and then failed the next
 // release. This compares the two lockfiles, so CI catches the drift first.
 
+// Both paths are fixed, relative to this file.
+/* eslint-disable security/detect-non-literal-fs-filename */
 const cargoLock = readFileSync(fileURLToPath(new URL('../../../src-tauri/Cargo.lock', import.meta.url)), 'utf8');
 const packageLock = readFileSync(fileURLToPath(new URL('../../../package-lock.json', import.meta.url)), 'utf8');
+/* eslint-enable security/detect-non-literal-fs-filename */
 const majorMinor = (version) => version.split('.').slice(0, 2).join('.');
 
 describe('Tauri versions', () => {
