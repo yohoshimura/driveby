@@ -1,5 +1,13 @@
 # Changelog
 ## 2.0.1
+
+Security release. Backup and restore can no longer write outside the chosen
+folder through a file name containing `\` (Linux, macOS), and a folder dated
+in the future can no longer make retention delete every daily version. The
+notification's "open folder" button only opens folders. The app asks for
+fewer permissions, and releases now come with checksums, an SBOM and signed
+build provenance.
+
 ## 2.0.0
 
 **Daily versions.** A task can now keep one version of its backup per day,
