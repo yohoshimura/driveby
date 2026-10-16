@@ -129,12 +129,20 @@ function freeBytes() {
   }
 }
 
-function removeDir(abs) {
+function removeDir(abs, rel) {
   if (process.platform === 'win32') {
     // rmdir clears a multi-GB tree in seconds; fs.rmSync walks every entry
     // from Node and takes minutes on the same tree.
+    //
+    // cmd parses its whole command line: a clone path holding `%NAME%` would
+    // be expanded, and `"` or `^` misread, pointing `rmdir /s /q` somewhere
+    // else. So cmd only ever sees the hardcoded relative path, and the repo
+    // location travels as the working directory, which cmd does not parse.
     try {
-      execFileSync('cmd', ['/c', 'rmdir', '/s', '/q', abs], { stdio: 'ignore' });
+      execFileSync('cmd', ['/c', 'rmdir', '/s', '/q', rel.replaceAll('/', '\\')], {
+        cwd: ROOT,
+        stdio: 'ignore',
+      });
       if (!existsSync(abs)) return;
     } catch {
       /* locked or partially removed — fall through for a real error */
@@ -191,7 +199,7 @@ const before = freeBytes();
 for (const t of present) {
   process.stdout.write(`  removing ${t.rel} ... `);
   try {
-    removeDir(t.abs);
+    removeDir(t.abs, t.rel);
     console.log('done');
   } catch (e) {
     console.log('FAILED');
