@@ -1,4 +1,10 @@
 # Changelog
+## 2.0.2
+
+Security update. The updater's HTTPS library (rustls) is updated past four
+advisories, and the libraries that unpack update bundles (tar) and read the
+app configuration (serde_with) are updated past theirs.
+
 ## 2.0.1
 
 Security release. Backup and restore can no longer write outside the chosen
