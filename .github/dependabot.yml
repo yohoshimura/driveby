@@ -31,6 +31,12 @@ updates:
     commit-message:
       prefix: "deps(npm)"
     groups:
+      # Security fixes skip the cooldown and arrive as soon as an advisory
+      # is published; several on one day come as one PR, not several that
+      # conflict over the lockfile.
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
       # The JS API/plugins and the CLI must track the Rust `tauri` crates
       # (the CLI warns on mismatched versions); review them together with
       # the cargo `tauri` group below.
@@ -59,6 +65,9 @@ updates:
     commit-message:
       prefix: "deps(cargo)"
     groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
       tauri:
         patterns: ["tauri", "tauri-*"]
       cargo-minor-and-patch:
