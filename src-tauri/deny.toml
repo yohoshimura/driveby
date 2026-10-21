@@ -32,15 +32,8 @@ yanked = "deny"
 # Every exception names a reason and a date to look again (2-3-5: time-boxed,
 # owned exceptions; never a silent `ignore`).
 ignore = [
-  # Template:
+  # Nothing is ignored today. Template:
   # { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply / what we wait for; revisit YYYY-MM-DD" },
-  #
-  # Every zip 4.x release is yanked, with no advisory and no reason in the
-  # changelog, and tauri-plugin-updater (2.13 and 2.14 alike) still requires
-  # zip ^4. Only the Windows build compiles it, to unpack update bundles whose
-  # minisign signature the updater has already verified. Drop this as soon as
-  # an updater release moves off zip 4.
-  { crate = "zip@4.6.1", reason = "yanked without advisory; tauri-plugin-updater requires zip ^4; revisit 2026-11-16" },
 ]
 
 [licenses]
