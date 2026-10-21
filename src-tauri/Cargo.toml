@@ -17,7 +17,12 @@ tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
-tauri-plugin-updater = "2"
+# Without the default `zip` feature. It only unpacks the zipped updater
+# bundles Tauri 1 produced (`.msi.zip`, `.AppImage.tar.gz`); Driveby publishes
+# plain .msi, -setup.exe and .AppImage updates (and .app.tar.gz on macOS, which
+# does not need the feature). It also pulled in zip 4, which is yanked and has
+# RUSTSEC-2026-0367/0368/0369 in its extraction code.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
