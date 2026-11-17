@@ -48,6 +48,11 @@ updates:
         patterns: ["react", "react-dom"]
       npm-minor-and-patch:
         update-types: ["minor", "patch"]
+        # Listing a package in `tauri` above is not enough to keep it out of
+        # this group: the plugins kept landing here (#37, #48, #52). The
+        # tests fail a Tauri update until both sides match, so with Tauri
+        # in this group every other npm update waited along with it.
+        exclude-patterns: ["@tauri-apps/*"]
 
   - package-ecosystem: cargo
     directory: /src-tauri
@@ -72,6 +77,8 @@ updates:
         patterns: ["tauri", "tauri-*"]
       cargo-minor-and-patch:
         update-types: ["minor", "patch"]
+        # As for npm above (#36, #46, #50).
+        exclude-patterns: ["tauri", "tauri-*"]
 
   # Keeps the SHA pins in .github/workflows current, including the
   # `# vX.Y.Z` comments next to them.
