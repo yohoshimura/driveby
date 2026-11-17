@@ -32,8 +32,9 @@ yanked = "deny"
 # Every exception names a reason and a date to look again (2-3-5: time-boxed,
 # owned exceptions; never a silent `ignore`).
 ignore = [
-  # Nothing is ignored today. Template:
+  # Template:
   # { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not apply / what we wait for; revisit YYYY-MM-DD" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable: no known flaw and no patched version. Driveby uses it for schedules, snapshot days and saved timestamps; moving to jiff or time is a change of its own; revisit 2027-02-17" },
 ]
 
 [licenses]
